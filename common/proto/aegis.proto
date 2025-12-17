@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package aegis;
+
+message SystemInfo {
+  string hostname = 1;
+  string os_version = 2;
+  string kernel_version = 3;
+  repeated string ip_addresses = 4;
+  int64 boot_time = 5;
+}
+
+message ProcessInfo {
+  uint32 pid = 1;
+  uint32 ppid = 2;
+  string name = 3;
+  string cmdline = 4;
+  string exe_path = 5;
+  uint32 uid = 6;
+  int64 start_time = 7;
+  bool is_ghost = 8;
+  bool is_mismatched = 9;
+  bool has_floating_code = 10;
+  uint64 exec_id = 11;
+}
+
+message FileInfo {
+  string path = 1;
+  uint64 size = 2;
+  int64 created_si = 3;
+  int64 created_fn = 4;
+  int64 modified = 5;
+  bool is_timestomped = 6;
+  bool is_locked = 7;
+}
+
+message NetworkInterfaceUpdate {
+  int64 timestamp = 1;
+  repeated string new_ip_addresses = 2;
+}
+
+message AgentTelemetry {
+  int64 timestamp = 1;
+  uint32 cpu_usage_percent = 2;
+  uint32 memory_usage_mb = 3;
+  uint64 dropped_events_count = 4;
+}
+
