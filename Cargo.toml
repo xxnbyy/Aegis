@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["common", "probe", "console", "sdk", "mock"]
+
+[workspace.package]
+version = "0.0.1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+trivially_copy_pass_by_ref = "deny"
+let_underscore_must_use = "deny"
+
