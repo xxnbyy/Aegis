@@ -8,21 +8,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use common::crypto;
 use common::error::{AegisError, ErrorCode};
-use common::protocol::{
-    AgentTelemetry, MessagePayload, NetworkInterfaceUpdate, ProcessInfo, SystemInfo,
-};
+use common::protocol::{AgentTelemetry, NetworkInterfaceUpdate, ProcessInfo, SystemInfo};
+use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
 use sha2::Sha256;
+use uuid::Uuid;
 use xxhash_rust::xxh64::xxh64;
 
 const HEADER_LEN: usize = 144;
 const MAGIC: &[u8; 5] = b"AEGIS";
 const VERSION: u8 = 0x01;
 const CIPHER_ID_XCHACHA20: u8 = 0x01;
+const KDF_SALT_OFFSET: usize = 0x08;
+const KDF_SALT_LEN: usize = 32;
+const HOST_UUID_OFFSET: usize = 0x28;
+const HOST_UUID_LEN: usize = 16;
 const ORG_KEY_FP_OFFSET: usize = 0x38;
 
 #[derive(Parser, Debug)]
@@ -133,22 +137,24 @@ fn build_artifact(
     header[0..MAGIC.len()].copy_from_slice(MAGIC.as_slice());
     header[0x05] = VERSION;
     header[0x06] = CIPHER_ID_XCHACHA20;
+    let mut kdf_salt = [0u8; KDF_SALT_LEN];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut kdf_salt);
+    header[KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN].copy_from_slice(&kdf_salt);
+    let host_uuid = Uuid::new_v4();
+    header[HOST_UUID_OFFSET..HOST_UUID_OFFSET + HOST_UUID_LEN]
+        .copy_from_slice(host_uuid.as_bytes());
     header[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8].copy_from_slice(&org_key_fp.to_be_bytes());
 
     let mut out = Vec::with_capacity(HEADER_LEN + encrypted_session_key.len() + 4096);
     out.extend_from_slice(&header);
     out.extend_from_slice(&encrypted_session_key);
 
-    let mut payloads = Vec::with_capacity(1 + scenario.events.len());
-    payloads.push(MessagePayload::SystemInfo(dummy_system_info()));
-    payloads.extend(scenario.events.iter().map(event_to_payload));
+    let mut plaintext_payloads = Vec::with_capacity(1 + scenario.events.len());
+    plaintext_payloads.push(dummy_system_info().encode_to_vec());
+    plaintext_payloads.extend(scenario.events.iter().map(event_to_payload_bytes));
 
-    for payload in payloads {
-        let plaintext = bincode::serialize(&payload).map_err(|e| AegisError::ProtocolError {
-            message: format!("Payload 序列化失败: {e}"),
-            code: None,
-        })?;
-
+    for plaintext in plaintext_payloads {
         let encrypted_chunk = crypto::encrypt(plaintext.as_slice(), session_key.as_slice())?;
         out.extend_from_slice(&encrypted_chunk);
     }
@@ -156,7 +162,7 @@ fn build_artifact(
     Ok(out)
 }
 
-fn event_to_payload(event: &EventSpec) -> MessagePayload {
+fn event_to_payload_bytes(event: &EventSpec) -> Vec<u8> {
     match event {
         EventSpec::Process {
             exec_id,
@@ -170,7 +176,7 @@ fn event_to_payload(event: &EventSpec) -> MessagePayload {
             is_ghost,
             is_mismatched,
             has_floating_code,
-        } => MessagePayload::ProcessInfo(ProcessInfo {
+        } => ProcessInfo {
             pid: pid.unwrap_or(1234),
             ppid: ppid.unwrap_or(1),
             name: name.clone().unwrap_or_else(|| "mock-process".to_string()),
@@ -184,27 +190,30 @@ fn event_to_payload(event: &EventSpec) -> MessagePayload {
             is_mismatched: is_mismatched.unwrap_or(false),
             has_floating_code: has_floating_code.unwrap_or(false),
             exec_id: *exec_id,
-        }),
+        }
+        .encode_to_vec(),
 
         EventSpec::Telemetry {
             dropped_events,
             timestamp,
             cpu_usage_percent,
             memory_usage_mb,
-        } => MessagePayload::AgentTelemetry(AgentTelemetry {
+        } => AgentTelemetry {
             timestamp: timestamp.unwrap_or_else(timestamp_now),
             cpu_usage_percent: cpu_usage_percent.unwrap_or(12),
             memory_usage_mb: memory_usage_mb.unwrap_or(128),
             dropped_events_count: *dropped_events,
-        }),
+        }
+        .encode_to_vec(),
 
         EventSpec::NetworkChange {
             timestamp,
             new_ip_addresses,
-        } => MessagePayload::NetworkInterfaceUpdate(NetworkInterfaceUpdate {
+        } => NetworkInterfaceUpdate {
             timestamp: timestamp.unwrap_or_else(timestamp_now),
             new_ip_addresses: new_ip_addresses.clone(),
-        }),
+        }
+        .encode_to_vec(),
     }
 }
 
@@ -334,12 +343,12 @@ mod tests {
         Ok((rsa_ct, stream))
     }
 
-    fn decode_stream(
+    fn decrypt_stream_to_plaintexts(
         stream: &[u8],
         session_key: &[u8; 32],
-    ) -> Result<Vec<MessagePayload>, AegisError> {
+    ) -> Result<Vec<Vec<u8>>, AegisError> {
         let mut offset = 0usize;
-        let mut decoded = Vec::new();
+        let mut plaintexts = Vec::new();
 
         while offset < stream.len() {
             if stream.len().saturating_sub(offset) < 24 + 4 + 16 {
@@ -367,17 +376,10 @@ mod tests {
             offset += chunk_len;
 
             let plaintext = crypto::decrypt(chunk, session_key.as_slice())?;
-            let payload: MessagePayload =
-                bincode::deserialize(plaintext.as_slice()).map_err(|e| {
-                    AegisError::ProtocolError {
-                        message: format!("Payload 反序列化失败: {e}"),
-                        code: None,
-                    }
-                })?;
-            decoded.push(payload);
+            plaintexts.push(plaintext);
         }
 
-        Ok(decoded)
+        Ok(plaintexts)
     }
 
     #[test]
@@ -420,6 +422,16 @@ events:
         assert_eq!(&artifact[0..MAGIC.len()], MAGIC.as_slice());
         assert_eq!(artifact[0x05], VERSION);
         assert_eq!(artifact[0x06], CIPHER_ID_XCHACHA20);
+        assert!(
+            artifact[KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+                .iter()
+                .any(|b| *b != 0)
+        );
+        assert!(
+            artifact[HOST_UUID_OFFSET..HOST_UUID_OFFSET + HOST_UUID_LEN]
+                .iter()
+                .any(|b| *b != 0)
+        );
 
         let private_key_pem =
             fs::read_to_string(workspace_root.join("tests/keys/dev_org_private.pem"))
@@ -444,40 +456,45 @@ events:
                     code: Some(ErrorCode::Crypto003),
                 })?;
 
-        let decoded = decode_stream(stream, &session_key)?;
-
-        match decoded.first() {
-            Some(MessagePayload::SystemInfo(_)) => {}
-            other => {
-                return Err(AegisError::ProtocolError {
-                    message: format!("首个 chunk 不是 SystemInfo: {other:?}"),
-                    code: None,
-                });
-            }
+        let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key)?;
+        if plaintexts.len() < 4 {
+            return Err(AegisError::ProtocolError {
+                message: "解密后的 Protobuf 消息数量不足".to_string(),
+                code: None,
+            });
         }
 
-        let mut saw_exec_id = false;
-        let mut saw_dropped_events = false;
-
-        for payload in decoded {
-            match payload {
-                MessagePayload::ProcessInfo(p) => {
-                    assert_eq!(p.exec_id, 42);
-                    saw_exec_id = true;
-                }
-                MessagePayload::AgentTelemetry(t) => {
-                    assert_eq!(t.dropped_events_count, 9);
-                    saw_dropped_events = true;
-                }
-                MessagePayload::NetworkInterfaceUpdate(n) => {
-                    assert_eq!(n.new_ip_addresses.len(), 2);
-                }
-                _ => {}
+        let system_info = SystemInfo::decode(plaintexts[0].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("SystemInfo Protobuf 反序列化失败: {e}"),
+                code: None,
             }
-        }
+        })?;
+        assert!(!system_info.hostname.is_empty());
 
-        assert!(saw_exec_id);
-        assert!(saw_dropped_events);
+        let process = ProcessInfo::decode(plaintexts[1].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("ProcessInfo Protobuf 反序列化失败: {e}"),
+                code: None,
+            }
+        })?;
+        assert_eq!(process.exec_id, 42);
+
+        let telemetry = AgentTelemetry::decode(plaintexts[2].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("AgentTelemetry Protobuf 反序列化失败: {e}"),
+                code: None,
+            }
+        })?;
+        assert_eq!(telemetry.dropped_events_count, 9);
+
+        let net = NetworkInterfaceUpdate::decode(plaintexts[3].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("NetworkInterfaceUpdate Protobuf 反序列化失败: {e}"),
+                code: None,
+            }
+        })?;
+        assert_eq!(net.new_ip_addresses.len(), 2);
         Ok(())
     }
 }
