@@ -5,6 +5,7 @@ use crate::error::AegisError;
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
+const MAX_PACKET_SIZE: usize = 50 * 1024 * 1024; // 50MB
 
 #[allow(clippy::missing_errors_doc)]
 pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
@@ -71,6 +72,13 @@ pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     let payload_len =
         u32::from_be_bytes([len_part[0], len_part[1], len_part[2], len_part[3]]) as usize;
 
+    if payload_len > MAX_PACKET_SIZE {
+        return Err(AegisError::PacketTooLarge {
+            size: payload_len,
+            limit: MAX_PACKET_SIZE,
+        });
+    }
+
     if rest.len() != payload_len + TAG_LEN {
         return Err(AegisError::CryptoError {
             message: "密文长度与 PayloadLen 不匹配".to_string(),
@@ -78,11 +86,8 @@ pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
         });
     }
 
-    let mut ciphertext_and_tag = Vec::with_capacity(payload_len + TAG_LEN);
-    ciphertext_and_tag.extend_from_slice(rest);
-
     cipher
-        .decrypt(nonce, ciphertext_and_tag.as_slice())
+        .decrypt(nonce, rest)
         .map_err(|_| AegisError::CryptoError {
             message: "解密失败".to_string(),
             code: None,
@@ -111,5 +116,24 @@ mod tests {
         let decrypted = decrypt(encrypted.as_slice(), key.as_slice())?;
         assert_eq!(decrypted, plaintext);
         Ok(())
+    }
+
+    #[test]
+    fn test_decrypt_packet_too_large() {
+        let key = [1u8; 32];
+        let nonce = [0u8; NONCE_LEN];
+        let payload_len_u32: u32 = 50 * 1024 * 1024 + 1;
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(&payload_len_u32.to_be_bytes());
+        packet.extend_from_slice(&[0u8; TAG_LEN]);
+
+        let err = decrypt(packet.as_slice(), key.as_slice()).err();
+        assert!(matches!(
+            err,
+            Some(AegisError::PacketTooLarge { size, limit })
+                if size == MAX_PACKET_SIZE + 1 && limit == MAX_PACKET_SIZE
+        ));
     }
 }

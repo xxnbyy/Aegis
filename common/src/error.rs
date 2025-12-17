@@ -50,6 +50,9 @@ pub enum AegisError {
 
     #[error("配置错误: {message}")]
     ConfigError { message: String },
+
+    #[error("Packet size {size} exceeds limit {limit}")]
+    PacketTooLarge { size: usize, limit: usize },
 }
 
 impl From<getrandom::Error> for AegisError {
