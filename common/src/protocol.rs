@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AegisError, ErrorCode};
+
+#[allow(clippy::all)]
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/aegis.rs"));
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub header: MessageHeader,
@@ -106,4 +113,42 @@ pub struct AgentTelemetry {
     pub memory_usage_mb: u32,
     #[prost(uint64, tag = "4")]
     pub dropped_events_count: u64,
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn validate_first_chunk_is_system_info(first: &MessagePayload) -> Result<(), AegisError> {
+    match first {
+        MessagePayload::SystemInfo(_) => Ok(()),
+        _ => Err(AegisError::CryptoError {
+            message: "SystemInfo 块缺失或顺序错误".to_string(),
+            code: Some(ErrorCode::Crypto003),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_chunk_must_be_system_info() {
+        let ok = MessagePayload::SystemInfo(SystemInfo {
+            hostname: String::new(),
+            os_version: String::new(),
+            kernel_version: String::new(),
+            ip_addresses: Vec::new(),
+            boot_time: 0,
+        });
+        assert!(validate_first_chunk_is_system_info(&ok).is_ok());
+
+        let bad = MessagePayload::Empty;
+        let err = validate_first_chunk_is_system_info(&bad).err();
+        assert!(matches!(
+            err,
+            Some(AegisError::CryptoError {
+                code: Some(ErrorCode::Crypto003),
+                ..
+            })
+        ));
+    }
 }

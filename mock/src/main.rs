@@ -186,8 +186,16 @@ fn run_with_paths(
         &public_key_der,
         password.as_str(),
     )?;
-    write_file(out_path, &artifact)?;
+    for warning in artifact.warnings {
+        eprintln!("{warning}");
+    }
+    write_file(out_path, &artifact.bytes)?;
     Ok(())
+}
+
+struct BuildArtifactResult {
+    bytes: Vec<u8>,
+    warnings: Vec<String>,
 }
 
 fn build_artifact(
@@ -196,7 +204,7 @@ fn build_artifact(
     org_public_key: &RsaPublicKey,
     org_public_key_der: &[u8],
     password: &str,
-) -> Result<Vec<u8>, AegisError> {
+) -> Result<BuildArtifactResult, AegisError> {
     let _scenario_name = scenario.name.as_deref();
     let org_key_fp = xxh64(org_public_key_der, 0);
 
@@ -223,26 +231,57 @@ fn build_artifact(
     out.extend_from_slice(user_slot.as_slice());
     out.extend_from_slice(&encrypted_session_key);
 
-    let mut plaintext_payloads = Vec::with_capacity(1 + scenario.events.len());
-    plaintext_payloads.push(dummy_system_info().encode_to_vec());
     let base_time = parse_base_time(scenario.base_time.as_str())?;
-    plaintext_payloads.extend(
-        scenario
-            .events
-            .iter()
-            .map(|event| event_to_payload_bytes(event, base_time)),
-    );
+    let mut warnings = Vec::new();
+    let mut any_data_loss = false;
+    let mut last_net_timestamp: Option<i64> = None;
 
-    for plaintext in plaintext_payloads {
+    let encrypted_chunk = crypto::encrypt(
+        dummy_system_info().encode_to_vec().as_slice(),
+        session_key.as_slice(),
+    )?;
+    out.extend_from_slice(&encrypted_chunk);
+
+    for event in &scenario.events {
+        let plaintext = event_to_payload_bytes(
+            event,
+            base_time,
+            &mut any_data_loss,
+            &mut last_net_timestamp,
+        )?;
         let encrypted_chunk = crypto::encrypt(plaintext.as_slice(), session_key.as_slice())?;
         out.extend_from_slice(&encrypted_chunk);
     }
 
-    Ok(out)
+    if any_data_loss {
+        warnings.push("WARN: Trace file contains data loss events".to_string());
+    }
+
+    Ok(BuildArtifactResult {
+        bytes: out,
+        warnings,
+    })
 }
 
-fn event_to_payload_bytes(event: &EventSpec, base_time: i64) -> Vec<u8> {
-    match event {
+fn resolve_event_timestamp(
+    base_time: i64,
+    timestamp: Option<i64>,
+    time_offset: Option<&str>,
+) -> i64 {
+    timestamp.unwrap_or_else(|| {
+        time_offset
+            .and_then(|s| apply_offset(base_time, s).ok())
+            .unwrap_or(base_time)
+    })
+}
+
+fn event_to_payload_bytes(
+    event: &EventSpec,
+    base_time: i64,
+    any_data_loss: &mut bool,
+    last_net_timestamp: &mut Option<i64>,
+) -> Result<Vec<u8>, AegisError> {
+    let bytes = match event {
         EventSpec::Process {
             exec_id,
             pid,
@@ -265,12 +304,7 @@ fn event_to_payload_bytes(event: &EventSpec, base_time: i64) -> Vec<u8> {
                 .clone()
                 .unwrap_or_else(|| "C:\\\\Windows\\\\System32\\\\cmd.exe".to_string()),
             uid: uid.unwrap_or(0),
-            start_time: start_time.unwrap_or_else(|| {
-                start_offset
-                    .as_deref()
-                    .and_then(|s| apply_offset(base_time, s).ok())
-                    .unwrap_or(base_time)
-            }),
+            start_time: resolve_event_timestamp(base_time, *start_time, start_offset.as_deref()),
             is_ghost: is_ghost.unwrap_or(false),
             is_mismatched: is_mismatched.unwrap_or(false),
             has_floating_code: has_floating_code.unwrap_or(false),
@@ -284,34 +318,41 @@ fn event_to_payload_bytes(event: &EventSpec, base_time: i64) -> Vec<u8> {
             time_offset,
             cpu_usage_percent,
             memory_usage_mb,
-        } => AgentTelemetry {
-            timestamp: timestamp.unwrap_or_else(|| {
-                time_offset
-                    .as_deref()
-                    .and_then(|s| apply_offset(base_time, s).ok())
-                    .unwrap_or(base_time)
-            }),
-            cpu_usage_percent: cpu_usage_percent.unwrap_or(12),
-            memory_usage_mb: memory_usage_mb.unwrap_or(128),
-            dropped_events_count: *dropped_events,
+        } => {
+            if *dropped_events > 0 {
+                *any_data_loss = true;
+            }
+            AgentTelemetry {
+                timestamp: resolve_event_timestamp(base_time, *timestamp, time_offset.as_deref()),
+                cpu_usage_percent: cpu_usage_percent.unwrap_or(12),
+                memory_usage_mb: memory_usage_mb.unwrap_or(128),
+                dropped_events_count: *dropped_events,
+            }
+            .encode_to_vec()
         }
-        .encode_to_vec(),
-
         EventSpec::NetworkChange {
             timestamp,
             time_offset,
             new_ip_addresses,
-        } => NetworkInterfaceUpdate {
-            timestamp: timestamp.unwrap_or_else(|| {
-                time_offset
-                    .as_deref()
-                    .and_then(|s| apply_offset(base_time, s).ok())
-                    .unwrap_or(base_time)
-            }),
-            new_ip_addresses: new_ip_addresses.clone(),
+        } => {
+            let ts = resolve_event_timestamp(base_time, *timestamp, time_offset.as_deref());
+            if let Some(prev) = *last_net_timestamp
+                && ts <= prev
+            {
+                return Err(AegisError::ProtocolError {
+                    message: "NetworkInterfaceUpdate 时间戳必须单调递增".to_string(),
+                    code: None,
+                });
+            }
+            *last_net_timestamp = Some(ts);
+            NetworkInterfaceUpdate {
+                timestamp: ts,
+                new_ip_addresses: new_ip_addresses.clone(),
+            }
+            .encode_to_vec()
         }
-        .encode_to_vec(),
-    }
+    };
+    Ok(bytes)
 }
 
 fn dummy_system_info() -> SystemInfo {
@@ -650,6 +691,8 @@ mod tests {
 
     use rsa::RsaPrivateKey;
     use rsa::RsaPublicKey;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
 
@@ -921,6 +964,249 @@ events:
             }
         })?;
         assert_eq!(net.new_ip_addresses.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn warns_on_data_loss_events() -> Result<(), AegisError> {
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                message: format!("生成 RSA 私钥失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let public_key = RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("导出 Org Public Key DER 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?
+            .as_bytes()
+            .to_vec();
+
+        let scenario = Scenario {
+            name: None,
+            base_time: "1000".to_string(),
+            events: vec![EventSpec::Telemetry {
+                dropped_events: 1,
+                timestamp: Some(1000),
+                time_offset: None,
+                cpu_usage_percent: Some(85),
+                memory_usage_mb: Some(512),
+            }],
+        };
+
+        let artifact = build_artifact(
+            "dev",
+            &scenario,
+            &public_key,
+            public_key_der.as_slice(),
+            "aegis-dev",
+        )?;
+        assert!(
+            artifact
+                .warnings
+                .iter()
+                .any(|w| w.as_str() == "WARN: Trace file contains data loss events")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn network_update_timestamps_must_increase() -> Result<(), AegisError> {
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                message: format!("生成 RSA 私钥失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let public_key = RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("导出 Org Public Key DER 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?
+            .as_bytes()
+            .to_vec();
+
+        let scenario = Scenario {
+            name: None,
+            base_time: "1000".to_string(),
+            events: vec![
+                EventSpec::NetworkChange {
+                    timestamp: Some(2000),
+                    time_offset: None,
+                    new_ip_addresses: vec!["10.0.0.1".to_string()],
+                },
+                EventSpec::NetworkChange {
+                    timestamp: Some(1999),
+                    time_offset: None,
+                    new_ip_addresses: vec!["10.0.0.2".to_string()],
+                },
+            ],
+        };
+
+        let err = build_artifact(
+            "dev",
+            &scenario,
+            &public_key,
+            public_key_der.as_slice(),
+            "aegis-dev",
+        )
+        .err();
+        assert!(matches!(err, Some(AegisError::ProtocolError { .. })));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn generate_then_decrypt_roundtrip_with_repo_dev_keys() -> Result<(), AegisError> {
+        #[cfg(windows)]
+        {
+            use winreg::RegKey;
+            use winreg::enums::HKEY_CURRENT_USER;
+
+            let root = RegKey::predef(HKEY_CURRENT_USER);
+            let Ok((key, _)) = root.create_subkey("SOFTWARE\\Aegis") else {
+                return Ok(());
+            };
+            let uuid_str = Uuid::new_v4().to_string();
+            if key.set_value("HostUUID", &uuid_str).is_err() {
+                return Ok(());
+            }
+        }
+        let workspace_root = find_workspace_root(&std::env::current_dir().map_err(io_error)?)
+            .ok_or(AegisError::ConfigError {
+                message: "无法定位 workspace root（未找到包含 [workspace] 的 Cargo.toml）"
+                    .to_string(),
+            })?;
+        let public_key_path = workspace_root.join("tests/keys/dev_org_public.der");
+        let private_key_path = workspace_root.join("tests/keys/dev_org_private.pem");
+
+        let temp_dir = unique_temp_dir()?;
+        let scenario_path = temp_dir.join("scenario.yml");
+        let out_path = temp_dir.join("out.aes");
+        let scenario_yaml = r#"
+events:
+  - type: process
+    exec_id: 42
+    pid: 777
+    name: "p1"
+  - type: telemetry
+    dropped_events: 9
+    cpu_usage_percent: 33
+    memory_usage_mb: 2048
+  - type: network_change
+    timestamp: 100
+    new_ip_addresses: ["10.0.0.1", "10.0.0.2"]
+"#;
+        fs::write(scenario_path.as_path(), scenario_yaml).map_err(io_error)?;
+
+        let (expected_public_der, private_key) = if public_key_path.exists()
+            && private_key_path.exists()
+        {
+            run_with_paths(
+                scenario_path.as_path(),
+                out_path.as_path(),
+                "dev",
+                None,
+                None,
+            )?;
+            let public_der = fs::read(public_key_path.as_path()).map_err(io_error)?;
+            let private_pem = fs::read_to_string(private_key_path.as_path()).map_err(io_error)?;
+            let private_pem = private_pem.trim().trim_start_matches('\u{feff}');
+            let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem)
+                .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_pem))
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("解析 dev_org_private.pem 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+            (public_der, private_key)
+        } else {
+            let mut rng = OsRng;
+            let private_key =
+                RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                    message: format!("生成 dev RSA 私钥失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+            let public_key = RsaPublicKey::from(&private_key);
+            let public_key_der = public_key
+                .to_public_key_der()
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("导出 dev Org Public Key DER 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?
+                .as_bytes()
+                .to_vec();
+
+            let cert_path = temp_dir.join("dev_org_public.der");
+            fs::write(cert_path.as_path(), public_key_der.as_slice()).map_err(io_error)?;
+            run_with_paths(
+                scenario_path.as_path(),
+                out_path.as_path(),
+                "dev",
+                Some(cert_path.as_path()),
+                None,
+            )?;
+            (public_key_der, private_key)
+        };
+
+        let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
+        let expected_fp = xxh64(expected_public_der.as_slice(), 0).to_be_bytes();
+        assert_eq!(
+            &artifact[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8],
+            expected_fp.as_slice()
+        );
+        let rsa_ct_len = private_key.size();
+        let (user_slot, rsa_ct, stream) = read_artifact_parts(artifact.as_slice(), rsa_ct_len)?;
+        let kdf_salt: [u8; KDF_SALT_LEN] = artifact
+            [KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+            .try_into()
+            .map_err(|_| AegisError::ProtocolError {
+                message: "读取 KDF_Salt 失败".to_string(),
+                code: None,
+            })?;
+        let kek_bytes = derive_kek("aegis-dev".as_bytes(), kdf_salt.as_ref())?;
+        let kek = Kek::from(kek_bytes);
+        let unwrapped = kek
+            .unwrap_vec(user_slot)
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("AES-256-KeyWrap 解密 SessionKey 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let session_key_from_user: [u8; 32] =
+            unwrapped
+                .as_slice()
+                .try_into()
+                .map_err(|_| AegisError::CryptoError {
+                    message: "User Slot 解出的 SessionKey 长度不是 32 bytes".to_string(),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        let session_key_bytes =
+            private_key
+                .decrypt(Oaep::new::<Sha256>(), rsa_ct)
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("RSA-OAEP 解密 SessionKey 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        let session_key_from_org: [u8; 32] =
+            session_key_bytes
+                .try_into()
+                .map_err(|_| AegisError::CryptoError {
+                    message: "SessionKey 长度不是 32 bytes".to_string(),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        assert_eq!(session_key_from_user, session_key_from_org);
+        let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key_from_org)?;
+        let system_info = SystemInfo::decode(plaintexts[0].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("SystemInfo Protobuf 反序列化失败: {e}"),
+                code: None,
+            }
+        })?;
+        assert!(!system_info.hostname.is_empty());
         Ok(())
     }
 }
