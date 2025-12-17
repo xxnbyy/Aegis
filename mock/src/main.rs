@@ -320,10 +320,7 @@ fn timestamp_now() -> i64 {
         Ok(d) => d,
         Err(_) => std::time::Duration::from_secs(0),
     };
-    match i64::try_from(dur.as_secs()) {
-        Ok(v) => v,
-        Err(_) => i64::MAX,
-    }
+    i64::try_from(dur.as_secs()).unwrap_or(i64::MAX)
 }
 
 fn default_base_time() -> String {
@@ -495,12 +492,16 @@ fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
     #[cfg(not(windows))]
     {
         let primary = Path::new("/etc/aegis/uuid");
-        if let Ok(Some(v)) = try_read_host_uuid_file(primary) {
+        if let Some(v) = try_read_host_uuid_file(primary).map_err(AegisError::IoError)? {
             return Ok(Some(v));
         }
-        let fallback = user_uuid_path();
-        if let Ok(Some(v)) = try_read_host_uuid_file(fallback.as_path()) {
-            return Ok(Some(v));
+        if mode == "dev" {
+            let fallback = user_uuid_path();
+            if let Some(v) =
+                try_read_host_uuid_file(fallback.as_path()).map_err(AegisError::IoError)?
+            {
+                return Ok(Some(v));
+            }
         }
         Ok(None)
     }
@@ -534,10 +535,13 @@ fn persist_host_uuid(mode: &str, uuid: &[u8; 16]) -> Result<(), AegisError> {
         if try_write_host_uuid_file(primary, uuid).is_ok() {
             return Ok(());
         }
+        if mode != "dev" {
+            return Err(AegisError::ConfigError {
+                message: "无法写入 HostUUID 至 /etc/aegis/uuid（请以 root 权限运行）".to_string(),
+            });
+        }
         let fallback = user_uuid_path();
-        try_write_host_uuid_file(fallback.as_path(), uuid)
-            .map_err(|err| AegisError::IoError(err))?;
-        Ok(())
+        try_write_host_uuid_file(fallback.as_path(), uuid).map_err(AegisError::IoError)
     }
 }
 
@@ -574,9 +578,7 @@ fn try_write_host_uuid_registry(hive: winreg::HKEY, uuid: &[u8; 16]) -> io::Resu
 
 #[cfg(not(windows))]
 fn user_uuid_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".config").join("aegis").join("uuid")
 }
 
@@ -596,7 +598,7 @@ fn try_read_host_uuid_file(path: &Path) -> io::Result<Option<[u8; 16]>> {
 #[cfg(not(windows))]
 fn try_write_host_uuid_file(path: &Path, uuid: &[u8; 16]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
     fs::write(path, uuid)
 }
