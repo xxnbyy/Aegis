@@ -8,26 +8,70 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SONAR_USER_HOME: ${{ github.workspace }}/.sonar
 
 jobs:
   quality-check:
     name: Security & Quality Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
         with:
           components: clippy, rustfmt, llvm-tools-preview
 
+      - name: Cache Rust Toolchain
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: |
+            ~/.rustup
+          key: rustup-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            rustup-${{ runner.os }}-
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97
+        with:
+          shared-key: quality-check
+
+      - name: Cache Cargo Tools
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates2.json
+            ~/.cargo/.crates.toml
+          key: cargo-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            cargo-tools-${{ runner.os }}-
+
+      - name: Cache RustSec Advisory DB
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: |
+            ~/.cargo/advisory-db
+          key: rustsec-db-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            rustsec-db-${{ runner.os }}-
+
+      - name: Cache SonarCloud
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: |
+            .sonar/cache
+          key: sonar-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            sonar-${{ runner.os }}-
+
       - name: Install Cargo Tools
         run: |
-          cargo install cargo-deny --locked
-          cargo install cargo-llvm-cov --locked
-          cargo install cargo-audit --locked
+          command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked
+          command -v cargo-llvm-cov >/dev/null 2>&1 || cargo install cargo-llvm-cov --locked
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
 
       - name: Check Formatting
         run: cargo fmt -- --check
@@ -45,10 +89,11 @@ jobs:
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@master
+        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
         with:
           args: >
             -Dsonar.verbose=true

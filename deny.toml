@@ -1,11 +1,7 @@
 [advisories]
-version = 2
-yanked = "deny"
-ignore = []
+
 
 [licenses]
-version = 2
-unused-allowed-license = "allow"
 allow = [
     "AGPL-3.0-only",
     "Apache-2.0",
@@ -19,4 +15,3 @@ confidence-threshold = 0.8
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
-
