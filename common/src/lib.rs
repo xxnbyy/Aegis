@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#![doc = "Aegis 通用基础库：协议类型、错误类型与加密原语。"]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[doc = "加密模块：提供基于 XChaCha20-Poly1305 的加密与解密。"]
+pub mod crypto;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+#[doc = "错误模块：全局错误类型与错误码。"]
+pub mod error;
+
+#[doc = "协议模块：用于 Probe/Console 之间的消息结构定义。"]
+pub mod protocol;
+
+pub use crypto::{decrypt, encrypt};
+pub use error::{AegisError, ErrorCode};
