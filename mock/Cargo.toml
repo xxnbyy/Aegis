@@ -5,6 +5,21 @@ version.workspace = true
 license = "AGPL-3.0-only"
 
 [dependencies]
+common = { path = "../common" }
+aes-kw = { version = "0.2", features = ["std"] }
+argon2 = "0.5"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+prost = "0.12"
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 
 [lints]
 workspace = true
