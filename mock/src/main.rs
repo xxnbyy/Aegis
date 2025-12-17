@@ -693,7 +693,9 @@ mod tests {
     use rsa::RsaPublicKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use rsa::pkcs8::EncodePublicKey;
+    use rsa::pkcs8::LineEnding;
     use rsa::traits::PublicKeyParts;
 
     type ArtifactParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
@@ -704,6 +706,45 @@ mod tests {
         let dir = base.join(id);
         fs::create_dir_all(dir.as_path()).map_err(io_error)?;
         Ok(dir)
+    }
+
+    fn ensure_repo_dev_keys(workspace_root: &Path) -> Result<(), AegisError> {
+        let keys_dir = workspace_root.join("tests/keys");
+        fs::create_dir_all(keys_dir.as_path()).map_err(io_error)?;
+        let public_key_path = keys_dir.join("dev_org_public.der");
+        let private_key_path = keys_dir.join("dev_org_private.pem");
+
+        if public_key_path.exists() && private_key_path.exists() {
+            return Ok(());
+        }
+
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                message: format!("生成 dev RSA 私钥失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let public_key = RsaPublicKey::from(&private_key);
+
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("导出 dev Org Public Key DER 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?
+            .as_bytes()
+            .to_vec();
+        fs::write(public_key_path.as_path(), public_key_der).map_err(io_error)?;
+
+        let private_pem =
+            private_key
+                .to_pkcs8_pem(LineEnding::LF)
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("导出 dev Org Private Key PEM 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        fs::write(private_key_path.as_path(), private_pem.as_bytes()).map_err(io_error)?;
+        Ok(())
     }
 
     fn read_artifact_parts(
@@ -1077,6 +1118,13 @@ events:
                 return Ok(());
             }
         }
+        let workspace_root = find_workspace_root(&std::env::current_dir().map_err(io_error)?)
+            .ok_or(AegisError::ConfigError {
+                message: "无法定位 workspace root（未找到包含 [workspace] 的 Cargo.toml）"
+                    .to_string(),
+            })?;
+        ensure_repo_dev_keys(workspace_root.as_path())?;
+
         let temp_dir = unique_temp_dir()?;
         let scenario_path = temp_dir.join("scenario.yml");
         let out_path = temp_dir.join("out.aes");
@@ -1104,11 +1152,6 @@ events:
             None,
         )?;
         let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
-        let workspace_root = find_workspace_root(&std::env::current_dir().map_err(io_error)?)
-            .ok_or(AegisError::ConfigError {
-                message: "无法定位 workspace root（未找到包含 [workspace] 的 Cargo.toml）"
-                    .to_string(),
-            })?;
         let public_key_der =
             fs::read(workspace_root.join("tests/keys/dev_org_public.der")).map_err(io_error)?;
         let expected_fp = xxh64(public_key_der.as_slice(), 0).to_be_bytes();
