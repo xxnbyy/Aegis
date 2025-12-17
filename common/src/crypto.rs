@@ -6,6 +6,7 @@ use crate::error::AegisError;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 
+#[allow(clippy::missing_errors_doc)]
 pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| AegisError::CryptoError {
         message: "无效的密钥长度，XChaCha20Poly1305 需要 32 字节密钥".to_string(),
@@ -49,6 +50,7 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     Ok(out)
 }
 
+#[allow(clippy::missing_errors_doc)]
 pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| AegisError::CryptoError {
         message: "无效的密钥长度，XChaCha20Poly1305 需要 32 字节密钥".to_string(),
