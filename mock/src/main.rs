@@ -134,16 +134,25 @@ fn run_with_paths(
 
     let (public_key, public_key_der) = match mode {
         "dev" => {
-            let workspace_root = find_workspace_root(&std::env::current_dir().map_err(io_error)?)
+            if let Some(cert_path) = cert_path {
+                let public_key_der =
+                    fs::read(cert_path).map_err(|err| io_error_with_path(&err, cert_path))?;
+                let public_key = load_rsa_public_key(&public_key_der)?;
+                (public_key, public_key_der)
+            } else {
+                let workspace_root = find_workspace_root(
+                    &std::env::current_dir().map_err(io_error)?,
+                )
                 .ok_or(AegisError::ConfigError {
-                message: "无法定位 workspace root（未找到包含 [workspace] 的 Cargo.toml）"
-                    .to_string(),
-            })?;
-            let public_key_path = workspace_root.join("tests/keys/dev_org_public.der");
-            let public_key_der = fs::read(&public_key_path)
-                .map_err(|err| io_error_with_path(&err, &public_key_path))?;
-            let public_key = load_rsa_public_key(&public_key_der)?;
-            (public_key, public_key_der)
+                    message: "无法定位 workspace root（未找到包含 [workspace] 的 Cargo.toml）"
+                        .to_string(),
+                })?;
+                let public_key_path = workspace_root.join("tests/keys/dev_org_public.der");
+                let public_key_der = fs::read(&public_key_path)
+                    .map_err(|err| io_error_with_path(&err, &public_key_path))?;
+                let public_key = load_rsa_public_key(&public_key_der)?;
+                (public_key, public_key_der)
+            }
         }
         "prod" => {
             let cert_path = cert_path.ok_or(AegisError::ConfigError {
@@ -640,8 +649,8 @@ mod tests {
     use super::*;
 
     use rsa::RsaPrivateKey;
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
 
     type ArtifactParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
@@ -652,15 +661,6 @@ mod tests {
         let dir = base.join(id);
         fs::create_dir_all(dir.as_path()).map_err(io_error)?;
         Ok(dir)
-    }
-
-    fn load_rsa_private_key(pem: &str) -> Result<RsaPrivateKey, AegisError> {
-        let pem = pem.trim_start_matches('\u{feff}').trim();
-        RsaPrivateKey::from_pkcs8_pem(pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
-            .map_err(|e| AegisError::ConfigError {
-                message: format!("解析 Private Key PEM 失败: {e}"),
-            })
     }
 
     fn read_artifact_parts(
@@ -771,14 +771,28 @@ mod tests {
             }
         }
 
-        let workspace_root = find_workspace_root(&std::env::current_dir().map_err(io_error)?)
-            .ok_or(AegisError::ConfigError {
-                message: "无法定位 workspace root".to_string(),
-            })?;
-
         let temp_dir = unique_temp_dir()?;
         let scenario_path = temp_dir.join("scenario.yml");
         let out_path = temp_dir.join("out.aes");
+        let cert_path = temp_dir.join("org_public.der");
+
+        let password = "aegis-dev";
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                message: format!("生成 RSA 私钥失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let public_key = RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("导出 Org Public Key DER 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?
+            .as_bytes()
+            .to_vec();
+        fs::write(cert_path.as_path(), public_key_der.as_slice()).map_err(io_error)?;
 
         let scenario_yaml = r#"
 events:
@@ -799,13 +813,11 @@ events:
             scenario_path.as_path(),
             out_path.as_path(),
             "dev",
-            None,
-            None,
+            Some(cert_path.as_path()),
+            Some(password),
         )?;
         let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
 
-        let public_key_der =
-            fs::read(workspace_root.join("tests/keys/dev_org_public.der")).map_err(io_error)?;
         let expected_fp = xxh64(public_key_der.as_slice(), 0).to_be_bytes();
         assert_eq!(
             &artifact[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8],
@@ -826,11 +838,6 @@ events:
                 .any(|b| *b != 0)
         );
 
-        let private_key_pem =
-            fs::read_to_string(workspace_root.join("tests/keys/dev_org_private.pem"))
-                .map_err(io_error)?;
-        let private_key = load_rsa_private_key(private_key_pem.as_str())?;
-
         let rsa_ct_len = private_key.size();
         let (user_slot, rsa_ct, stream) = read_artifact_parts(artifact.as_slice(), rsa_ct_len)?;
 
@@ -841,7 +848,7 @@ events:
                 message: "读取 KDF_Salt 失败".to_string(),
                 code: None,
             })?;
-        let kek_bytes = derive_kek(b"aegis-dev", kdf_salt.as_ref())?;
+        let kek_bytes = derive_kek(password.as_bytes(), kdf_salt.as_ref())?;
         let kek = Kek::from(kek_bytes);
         let unwrapped = kek
             .unwrap_vec(user_slot)
