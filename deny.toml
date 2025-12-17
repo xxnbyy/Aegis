@@ -1,17 +1,16 @@
 [advisories]
-vulnerability = "deny"
+version = 2
 yanked = "deny"
 ignore = []
 
 [licenses]
-unlicensed = "deny"
+version = 2
 allow = [
+    "AGPL-3.0-only",
     "Apache-2.0",
-    "MIT",
     "BSD-3-Clause",
-    "ISC",
-    "Unicode-DFS-2016",
-    "MPL-2.0",
+    "MIT",
+    "Unicode-3.0",
 ]
 confidence-threshold = 0.8
 
