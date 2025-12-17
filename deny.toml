@@ -1,17 +1,11 @@
 [advisories]
-vulnerability = "deny"
-yanked = "deny"
-ignore = []
+
 
 [licenses]
 unlicensed = "deny"
 allow = [
     "Apache-2.0",
     "MIT",
-    "BSD-3-Clause",
-    "ISC",
-    "Unicode-DFS-2016",
-    "MPL-2.0",
 ]
 confidence-threshold = 0.8
 
@@ -19,4 +13,3 @@ confidence-threshold = 0.8
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
-
