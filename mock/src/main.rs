@@ -693,9 +693,7 @@ mod tests {
     use rsa::RsaPublicKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
-    use rsa::pkcs8::EncodePrivateKey;
     use rsa::pkcs8::EncodePublicKey;
-    use rsa::pkcs8::LineEnding;
     use rsa::traits::PublicKeyParts;
 
     type ArtifactParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
@@ -706,45 +704,6 @@ mod tests {
         let dir = base.join(id);
         fs::create_dir_all(dir.as_path()).map_err(io_error)?;
         Ok(dir)
-    }
-
-    fn ensure_repo_dev_keys(workspace_root: &Path) -> Result<(), AegisError> {
-        let keys_dir = workspace_root.join("tests/keys");
-        fs::create_dir_all(keys_dir.as_path()).map_err(io_error)?;
-        let public_key_path = keys_dir.join("dev_org_public.der");
-        let private_key_path = keys_dir.join("dev_org_private.pem");
-
-        if public_key_path.exists() && private_key_path.exists() {
-            return Ok(());
-        }
-
-        let mut rng = OsRng;
-        let private_key =
-            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
-                message: format!("生成 dev RSA 私钥失败: {e}"),
-                code: Some(ErrorCode::Crypto003),
-            })?;
-        let public_key = RsaPublicKey::from(&private_key);
-
-        let public_key_der = public_key
-            .to_public_key_der()
-            .map_err(|e| AegisError::CryptoError {
-                message: format!("导出 dev Org Public Key DER 失败: {e}"),
-                code: Some(ErrorCode::Crypto003),
-            })?
-            .as_bytes()
-            .to_vec();
-        fs::write(public_key_path.as_path(), public_key_der).map_err(io_error)?;
-
-        let private_pem =
-            private_key
-                .to_pkcs8_pem(LineEnding::LF)
-                .map_err(|e| AegisError::CryptoError {
-                    message: format!("导出 dev Org Private Key PEM 失败: {e}"),
-                    code: Some(ErrorCode::Crypto003),
-                })?;
-        fs::write(private_key_path.as_path(), private_pem.as_bytes()).map_err(io_error)?;
-        Ok(())
     }
 
     fn read_artifact_parts(
@@ -1123,7 +1082,8 @@ events:
                 message: "无法定位 workspace root（未找到包含 [workspace] 的 Cargo.toml）"
                     .to_string(),
             })?;
-        ensure_repo_dev_keys(workspace_root.as_path())?;
+        let public_key_path = workspace_root.join("tests/keys/dev_org_public.der");
+        let private_key_path = workspace_root.join("tests/keys/dev_org_private.pem");
 
         let temp_dir = unique_temp_dir()?;
         let scenario_path = temp_dir.join("scenario.yml");
@@ -1144,30 +1104,61 @@ events:
 "#;
         fs::write(scenario_path.as_path(), scenario_yaml).map_err(io_error)?;
 
-        run_with_paths(
-            scenario_path.as_path(),
-            out_path.as_path(),
-            "dev",
-            None,
-            None,
-        )?;
+        let (expected_public_der, private_key) = if public_key_path.exists()
+            && private_key_path.exists()
+        {
+            run_with_paths(
+                scenario_path.as_path(),
+                out_path.as_path(),
+                "dev",
+                None,
+                None,
+            )?;
+            let public_der = fs::read(public_key_path.as_path()).map_err(io_error)?;
+            let private_pem = fs::read_to_string(private_key_path.as_path()).map_err(io_error)?;
+            let private_pem = private_pem.trim().trim_start_matches('\u{feff}');
+            let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem)
+                .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_pem))
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("解析 dev_org_private.pem 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+            (public_der, private_key)
+        } else {
+            let mut rng = OsRng;
+            let private_key =
+                RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                    message: format!("生成 dev RSA 私钥失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+            let public_key = RsaPublicKey::from(&private_key);
+            let public_key_der = public_key
+                .to_public_key_der()
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("导出 dev Org Public Key DER 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?
+                .as_bytes()
+                .to_vec();
+
+            let cert_path = temp_dir.join("dev_org_public.der");
+            fs::write(cert_path.as_path(), public_key_der.as_slice()).map_err(io_error)?;
+            run_with_paths(
+                scenario_path.as_path(),
+                out_path.as_path(),
+                "dev",
+                Some(cert_path.as_path()),
+                None,
+            )?;
+            (public_key_der, private_key)
+        };
+
         let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
-        let public_key_der =
-            fs::read(workspace_root.join("tests/keys/dev_org_public.der")).map_err(io_error)?;
-        let expected_fp = xxh64(public_key_der.as_slice(), 0).to_be_bytes();
+        let expected_fp = xxh64(expected_public_der.as_slice(), 0).to_be_bytes();
         assert_eq!(
             &artifact[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8],
             expected_fp.as_slice()
         );
-        let private_pem = fs::read_to_string(workspace_root.join("tests/keys/dev_org_private.pem"))
-            .map_err(io_error)?;
-        let private_pem = private_pem.trim().trim_start_matches('\u{feff}');
-        let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_pem))
-            .map_err(|e| AegisError::CryptoError {
-                message: format!("解析 dev_org_private.pem 失败: {e}"),
-                code: Some(ErrorCode::Crypto003),
-            })?;
         let rsa_ct_len = private_key.size();
         let (user_slot, rsa_ct, stream) = read_artifact_parts(artifact.as_slice(), rsa_ct_len)?;
         let kdf_salt: [u8; KDF_SALT_LEN] = artifact
