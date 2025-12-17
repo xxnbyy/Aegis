@@ -6,11 +6,6 @@ use crate::error::AegisError;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 
-#[doc = "使用 XChaCha20-Poly1305 加密，并输出 Doc-06 Chunk 格式。"]
-#[doc = ""]
-#[doc = "输出格式：`[nonce(24B)] + [payload_len(u32,BE)] + [ciphertext(N)] + [tag(16B)]`。"]
-#[doc = ""]
-#[doc = "Errors: 当密钥长度无效、随机数生成失败或加密失败时返回错误。"]
 pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| AegisError::CryptoError {
         message: "无效的密钥长度，XChaCha20Poly1305 需要 32 字节密钥".to_string(),
@@ -54,11 +49,6 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     Ok(out)
 }
 
-#[doc = "使用 XChaCha20-Poly1305 解密 Doc-06 Chunk 格式数据。"]
-#[doc = ""]
-#[doc = "输入格式：`[nonce(24B)] + [payload_len(u32,BE)] + [ciphertext(N)] + [tag(16B)]`。"]
-#[doc = ""]
-#[doc = "Errors: 当密钥长度无效、输入格式不合法或认证失败时返回错误。"]
 pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| AegisError::CryptoError {
         message: "无效的密钥长度，XChaCha20Poly1305 需要 32 字节密钥".to_string(),
