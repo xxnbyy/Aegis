@@ -1,6 +1,6 @@
 # Docs (Local only)
-.doc/
-doc/
+.docs/
+docs/
 
 # Rust
 /target/
