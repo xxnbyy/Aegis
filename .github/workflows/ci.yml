@@ -23,11 +23,27 @@ jobs:
         with:
           components: clippy, rustfmt, llvm-tools-preview
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quality-check
+
+      - name: Cache Cargo Tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates2.json
+            ~/.cargo/.crates.toml
+          key: cargo-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            cargo-tools-${{ runner.os }}-
+
       - name: Install Cargo Tools
         run: |
-          cargo install cargo-deny --locked
-          cargo install cargo-llvm-cov --locked
-          cargo install cargo-audit --locked
+          command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked
+          command -v cargo-llvm-cov >/dev/null 2>&1 || cargo install cargo-llvm-cov --locked
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
 
       - name: Check Formatting
         run: cargo fmt -- --check
