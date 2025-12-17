@@ -1,2 +1,27 @@
+# Docs (Local only)
 .doc/
+doc/
 
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node/Frontend
+node_modules/
+dist/
+build/
+
+# IDE & System
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Secrets (Strict)
+*.env
+.env
+*.pem
+*.der
+*.key
+secrets/

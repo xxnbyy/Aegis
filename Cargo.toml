@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["common", "probe", "console", "sdk", "mock"]
+members = ["common", "probe", "sdk", "mock"]
 
 [workspace.package]
 version = "0.0.1"

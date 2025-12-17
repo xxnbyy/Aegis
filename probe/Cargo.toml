@@ -1,0 +1,9 @@
+[package]
+name = "probe"
+edition = "2024"
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
