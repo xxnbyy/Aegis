@@ -1,6 +1,6 @@
 # Docs (Local only)
-.docs/
-docs/
+.doc/
+doc/
 
 # Rust
 /target/
@@ -25,3 +25,4 @@ build/
 *.der
 *.key
 secrets/
+tests/keys/
