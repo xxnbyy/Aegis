@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SONAR_USER_HOME: ${{ github.workspace }}/.sonar
 
 jobs:
   quality-check:
@@ -22,6 +23,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt, llvm-tools-preview
+
+      - name: Cache Rust Toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+          key: rustup-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            rustup-${{ runner.os }}-
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -38,6 +48,24 @@ jobs:
           key: cargo-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             cargo-tools-${{ runner.os }}-
+
+      - name: Cache RustSec Advisory DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/advisory-db
+          key: rustsec-db-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            rustsec-db-${{ runner.os }}-
+
+      - name: Cache SonarCloud
+        uses: actions/cache@v4
+        with:
+          path: |
+            .sonar/cache
+          key: sonar-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            sonar-${{ runner.os }}-
 
       - name: Install Cargo Tools
         run: |
