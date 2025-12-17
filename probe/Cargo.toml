@@ -5,6 +5,8 @@ version.workspace = true
 license = "AGPL-3.0-only"
 
 [dependencies]
+common = { path = "../common" }
+tracing = "0.1"
 
 [lints]
 workspace = true

@@ -7,10 +7,23 @@ license = "AGPL-3.0-only"
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 getrandom = "0.2"
 prost = "0.12"
 prost-types = "0.12"
+arc-swap = "1"
+notify = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+argon2 = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+prost-build = "0.12"
+protoc-bin-vendored = "3"
 
 [lints]
 workspace = true
