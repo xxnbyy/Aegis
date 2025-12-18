@@ -443,8 +443,9 @@ fn random_session_key() -> [u8; 32] {
 
 fn resolve_password(mode: &str, password: Option<&str>) -> Result<String, AegisError> {
     match (mode, password) {
-        ("dev", None) => std::env::var("AEGIS_DEV_PASSWORD").map_err(|_| AegisError::ConfigError {
-            message: "dev 模式必须提供 --password 或设置环境变量 AEGIS_DEV_PASSWORD".to_string(),
+        ("dev", None) => Ok(match std::env::var("AEGIS_DEV_PASSWORD") {
+            Ok(v) => v,
+            Err(_) => Uuid::new_v4().to_string(),
         }),
         ("dev" | "prod", Some(p)) => Ok(p.to_string()),
         ("prod", None) => Err(AegisError::ConfigError {
