@@ -443,7 +443,9 @@ fn random_session_key() -> [u8; 32] {
 
 fn resolve_password(mode: &str, password: Option<&str>) -> Result<String, AegisError> {
     match (mode, password) {
-        ("dev", None) => Ok("aegis-dev".to_string()),
+        ("dev", None) => std::env::var("AEGIS_DEV_PASSWORD").map_err(|_| AegisError::ConfigError {
+            message: "dev 模式必须提供 --password 或设置环境变量 AEGIS_DEV_PASSWORD".to_string(),
+        }),
         ("dev" | "prod", Some(p)) => Ok(p.to_string()),
         ("prod", None) => Err(AegisError::ConfigError {
             message: "prod 模式必须提供 --password".to_string(),
@@ -698,6 +700,10 @@ mod tests {
 
     type ArtifactParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
 
+    fn test_passphrase() -> String {
+        Uuid::new_v4().to_string()
+    }
+
     fn unique_temp_dir() -> Result<PathBuf, AegisError> {
         let base = std::env::temp_dir();
         let id = format!("aegis-mock-{}-{}", std::process::id(), timestamp_now());
@@ -819,7 +825,7 @@ mod tests {
         let out_path = temp_dir.join("out.aes");
         let cert_path = temp_dir.join("org_public.der");
 
-        let password = "aegis-dev";
+        let passphrase = test_passphrase();
         let mut rng = OsRng;
         let private_key =
             RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
@@ -857,7 +863,7 @@ events:
             out_path.as_path(),
             "dev",
             Some(cert_path.as_path()),
-            Some(password),
+            Some(passphrase.as_str()),
         )?;
         let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
 
@@ -891,7 +897,7 @@ events:
                 message: "读取 KDF_Salt 失败".to_string(),
                 code: None,
             })?;
-        let kek_bytes = derive_kek(password.as_bytes(), kdf_salt.as_ref())?;
+        let kek_bytes = derive_kek(passphrase.as_bytes(), kdf_salt.as_ref())?;
         let kek = Kek::from(kek_bytes);
         let unwrapped = kek
             .unwrap_vec(user_slot)
@@ -997,12 +1003,13 @@ events:
             }],
         };
 
+        let passphrase = test_passphrase();
         let artifact = build_artifact(
             "dev",
             &scenario,
             &public_key,
             public_key_der.as_slice(),
-            "aegis-dev",
+            passphrase.as_str(),
         )?;
         assert!(
             artifact
@@ -1048,12 +1055,13 @@ events:
             ],
         };
 
+        let passphrase = test_passphrase();
         let err = build_artifact(
             "dev",
             &scenario,
             &public_key,
             public_key_der.as_slice(),
-            "aegis-dev",
+            passphrase.as_str(),
         )
         .err();
         assert!(matches!(err, Some(AegisError::ProtocolError { .. })));
@@ -1088,6 +1096,7 @@ events:
         let temp_dir = unique_temp_dir()?;
         let scenario_path = temp_dir.join("scenario.yml");
         let out_path = temp_dir.join("out.aes");
+        let passphrase = test_passphrase();
         let scenario_yaml = r#"
 events:
   - type: process
@@ -1112,7 +1121,7 @@ events:
                 out_path.as_path(),
                 "dev",
                 None,
-                None,
+                Some(passphrase.as_str()),
             )?;
             let public_der = fs::read(public_key_path.as_path()).map_err(io_error)?;
             let private_pem = fs::read_to_string(private_key_path.as_path()).map_err(io_error)?;
@@ -1148,7 +1157,7 @@ events:
                 out_path.as_path(),
                 "dev",
                 Some(cert_path.as_path()),
-                None,
+                Some(passphrase.as_str()),
             )?;
             (public_key_der, private_key)
         };
@@ -1168,7 +1177,7 @@ events:
                 message: "读取 KDF_Salt 失败".to_string(),
                 code: None,
             })?;
-        let kek_bytes = derive_kek("aegis-dev".as_bytes(), kdf_salt.as_ref())?;
+        let kek_bytes = derive_kek(passphrase.as_bytes(), kdf_salt.as_ref())?;
         let kek = Kek::from(kek_bytes);
         let unwrapped = kek
             .unwrap_vec(user_slot)
