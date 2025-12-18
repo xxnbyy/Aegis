@@ -7,6 +7,10 @@ use std::time::Duration;
 use common::config::{ConfigManager, load_yaml_file};
 use common::telemetry::init_telemetry;
 
+mod embedded_key {
+    include!(concat!(env!("OUT_DIR"), "/embedded_org_pubkey.rs"));
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("{e}");
@@ -25,12 +29,11 @@ fn run() -> Result<(), String> {
     }
     cfg.validate().map_err(|e| format!("配置校验失败: {e}"))?;
 
-    if is_unsigned_build() && cfg.crypto.org_key_path.is_none() {
-        return Err(
-            "Unsigned build 模式下必须显式配置 crypto.org_key_path 或传入 --org-key-path"
-                .to_string(),
-        );
-    }
+    validate_key_requirements(
+        is_unsigned_build(),
+        embedded_key::EMBEDDED_ORG_PUBKEY_DER.is_some(),
+        cfg.crypto.org_key_path.is_some(),
+    )?;
 
     let mut mgr = ConfigManager::from_config(args.config_path, cfg)
         .map_err(|e| format!("初始化配置管理器失败: {e}"))?;
@@ -45,6 +48,29 @@ fn run() -> Result<(), String> {
 
 fn is_unsigned_build() -> bool {
     option_env!("AEGIS_IS_UNSIGNED_BUILD").is_some()
+}
+
+fn validate_key_requirements(
+    is_unsigned_build: bool,
+    has_embedded_key: bool,
+    has_external_key_path: bool,
+) -> Result<(), String> {
+    if is_unsigned_build {
+        if !has_external_key_path {
+            return Err(
+                "Unsigned build 模式下必须显式配置 crypto.org_key_path 或传入 --org-key-path"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    if !has_external_key_path && !has_embedded_key {
+        return Err(
+            "必须显式配置 crypto.org_key_path 或在构建期注入 AEGIS_ORG_PUBKEY_PATH".to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -85,4 +111,25 @@ where
         config_path,
         org_key_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_key_requirements;
+
+    #[test]
+    fn unsigned_build_requires_external_key_path() {
+        assert!(validate_key_requirements(true, false, false).is_err());
+        assert!(validate_key_requirements(true, true, false).is_err());
+        assert!(validate_key_requirements(true, false, true).is_ok());
+        assert!(validate_key_requirements(true, true, true).is_ok());
+    }
+
+    #[test]
+    fn signed_build_requires_embedded_or_external_key() {
+        assert!(validate_key_requirements(false, false, false).is_err());
+        assert!(validate_key_requirements(false, true, false).is_ok());
+        assert!(validate_key_requirements(false, false, true).is_ok());
+        assert!(validate_key_requirements(false, true, true).is_ok());
+    }
 }
