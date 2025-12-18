@@ -306,9 +306,8 @@ impl CpuUsageTracker {
 
     #[cfg(not(windows))]
     fn sample_linux_max_core_usage(&mut self) -> u32 {
-        let text = match std::fs::read_to_string("/proc/stat") {
-            Ok(t) => t,
-            Err(_) => return 0,
+        let Ok(text) = std::fs::read_to_string("/proc/stat") else {
+            return 0;
         };
         let current = parse_proc_stat_cores(text.as_str());
         match self.prev.as_mut() {
@@ -361,7 +360,7 @@ fn parse_proc_stat_cores(text: &str) -> Vec<CpuTimes> {
         };
 
         let mut vals = [0u64; 8];
-        for v in vals.iter_mut() {
+        for v in &mut vals {
             let Some(tok) = it.next() else {
                 *v = 0;
                 continue;

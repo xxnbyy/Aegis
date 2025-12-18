@@ -737,8 +737,13 @@ mod tests {
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
+    #[cfg(windows)]
+    use std::sync::Mutex;
 
     type ArtifactParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
+    #[cfg(windows)]
+    static REGISTRY_MUTEX: Mutex<()> = Mutex::new(());
 
     fn test_passphrase() -> String {
         Uuid::new_v4().to_string()
@@ -842,6 +847,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn generate_then_decrypt_roundtrip() -> Result<(), AegisError> {
+        #[cfg(windows)]
+        let _guard = REGISTRY_MUTEX.lock().unwrap();
+
         #[cfg(windows)]
         {
             use winreg::RegKey;
@@ -1087,6 +1095,9 @@ events:
     #[allow(clippy::too_many_lines)]
     fn dev_mode_without_cert_works_with_fallback_key() -> Result<(), AegisError> {
         #[cfg(windows)]
+        let _guard = REGISTRY_MUTEX.lock().unwrap();
+
+        #[cfg(windows)]
         {
             use winreg::RegKey;
             use winreg::enums::HKEY_CURRENT_USER;
@@ -1128,6 +1139,8 @@ events:
     #[test]
     #[cfg(windows)]
     fn host_uuid_is_persisted_in_dev_mode() -> Result<(), AegisError> {
+        let _guard = REGISTRY_MUTEX.lock().unwrap();
+
         use winreg::RegKey;
         use winreg::enums::HKEY_CURRENT_USER;
 
@@ -1136,8 +1149,12 @@ events:
         let expected = Uuid::new_v4().to_string();
         key.set_value("HostUUID", &expected).map_err(io_error)?;
 
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        let hklm = try_read_host_uuid_registry(HKEY_LOCAL_MACHINE).map_err(io_error)?;
         let first = get_or_create_host_uuid("dev")?;
-        assert_eq!(Uuid::from_bytes(first).to_string(), expected);
+        if hklm.is_none() {
+            assert_eq!(Uuid::from_bytes(first).to_string(), expected);
+        }
 
         let second = get_or_create_host_uuid("dev")?;
         assert_eq!(first, second);
@@ -1335,6 +1352,9 @@ events:
     #[test]
     #[allow(clippy::too_many_lines)]
     fn generate_then_decrypt_roundtrip_with_repo_dev_keys() -> Result<(), AegisError> {
+        #[cfg(windows)]
+        let _guard = REGISTRY_MUTEX.lock().unwrap();
+
         #[cfg(windows)]
         {
             use winreg::RegKey;
