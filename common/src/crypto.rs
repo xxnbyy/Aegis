@@ -1,6 +1,7 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hmac::Mac;
 
 use crate::error::AegisError;
 
@@ -11,6 +12,20 @@ const ARGON2ID_OUTPUT_LEN: usize = 32;
 const ARGON2ID_M_COST_KIB: u32 = 65_536;
 const ARGON2ID_T_COST: u32 = 4;
 const ARGON2ID_P_COST: u32 = 2;
+
+pub const HMAC_SIG_TRAILER_LEN: usize = 40;
+pub const HMAC_SIG_MAGIC: [u8; 4] = *b"AEHS";
+const HMAC_SIG_VERSION_V1: u8 = 1;
+const HMAC_SIG_ALG_HMAC_SHA256: u8 = 1;
+const HMAC_SIG_LABEL_V1: &[u8] = b"AEGIS-HMAC-SIG-v1";
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HmacSigVerification {
+    Missing,
+    Valid,
+    Invalid,
+}
 
 #[allow(clippy::missing_errors_doc)]
 pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
@@ -126,6 +141,87 @@ pub fn derive_kek_argon2id(
     Ok(out)
 }
 
+#[allow(clippy::missing_errors_doc)]
+pub fn append_hmac_sig_trailer_v1(
+    bytes: &mut Vec<u8>,
+    session_key: &[u8; 32],
+) -> Result<(), AegisError> {
+    let tag = compute_hmac_sig_v1(session_key, bytes.as_slice())?;
+    bytes.extend_from_slice(HMAC_SIG_MAGIC.as_slice());
+    bytes.push(HMAC_SIG_VERSION_V1);
+    bytes.push(HMAC_SIG_ALG_HMAC_SHA256);
+    bytes.extend_from_slice(&[0u8; 2]);
+    bytes.extend_from_slice(tag.as_slice());
+    Ok(())
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn verify_hmac_sig_trailer_v1(
+    bytes: &[u8],
+    session_key: &[u8; 32],
+) -> Result<HmacSigVerification, AegisError> {
+    let Some((trailer_start, tag)) = extract_hmac_sig_trailer_v1(bytes) else {
+        return Ok(HmacSigVerification::Missing);
+    };
+
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(session_key).map_err(|_| AegisError::CryptoError {
+            message: "初始化 HMAC 失败".to_string(),
+            code: None,
+        })?;
+    mac.update(HMAC_SIG_LABEL_V1);
+    mac.update(
+        bytes
+            .get(..trailer_start)
+            .ok_or(AegisError::ProtocolError {
+                message: "HMAC trailer_start 越界".to_string(),
+                code: None,
+            })?,
+    );
+    Ok(match mac.verify_slice(tag.as_slice()) {
+        Ok(()) => HmacSigVerification::Valid,
+        Err(_) => HmacSigVerification::Invalid,
+    })
+}
+
+fn compute_hmac_sig_v1(session_key: &[u8; 32], payload: &[u8]) -> Result<[u8; 32], AegisError> {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(session_key).map_err(|_| AegisError::CryptoError {
+            message: "初始化 HMAC 失败".to_string(),
+            code: None,
+        })?;
+    mac.update(HMAC_SIG_LABEL_V1);
+    mac.update(payload);
+    let out = mac.finalize().into_bytes();
+    let arr: [u8; 32] = out
+        .as_slice()
+        .try_into()
+        .map_err(|_| AegisError::CryptoError {
+            message: "HMAC 输出长度异常".to_string(),
+            code: None,
+        })?;
+    Ok(arr)
+}
+
+fn extract_hmac_sig_trailer_v1(bytes: &[u8]) -> Option<(usize, [u8; 32])> {
+    let trailer_start = bytes.len().checked_sub(HMAC_SIG_TRAILER_LEN)?;
+    let trailer = bytes.get(trailer_start..)?;
+    let magic = trailer.get(0..4)?;
+    if magic != HMAC_SIG_MAGIC.as_slice() {
+        return None;
+    }
+    let version = *trailer.get(4)?;
+    let alg = *trailer.get(5)?;
+    if version != HMAC_SIG_VERSION_V1 || alg != HMAC_SIG_ALG_HMAC_SHA256 {
+        return None;
+    }
+    if trailer.get(6..8)? != [0u8; 2].as_slice() {
+        return None;
+    }
+    let tag: [u8; 32] = trailer.get(8..40)?.try_into().ok()?;
+    Some((trailer_start, tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +281,27 @@ mod tests {
         let k1 = derive_kek_argon2id(b"a".as_slice(), salt.as_slice())?;
         let k2 = derive_kek_argon2id(b"b".as_slice(), salt.as_slice())?;
         assert_ne!(k1, k2);
+        Ok(())
+    }
+
+    #[test]
+    fn hmac_sig_roundtrip_and_verification() -> Result<(), AegisError> {
+        let key = [3u8; 32];
+        let mut bytes = b"hello".to_vec();
+        assert_eq!(
+            verify_hmac_sig_trailer_v1(bytes.as_slice(), &key)?,
+            HmacSigVerification::Missing
+        );
+        append_hmac_sig_trailer_v1(&mut bytes, &key)?;
+        assert_eq!(
+            verify_hmac_sig_trailer_v1(bytes.as_slice(), &key)?,
+            HmacSigVerification::Valid
+        );
+        bytes[0] ^= 0x01;
+        assert_eq!(
+            verify_hmac_sig_trailer_v1(bytes.as_slice(), &key)?,
+            HmacSigVerification::Invalid
+        );
         Ok(())
     }
 }
