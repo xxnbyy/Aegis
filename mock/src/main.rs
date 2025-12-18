@@ -16,7 +16,8 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
-use rsa::{Oaep, RsaPublicKey};
+use rsa::pkcs8::EncodePublicKey;
+use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use sha2::Sha256;
 use uuid::Uuid;
 use xxhash_rust::xxh64::xxh64;
@@ -119,6 +120,37 @@ fn run() -> Result<(), AegisError> {
     )
 }
 
+fn default_dev_keys_dir() -> PathBuf {
+    std::env::temp_dir().join("aegis").join("dev_keys")
+}
+
+fn load_or_generate_default_dev_public_key_der() -> Result<Vec<u8>, AegisError> {
+    let dir = default_dev_keys_dir();
+    let path = dir.join("dev_org_public.der");
+    if path.exists() {
+        return fs::read(path.as_path()).map_err(|err| io_error_with_path(&err, path.as_path()));
+    }
+
+    let mut rng = OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+        message: format!("生成 dev RSA 私钥失败: {e}"),
+        code: Some(ErrorCode::Crypto003),
+    })?;
+    let public_key = RsaPublicKey::from(&private_key);
+    let public_key_der = public_key
+        .to_public_key_der()
+        .map_err(|e| AegisError::CryptoError {
+            message: format!("导出 dev Org Public Key DER 失败: {e}"),
+            code: Some(ErrorCode::Crypto003),
+        })?
+        .as_bytes()
+        .to_vec();
+
+    fs::create_dir_all(dir.as_path()).map_err(io_error)?;
+    fs::write(path.as_path(), public_key_der.as_slice()).map_err(io_error)?;
+    Ok(public_key_der)
+}
+
 fn run_with_paths(
     scenario_path: &Path,
     out_path: &Path,
@@ -148,8 +180,12 @@ fn run_with_paths(
                         .to_string(),
                 })?;
                 let public_key_path = workspace_root.join("tests/keys/dev_org_public.der");
-                let public_key_der = fs::read(&public_key_path)
-                    .map_err(|err| io_error_with_path(&err, &public_key_path))?;
+                let public_key_der = if public_key_path.exists() {
+                    fs::read(&public_key_path)
+                        .map_err(|err| io_error_with_path(&err, &public_key_path))?
+                } else {
+                    load_or_generate_default_dev_public_key_der()?
+                };
                 let public_key = load_rsa_public_key(&public_key_der)?;
                 (public_key, public_key_der)
             }
@@ -256,6 +292,8 @@ fn build_artifact(
     if any_data_loss {
         warnings.push("WARN: Trace file contains data loss events".to_string());
     }
+
+    crypto::append_hmac_sig_trailer_v1(&mut out, &session_key)?;
 
     Ok(BuildArtifactResult {
         bytes: out,
@@ -689,6 +727,7 @@ fn io_error_with_path(err: &io::Error, path: &Path) -> AegisError {
 mod tests {
     use super::*;
 
+    use common::protocol::{MessagePayload, validate_first_chunk_is_system_info};
     use rsa::RsaPrivateKey;
     use rsa::RsaPublicKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -745,19 +784,21 @@ mod tests {
 
         while offset < stream.len() {
             if stream.len().saturating_sub(offset) < 24 + 4 + 16 {
-                return Err(AegisError::ProtocolError {
-                    message: "Artifact chunk 长度不足".to_string(),
-                    code: None,
-                });
+                break;
             }
 
+            let Some(len_bytes) = stream.get(offset + 24..offset + 28) else {
+                break;
+            };
             let payload_len =
-                u32::from_be_bytes(stream[offset + 24..offset + 28].try_into().map_err(|_| {
-                    AegisError::ProtocolError {
-                        message: "读取 payload_len 失败".to_string(),
-                        code: None,
-                    }
-                })?) as usize;
+                u32::from_be_bytes(
+                    len_bytes
+                        .try_into()
+                        .map_err(|_| AegisError::ProtocolError {
+                            message: "读取 payload_len 失败".to_string(),
+                            code: None,
+                        })?,
+                ) as usize;
             if payload_len > MAX_CHUNK_PAYLOAD_LEN {
                 return Err(AegisError::PacketTooLarge {
                     size: payload_len,
@@ -773,20 +814,15 @@ mod tests {
                     message: "Artifact chunk_len 溢出".to_string(),
                     code: None,
                 })?;
-            let chunk = stream
-                .get(
-                    offset
-                        ..offset
-                            .checked_add(chunk_len)
-                            .ok_or(AegisError::ProtocolError {
-                                message: "Artifact offset 溢出".to_string(),
-                                code: None,
-                            })?,
-                )
+            let end = offset
+                .checked_add(chunk_len)
                 .ok_or(AegisError::ProtocolError {
-                    message: "Artifact chunk 截断".to_string(),
+                    message: "Artifact offset 溢出".to_string(),
                     code: None,
                 })?;
+            let Some(chunk) = stream.get(offset..end) else {
+                break;
+            };
             offset += chunk_len;
 
             let plaintext = crypto::decrypt(chunk, session_key.as_slice())?;
@@ -870,6 +906,11 @@ events:
         assert_eq!(&artifact[0..MAGIC.len()], MAGIC.as_slice());
         assert_eq!(artifact[0x05], VERSION);
         assert_eq!(artifact[0x06], CIPHER_ID_XCHACHA20);
+        assert_eq!(artifact[0x07], 0);
+        assert!(
+            artifact[0x40..0x40 + 80].iter().all(|b| *b == 0),
+            "Reserved 区必须全 0"
+        );
         assert!(
             artifact[KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
                 .iter()
@@ -883,6 +924,21 @@ events:
 
         let rsa_ct_len = private_key.size();
         let (user_slot, rsa_ct, stream) = read_artifact_parts(artifact.as_slice(), rsa_ct_len)?;
+        let first_payload_len = u32::from_be_bytes(
+            stream
+                .get(24..28)
+                .ok_or(AegisError::ProtocolError {
+                    message: "读取 payload_len 失败".to_string(),
+                    code: None,
+                })?
+                .try_into()
+                .map_err(|_| AegisError::ProtocolError {
+                    message: "读取 payload_len 失败".to_string(),
+                    code: None,
+                })?,
+        ) as usize;
+        let first_chunk_len = 24usize + 4 + first_payload_len + 16;
+        assert!(stream.len() >= first_chunk_len);
 
         let kdf_salt: [u8; KDF_SALT_LEN] = artifact
             [KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
@@ -925,6 +981,11 @@ events:
 
         assert_eq!(session_key_from_user, session_key_from_org);
 
+        assert_eq!(
+            crypto::verify_hmac_sig_trailer_v1(artifact.as_slice(), &session_key_from_org)?,
+            crypto::HmacSigVerification::Valid
+        );
+
         let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key_from_org)?;
         if plaintexts.len() < 4 {
             return Err(AegisError::ProtocolError {
@@ -939,6 +1000,7 @@ events:
                 code: None,
             }
         })?;
+        validate_first_chunk_is_system_info(&MessagePayload::SystemInfo(system_info.clone()))?;
         assert!(!system_info.hostname.is_empty());
 
         let process = ProcessInfo::decode(plaintexts[1].as_slice()).map_err(|e| {
@@ -1010,6 +1072,207 @@ events:
                 .iter()
                 .any(|w| w.as_str() == "WARN: Trace file contains data loss events")
         );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dev_mode_without_cert_works_with_fallback_key() -> Result<(), AegisError> {
+        #[cfg(windows)]
+        {
+            use winreg::RegKey;
+            use winreg::enums::HKEY_CURRENT_USER;
+
+            let root = RegKey::predef(HKEY_CURRENT_USER);
+            let Ok((key, _)) = root.create_subkey("SOFTWARE\\Aegis") else {
+                return Ok(());
+            };
+            let uuid_str = Uuid::new_v4().to_string();
+            if key.set_value("HostUUID", &uuid_str).is_err() {
+                return Ok(());
+            }
+        }
+
+        let temp_dir = unique_temp_dir()?;
+        let scenario_path = temp_dir.join("scenario.yml");
+        let out_path = temp_dir.join("out.aes");
+        let scenario_yaml = r#"
+events:
+  - type: process
+    exec_id: 1
+    pid: 2
+    name: "p"
+"#;
+        fs::write(scenario_path.as_path(), scenario_yaml).map_err(io_error)?;
+
+        run_with_paths(
+            scenario_path.as_path(),
+            out_path.as_path(),
+            "dev",
+            None,
+            None,
+        )?;
+        let out = fs::read(out_path.as_path()).map_err(io_error)?;
+        assert!(out.len() > HEADER_LEN);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_uuid_is_persisted_in_dev_mode() -> Result<(), AegisError> {
+        use winreg::RegKey;
+        use winreg::enums::HKEY_CURRENT_USER;
+
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = root.create_subkey("SOFTWARE\\Aegis").map_err(io_error)?;
+        let expected = Uuid::new_v4().to_string();
+        key.set_value("HostUUID", &expected).map_err(io_error)?;
+
+        let first = get_or_create_host_uuid("dev")?;
+        assert_eq!(Uuid::from_bytes(first).to_string(), expected);
+
+        let second = get_or_create_host_uuid("dev")?;
+        assert_eq!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn decrypt_rejects_payload_len_over_50mb() {
+        let too_big_payload_len_u32: u32 = 50 * 1024 * 1024 + 1;
+        let mut stream = vec![0u8; 24 + 4 + 16];
+        stream[24..28].copy_from_slice(&too_big_payload_len_u32.to_be_bytes());
+        let key = [0u8; 32];
+        let err = decrypt_stream_to_plaintexts(stream.as_slice(), &key).err();
+        assert!(matches!(
+            err,
+            Some(AegisError::PacketTooLarge { size, limit })
+                if size == (50 * 1024 * 1024 + 1) as usize && limit == 50 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn decrypt_tolerates_truncated_last_chunk() -> Result<(), AegisError> {
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                message: format!("生成 RSA 私钥失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let public_key = RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("导出 Org Public Key DER 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?
+            .as_bytes()
+            .to_vec();
+
+        let scenario = Scenario {
+            name: None,
+            base_time: "1000".to_string(),
+            events: vec![EventSpec::Telemetry {
+                dropped_events: 0,
+                timestamp: Some(1000),
+                time_offset: None,
+                cpu_usage_percent: Some(10),
+                memory_usage_mb: Some(128),
+            }],
+        };
+
+        let artifact = build_artifact(
+            "dev",
+            &scenario,
+            &public_key,
+            public_key_der.as_slice(),
+            "aegis-dev",
+        )?;
+
+        let rsa_ct_len = private_key.size();
+        let (user_slot, rsa_ct, stream) =
+            read_artifact_parts(artifact.bytes.as_slice(), rsa_ct_len)?;
+        let kdf_salt: [u8; KDF_SALT_LEN] = artifact.bytes
+            [KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+            .try_into()
+            .map_err(|_| AegisError::ProtocolError {
+                message: "读取 KDF_Salt 失败".to_string(),
+                code: None,
+            })?;
+        let kek_bytes = derive_kek("aegis-dev".as_bytes(), kdf_salt.as_ref())?;
+        let kek = Kek::from(kek_bytes);
+        let unwrapped = kek
+            .unwrap_vec(user_slot)
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("AES-256-KeyWrap 解密 SessionKey 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let session_key_from_user: [u8; 32] =
+            unwrapped
+                .as_slice()
+                .try_into()
+                .map_err(|_| AegisError::CryptoError {
+                    message: "User Slot 解出的 SessionKey 长度不是 32 bytes".to_string(),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+
+        let session_key_bytes =
+            private_key
+                .decrypt(Oaep::new::<Sha256>(), rsa_ct)
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("RSA-OAEP 解密 SessionKey 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        let session_key_from_org: [u8; 32] =
+            session_key_bytes
+                .try_into()
+                .map_err(|_| AegisError::CryptoError {
+                    message: "SessionKey 长度不是 32 bytes".to_string(),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        assert_eq!(session_key_from_user, session_key_from_org);
+
+        assert_eq!(
+            crypto::verify_hmac_sig_trailer_v1(artifact.bytes.as_slice(), &session_key_from_org)?,
+            crypto::HmacSigVerification::Valid
+        );
+
+        let stream_data_end = if stream.len() >= crypto::HMAC_SIG_TRAILER_LEN {
+            let start = stream.len().saturating_sub(crypto::HMAC_SIG_TRAILER_LEN);
+            match stream.get(start..start + crypto::HMAC_SIG_MAGIC.len()) {
+                Some(magic) if magic == crypto::HMAC_SIG_MAGIC.as_slice() => start,
+                _ => stream.len(),
+            }
+        } else {
+            stream.len()
+        };
+
+        let stream_data = stream
+            .get(..stream_data_end)
+            .ok_or(AegisError::ProtocolError {
+                message: "stream_data 越界".to_string(),
+                code: None,
+            })?;
+
+        let full_plaintexts = decrypt_stream_to_plaintexts(stream_data, &session_key_from_org)?;
+        assert!(full_plaintexts.len() >= 2);
+
+        let truncated_stream = stream_data
+            .get(..stream_data.len().saturating_sub(1))
+            .ok_or(AegisError::ProtocolError {
+                message: "stream 为空".to_string(),
+                code: None,
+            })?;
+        let truncated_plaintexts =
+            decrypt_stream_to_plaintexts(truncated_stream, &session_key_from_org)?;
+
+        assert_eq!(truncated_plaintexts.len() + 1, full_plaintexts.len());
+        let _ = SystemInfo::decode(truncated_plaintexts[0].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("SystemInfo Protobuf 反序列化失败: {e}"),
+                code: None,
+            }
+        })?;
         Ok(())
     }
 
@@ -1199,6 +1462,12 @@ events:
                     code: Some(ErrorCode::Crypto003),
                 })?;
         assert_eq!(session_key_from_user, session_key_from_org);
+
+        assert_eq!(
+            crypto::verify_hmac_sig_trailer_v1(artifact.as_slice(), &session_key_from_org)?,
+            crypto::HmacSigVerification::Valid
+        );
+
         let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key_from_org)?;
         let system_info = SystemInfo::decode(plaintexts[0].as_slice()).map_err(|e| {
             AegisError::ProtocolError {

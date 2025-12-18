@@ -63,3 +63,26 @@ impl From<getrandom::Error> for AegisError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode;
+
+    #[test]
+    fn error_codes_match_doc18() {
+        let cases = [
+            (ErrorCode::Probe101, "AEGIS-PROBE-101"),
+            (ErrorCode::Probe201, "AEGIS-PROBE-201"),
+            (ErrorCode::Plugin501, "AEGIS-PLUGIN-501"),
+            (ErrorCode::Plugin502, "AEGIS-PLUGIN-502"),
+            (ErrorCode::Ai301, "AEGIS-AI-301"),
+            (ErrorCode::Ai399, "AEGIS-AI-399"),
+            (ErrorCode::Crypto003, "AEGIS-CRYPTO-003"),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(code.as_str(), expected);
+            assert!(code.as_str().starts_with("AEGIS-"));
+        }
+    }
+}
