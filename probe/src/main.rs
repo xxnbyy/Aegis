@@ -36,6 +36,16 @@ fn run() -> Result<(), String> {
         cfg.crypto.org_key_path.is_some(),
     )?;
 
+    let org_pubkey_der = load_org_pubkey_der(
+        is_unsigned_build(),
+        cfg.crypto.org_key_path.as_deref(),
+        embedded_key::EMBEDDED_ORG_PUBKEY_DER,
+    )?;
+    tracing::info!(
+        org_pubkey_bytes = org_pubkey_der.len(),
+        "org public key loaded"
+    );
+
     let mut mgr = ConfigManager::from_config(args.config_path, cfg)
         .map_err(|e| format!("初始化配置管理器失败: {e}"))?;
     mgr.start_watching()
@@ -49,6 +59,25 @@ fn run() -> Result<(), String> {
         let sleep = governor.tick();
         thread::sleep(Duration::from_millis(50).saturating_add(sleep));
     }
+}
+
+fn load_org_pubkey_der(
+    is_unsigned_build: bool,
+    org_key_path: Option<&std::path::Path>,
+    embedded: Option<&'static [u8]>,
+) -> Result<Vec<u8>, String> {
+    if let Some(path) = org_key_path {
+        return std::fs::read(path)
+            .map_err(|e| format!("读取 org public key 失败（{}）: {e}", path.display()));
+    }
+
+    if is_unsigned_build {
+        return Err("Unsigned build 模式下缺少 crypto.org_key_path".to_string());
+    }
+
+    embedded
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| "缺少 org public key（外部路径与内嵌 key 均为空）".to_string())
 }
 
 fn is_unsigned_build() -> bool {

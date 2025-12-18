@@ -3,7 +3,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::Mac;
 
-use crate::error::AegisError;
+use crate::error::{AegisError, ErrorCode};
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
@@ -93,9 +93,9 @@ pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AegisError> {
         u32::from_be_bytes([len_part[0], len_part[1], len_part[2], len_part[3]]) as usize;
 
     if payload_len > MAX_PACKET_SIZE {
-        return Err(AegisError::PacketTooLarge {
-            size: payload_len,
-            limit: MAX_PACKET_SIZE,
+        return Err(AegisError::CryptoError {
+            message: format!("PayloadLen 超过 50MB 上限: {payload_len}"),
+            code: Some(ErrorCode::Crypto003),
         });
     }
 
@@ -260,8 +260,10 @@ mod tests {
         let err = decrypt(packet.as_slice(), key.as_slice()).err();
         assert!(matches!(
             err,
-            Some(AegisError::PacketTooLarge { size, limit })
-                if size == MAX_PACKET_SIZE + 1 && limit == MAX_PACKET_SIZE
+            Some(AegisError::CryptoError {
+                code: Some(ErrorCode::Crypto003),
+                ..
+            })
         ));
     }
 
