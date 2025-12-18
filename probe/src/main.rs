@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use common::config::{ConfigManager, load_yaml_file};
+use common::governor::Governor;
 use common::telemetry::init_telemetry;
 
 mod embedded_key {
@@ -41,8 +42,12 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("启动配置热加载失败: {e}"))?;
 
     tracing::info!("probe started");
+    let mut governor = Governor::new(mgr.current().governor.clone());
     loop {
-        thread::sleep(Duration::from_secs(3600));
+        let cfg = mgr.current();
+        governor.apply_config(cfg.governor.clone());
+        let sleep = governor.tick();
+        thread::sleep(Duration::from_millis(50).saturating_add(sleep));
     }
 }
 
