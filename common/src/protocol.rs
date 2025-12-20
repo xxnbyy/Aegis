@@ -3,12 +3,33 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto;
 use crate::error::{AegisError, ErrorCode};
 
 #[allow(clippy::all)]
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/aegis.rs"));
+}
+
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct PayloadEnvelope {
+    #[prost(oneof = "payload_envelope::Payload", tags = "1, 2, 3, 4, 5")]
+    pub payload: Option<payload_envelope::Payload>,
+}
+
+pub mod payload_envelope {
+    #[derive(Clone, PartialEq, Eq, prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        SystemInfo(super::SystemInfo),
+        #[prost(message, tag = "2")]
+        ProcessInfo(super::ProcessInfo),
+        #[prost(message, tag = "3")]
+        FileInfo(super::FileInfo),
+        #[prost(message, tag = "4")]
+        NetworkInterfaceUpdate(super::NetworkInterfaceUpdate),
+        #[prost(message, tag = "5")]
+        AgentTelemetry(super::AgentTelemetry),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,7 +68,7 @@ pub enum MessagePayload {
 pub struct ArtifactChunk {
     pub sequence_id: u64,
     pub is_last: bool,
-    pub encrypted_bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
 }
 
 pub const DEFAULT_ARTIFACT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -58,17 +79,11 @@ pub struct Chunker<R> {
     chunk_size: usize,
     request_id: u64,
     sequence_id: u64,
-    session_key: [u8; 32],
 }
 
 impl<R: Read> Chunker<R> {
     #[allow(clippy::missing_errors_doc)]
-    pub fn new(
-        reader: R,
-        chunk_size: usize,
-        request_id: u64,
-        session_key: [u8; 32],
-    ) -> Result<Self, AegisError> {
+    pub fn new(reader: R, chunk_size: usize, request_id: u64) -> Result<Self, AegisError> {
         if chunk_size == 0 || chunk_size > MAX_ARTIFACT_CHUNK_SIZE {
             return Err(AegisError::ConfigError {
                 message: format!(
@@ -82,7 +97,6 @@ impl<R: Read> Chunker<R> {
             chunk_size,
             request_id,
             sequence_id: 0,
-            session_key,
         })
     }
 
@@ -128,11 +142,6 @@ impl<R: Read> Iterator for Chunker<R> {
             }
         };
 
-        let encrypted_bytes = match crypto::encrypt(buf.as_slice(), self.session_key.as_slice()) {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-
         let message = Message {
             header: MessageHeader {
                 request_id: self.request_id,
@@ -142,7 +151,7 @@ impl<R: Read> Iterator for Chunker<R> {
             payload: MessagePayload::ArtifactChunk(ArtifactChunk {
                 sequence_id: self.sequence_id,
                 is_last,
-                encrypted_bytes,
+                bytes: buf,
             }),
         };
         self.sequence_id = self.sequence_id.saturating_add(1);
@@ -155,18 +164,16 @@ pub struct ArtifactBuilder<W> {
     expected_sequence_id: u64,
     finished: bool,
     writer: W,
-    session_key: [u8; 32],
     bytes_written: u64,
 }
 
 impl<W: Write> ArtifactBuilder<W> {
-    pub fn new(request_id: u64, writer: W, session_key: [u8; 32]) -> Self {
+    pub fn new(request_id: u64, writer: W) -> Self {
         Self {
             request_id,
             expected_sequence_id: 0,
             finished: false,
             writer,
-            session_key,
             bytes_written: 0,
         }
     }
@@ -208,16 +215,12 @@ impl<W: Write> ArtifactBuilder<W> {
             });
         }
 
-        let plaintext = crypto::decrypt(
-            chunk.encrypted_bytes.as_slice(),
-            self.session_key.as_slice(),
-        )?;
         self.writer
-            .write_all(plaintext.as_slice())
+            .write_all(chunk.bytes.as_slice())
             .map_err(AegisError::IoError)?;
         self.bytes_written = self
             .bytes_written
-            .saturating_add(plaintext.len().try_into().unwrap_or(0));
+            .saturating_add(chunk.bytes.len().try_into().unwrap_or(0));
         self.expected_sequence_id = self.expected_sequence_id.saturating_add(1);
         if chunk.is_last {
             self.finished = true;
@@ -259,6 +262,38 @@ pub struct SystemInfo {
     pub boot_time: i64,
 }
 
+impl PayloadEnvelope {
+    pub fn system_info(v: SystemInfo) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::SystemInfo(v)),
+        }
+    }
+
+    pub fn process_info(v: ProcessInfo) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::ProcessInfo(v)),
+        }
+    }
+
+    pub fn file_info(v: FileInfo) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::FileInfo(v)),
+        }
+    }
+
+    pub fn network_interface_update(v: NetworkInterfaceUpdate) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::NetworkInterfaceUpdate(v)),
+        }
+    }
+
+    pub fn agent_telemetry(v: AgentTelemetry) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::AgentTelemetry(v)),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
 pub struct ProcessInfo {
     #[prost(uint32, tag = "1")]
@@ -283,6 +318,8 @@ pub struct ProcessInfo {
     pub has_floating_code: bool,
     #[prost(uint64, tag = "11")]
     pub exec_id: u64,
+    #[prost(string, tag = "12")]
+    pub exec_id_quality: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
@@ -301,6 +338,8 @@ pub struct FileInfo {
     pub is_timestomped: bool,
     #[prost(bool, tag = "7")]
     pub is_locked: bool,
+    #[prost(string, repeated, tag = "8")]
+    pub ads_streams: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
@@ -432,19 +471,13 @@ mod tests {
     #[ignore = "1GB roundtrip 流式测试耗时较长"]
     fn artifact_chunker_roundtrip_streaming_1gb() -> Result<(), AegisError> {
         let total_size = 1024u64 * 1024 * 1024;
-        let session_key = [3u8; 32];
         let request_id = 7u64;
 
         let source_reader = PatternReader::new(total_size);
-        let mut chunker = Chunker::new(
-            source_reader,
-            DEFAULT_ARTIFACT_CHUNK_SIZE,
-            request_id,
-            session_key,
-        )?;
+        let mut chunker = Chunker::new(source_reader, DEFAULT_ARTIFACT_CHUNK_SIZE, request_id)?;
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(request_id, writer, session_key);
+        let mut builder = ArtifactBuilder::new(request_id, writer);
 
         for message in chunker.by_ref() {
             builder.push(&message?)?;
@@ -466,19 +499,13 @@ mod tests {
     #[test]
     fn artifact_chunker_roundtrip_streaming_64mb() -> Result<(), AegisError> {
         let total_size = 64u64 * 1024 * 1024;
-        let session_key = [3u8; 32];
         let request_id = 8u64;
 
         let source_reader = PatternReader::new(total_size);
-        let mut chunker = Chunker::new(
-            source_reader,
-            DEFAULT_ARTIFACT_CHUNK_SIZE,
-            request_id,
-            session_key,
-        )?;
+        let mut chunker = Chunker::new(source_reader, DEFAULT_ARTIFACT_CHUNK_SIZE, request_id)?;
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(request_id, writer, session_key);
+        let mut builder = ArtifactBuilder::new(request_id, writer);
 
         for message in chunker.by_ref() {
             builder.push(&message?)?;
@@ -499,34 +526,21 @@ mod tests {
 
     #[test]
     fn chunker_rejects_invalid_chunk_size() {
-        let session_key = [1u8; 32];
-        let ok = Chunker::new(std::io::empty(), 1, 1, session_key);
+        let ok = Chunker::new(std::io::empty(), 1, 1);
         assert!(ok.is_ok());
 
-        let bad_zero = Chunker::new(std::io::empty(), 0, 1, session_key).err();
+        let bad_zero = Chunker::new(std::io::empty(), 0, 1).err();
         assert!(matches!(bad_zero, Some(AegisError::ConfigError { .. })));
 
-        let bad_big = Chunker::new(
-            std::io::empty(),
-            MAX_ARTIFACT_CHUNK_SIZE + 1,
-            1,
-            session_key,
-        )
-        .err();
+        let bad_big = Chunker::new(std::io::empty(), MAX_ARTIFACT_CHUNK_SIZE + 1, 1).err();
         assert!(matches!(bad_big, Some(AegisError::ConfigError { .. })));
     }
 
     #[test]
     fn builder_rejects_out_of_order_chunks() -> Result<(), AegisError> {
-        let session_key = [2u8; 32];
         let request_id = 9u64;
         let source_reader = PatternReader::new((DEFAULT_ARTIFACT_CHUNK_SIZE * 2 + 7) as u64);
-        let mut chunker = Chunker::new(
-            source_reader,
-            DEFAULT_ARTIFACT_CHUNK_SIZE,
-            request_id,
-            session_key,
-        )?;
+        let mut chunker = Chunker::new(source_reader, DEFAULT_ARTIFACT_CHUNK_SIZE, request_id)?;
         let first = chunker.next().ok_or(AegisError::ProtocolError {
             message: "缺少 chunk".to_string(),
             code: None,
@@ -537,7 +551,7 @@ mod tests {
         })??;
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(request_id, writer, session_key);
+        let mut builder = ArtifactBuilder::new(request_id, writer);
         let err = builder.push(&second).err();
         assert!(matches!(err, Some(AegisError::ProtocolError { .. })));
 
@@ -546,9 +560,8 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_wrong_request_id() -> Result<(), AegisError> {
-        let session_key = [4u8; 32];
-        let encrypted_bytes = crypto::encrypt(b"abc".as_slice(), session_key.as_slice())?;
+    fn builder_rejects_wrong_request_id() {
+        let bytes = b"abc".to_vec();
         let msg = Message {
             header: MessageHeader {
                 request_id: 1,
@@ -558,21 +571,19 @@ mod tests {
             payload: MessagePayload::ArtifactChunk(ArtifactChunk {
                 sequence_id: 0,
                 is_last: true,
-                encrypted_bytes,
+                bytes,
             }),
         };
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(2, writer, session_key);
+        let mut builder = ArtifactBuilder::new(2, writer);
         let err = builder.push(&msg).err();
         assert!(matches!(err, Some(AegisError::ProtocolError { .. })));
-        Ok(())
     }
 
     #[test]
-    fn builder_rejects_wrong_command() -> Result<(), AegisError> {
-        let session_key = [5u8; 32];
-        let encrypted_bytes = crypto::encrypt(b"abc".as_slice(), session_key.as_slice())?;
+    fn builder_rejects_wrong_command() {
+        let bytes = b"abc".to_vec();
         let msg = Message {
             header: MessageHeader {
                 request_id: 1,
@@ -582,20 +593,18 @@ mod tests {
             payload: MessagePayload::ArtifactChunk(ArtifactChunk {
                 sequence_id: 0,
                 is_last: true,
-                encrypted_bytes,
+                bytes,
             }),
         };
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(1, writer, session_key);
+        let mut builder = ArtifactBuilder::new(1, writer);
         let err = builder.push(&msg).err();
         assert!(matches!(err, Some(AegisError::ProtocolError { .. })));
-        Ok(())
     }
 
     #[test]
     fn builder_rejects_wrong_payload() {
-        let session_key = [6u8; 32];
         let msg = Message {
             header: MessageHeader {
                 request_id: 1,
@@ -606,14 +615,13 @@ mod tests {
         };
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(1, writer, session_key);
+        let mut builder = ArtifactBuilder::new(1, writer);
         let err = builder.push(&msg).err();
         assert!(matches!(err, Some(AegisError::ProtocolError { .. })));
     }
 
     #[test]
     fn builder_rejects_more_chunks_after_last() -> Result<(), AegisError> {
-        let session_key = [7u8; 32];
         let request_id = 5u64;
 
         let first = Message {
@@ -625,7 +633,7 @@ mod tests {
             payload: MessagePayload::ArtifactChunk(ArtifactChunk {
                 sequence_id: 0,
                 is_last: true,
-                encrypted_bytes: crypto::encrypt(b"first".as_slice(), session_key.as_slice())?,
+                bytes: b"first".to_vec(),
             }),
         };
         let second = Message {
@@ -637,12 +645,12 @@ mod tests {
             payload: MessagePayload::ArtifactChunk(ArtifactChunk {
                 sequence_id: 1,
                 is_last: true,
-                encrypted_bytes: crypto::encrypt(b"second".as_slice(), session_key.as_slice())?,
+                bytes: b"second".to_vec(),
             }),
         };
 
         let writer = ChecksumWriter::new();
-        let mut builder = ArtifactBuilder::new(request_id, writer, session_key);
+        let mut builder = ArtifactBuilder::new(request_id, writer);
         builder.push(&first)?;
         assert!(builder.is_finished());
 
@@ -653,10 +661,9 @@ mod tests {
 
     #[test]
     fn chunker_sequence_starts_at_zero_and_marks_last() -> Result<(), AegisError> {
-        let session_key = [8u8; 32];
         let request_id = 3u64;
         let data = vec![1u8; 10];
-        let mut chunker = Chunker::new(data.as_slice(), 1024, request_id, session_key)?;
+        let mut chunker = Chunker::new(data.as_slice(), 1024, request_id)?;
 
         let first = chunker.next().ok_or(AegisError::ProtocolError {
             message: "缺少 chunk".to_string(),

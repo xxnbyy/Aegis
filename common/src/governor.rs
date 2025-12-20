@@ -248,13 +248,19 @@ impl Governor {
         self.io.reserve(bytes)
     }
 
-    pub fn tick(&mut self) -> Duration {
+    pub fn tick_with_usage(&mut self) -> (u32, Duration) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
         let usage = self.get_max_single_core_usage();
-        self.pid
-            .compute_sleep(self.cfg.max_single_core_usage, usage, dt)
+        let sleep = self
+            .pid
+            .compute_sleep(self.cfg.max_single_core_usage, usage, dt);
+        (usage, sleep)
+    }
+
+    pub fn tick(&mut self) -> Duration {
+        self.tick_with_usage().1
     }
 }
 

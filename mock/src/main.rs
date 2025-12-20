@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_kw::Kek;
-use argon2::{Algorithm, Argon2, Params, Version};
 use clap::Parser;
 use common::crypto;
 use common::error::{AegisError, ErrorCode};
-use common::protocol::{AgentTelemetry, NetworkInterfaceUpdate, ProcessInfo, SystemInfo};
+use common::protocol::{
+    AgentTelemetry, NetworkInterfaceUpdate, PayloadEnvelope, ProcessInfo, SystemInfo,
+};
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -20,17 +21,6 @@ use rsa::pkcs8::EncodePublicKey;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use sha2::Sha256;
 use uuid::Uuid;
-use xxhash_rust::xxh64::xxh64;
-
-const HEADER_LEN: usize = 144;
-const MAGIC: &[u8; 5] = b"AEGIS";
-const VERSION: u8 = 0x01;
-const CIPHER_ID_XCHACHA20: u8 = 0x01;
-const KDF_SALT_OFFSET: usize = 0x08;
-const KDF_SALT_LEN: usize = 32;
-const HOST_UUID_OFFSET: usize = 0x28;
-const HOST_UUID_LEN: usize = 16;
-const ORG_KEY_FP_OFFSET: usize = 0x38;
 const USER_SLOT_LEN: usize = 40;
 
 #[derive(Parser, Debug)]
@@ -242,27 +232,22 @@ fn build_artifact(
     password: &str,
 ) -> Result<BuildArtifactResult, AegisError> {
     let _scenario_name = scenario.name.as_deref();
-    let org_key_fp = xxh64(org_public_key_der, 0);
+    let org_key_fp = crypto::org_pubkey_fingerprint_xxh64(org_public_key_der);
 
     let session_key = random_session_key();
     let encrypted_session_key = encrypt_session_key(org_public_key, &session_key)?;
 
-    let mut header = [0u8; HEADER_LEN];
-    header[0..MAGIC.len()].copy_from_slice(MAGIC.as_slice());
-    header[0x05] = VERSION;
-    header[0x06] = CIPHER_ID_XCHACHA20;
-    let mut kdf_salt = [0u8; KDF_SALT_LEN];
+    let mut kdf_salt = [0u8; crypto::AES_KDF_SALT_LEN];
     let mut rng = OsRng;
     rng.fill_bytes(&mut kdf_salt);
-    header[KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN].copy_from_slice(&kdf_salt);
-    let host_uuid = get_or_create_host_uuid(mode)?;
-    header[HOST_UUID_OFFSET..HOST_UUID_OFFSET + HOST_UUID_LEN].copy_from_slice(host_uuid.as_ref());
-    header[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8].copy_from_slice(&org_key_fp.to_be_bytes());
+    let host_uuid = crypto::get_or_create_host_uuid(mode)?;
+    let header = crypto::build_aes_header_v1(&kdf_salt, &host_uuid, org_key_fp);
 
     let user_slot = encrypt_session_key_user_slot(password, &kdf_salt, &session_key)?;
 
-    let mut out =
-        Vec::with_capacity(HEADER_LEN + USER_SLOT_LEN + encrypted_session_key.len() + 4096);
+    let mut out = Vec::with_capacity(
+        crypto::AES_HEADER_LEN + USER_SLOT_LEN + encrypted_session_key.len() + 4096,
+    );
     out.extend_from_slice(&header);
     out.extend_from_slice(user_slot.as_slice());
     out.extend_from_slice(&encrypted_session_key);
@@ -273,7 +258,9 @@ fn build_artifact(
     let mut last_net_timestamp: Option<i64> = None;
 
     let encrypted_chunk = crypto::encrypt(
-        dummy_system_info().encode_to_vec().as_slice(),
+        PayloadEnvelope::system_info(dummy_system_info())
+            .encode_to_vec()
+            .as_slice(),
         session_key.as_slice(),
     )?;
     out.extend_from_slice(&encrypted_chunk);
@@ -319,7 +306,7 @@ fn event_to_payload_bytes(
     any_data_loss: &mut bool,
     last_net_timestamp: &mut Option<i64>,
 ) -> Result<Vec<u8>, AegisError> {
-    let bytes = match event {
+    let env = match event {
         EventSpec::Process {
             exec_id,
             pid,
@@ -333,7 +320,7 @@ fn event_to_payload_bytes(
             is_ghost,
             is_mismatched,
             has_floating_code,
-        } => ProcessInfo {
+        } => PayloadEnvelope::process_info(ProcessInfo {
             pid: pid.unwrap_or(1234),
             ppid: ppid.unwrap_or(1),
             name: name.clone().unwrap_or_else(|| "mock-process".to_string()),
@@ -347,8 +334,8 @@ fn event_to_payload_bytes(
             is_mismatched: is_mismatched.unwrap_or(false),
             has_floating_code: has_floating_code.unwrap_or(false),
             exec_id: *exec_id,
-        }
-        .encode_to_vec(),
+            exec_id_quality: String::new(),
+        }),
 
         EventSpec::Telemetry {
             dropped_events,
@@ -360,13 +347,12 @@ fn event_to_payload_bytes(
             if *dropped_events > 0 {
                 *any_data_loss = true;
             }
-            AgentTelemetry {
+            PayloadEnvelope::agent_telemetry(AgentTelemetry {
                 timestamp: resolve_event_timestamp(base_time, *timestamp, time_offset.as_deref()),
                 cpu_usage_percent: cpu_usage_percent.unwrap_or(12),
                 memory_usage_mb: memory_usage_mb.unwrap_or(128),
                 dropped_events_count: *dropped_events,
-            }
-            .encode_to_vec()
+            })
         }
         EventSpec::NetworkChange {
             timestamp,
@@ -383,14 +369,13 @@ fn event_to_payload_bytes(
                 });
             }
             *last_net_timestamp = Some(ts);
-            NetworkInterfaceUpdate {
+            PayloadEnvelope::network_interface_update(NetworkInterfaceUpdate {
                 timestamp: ts,
                 new_ip_addresses: new_ip_addresses.clone(),
-            }
-            .encode_to_vec()
+            })
         }
     };
-    Ok(bytes)
+    Ok(env.encode_to_vec())
 }
 
 fn dummy_system_info() -> SystemInfo {
@@ -497,10 +482,10 @@ fn resolve_password(mode: &str, password: Option<&str>) -> Result<String, AegisE
 
 fn encrypt_session_key_user_slot(
     password: &str,
-    kdf_salt: &[u8; KDF_SALT_LEN],
+    kdf_salt: &[u8; crypto::AES_KDF_SALT_LEN],
     session_key: &[u8; 32],
 ) -> Result<Vec<u8>, AegisError> {
-    let kek_bytes = derive_kek(password.as_bytes(), kdf_salt)?;
+    let kek_bytes = crypto::derive_kek_argon2id(password.as_bytes(), kdf_salt.as_slice())?;
     let kek = Kek::from(kek_bytes);
     let wrapped = kek
         .wrap_vec(session_key.as_slice())
@@ -515,21 +500,6 @@ fn encrypt_session_key_user_slot(
         });
     }
     Ok(wrapped)
-}
-
-fn derive_kek(password: &[u8], salt: &[u8]) -> Result<[u8; 32], AegisError> {
-    let params = Params::new(65_536, 4, 2, Some(32)).map_err(|e| AegisError::ConfigError {
-        message: format!("Argon2 参数错误: {e}"),
-    })?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = [0u8; 32];
-    argon2
-        .hash_password_into(password, salt, &mut out)
-        .map_err(|e| AegisError::CryptoError {
-            message: format!("Argon2id 派生 KEK 失败: {e}"),
-            code: Some(ErrorCode::Crypto003),
-        })?;
-    Ok(out)
 }
 
 fn encrypt_session_key(
@@ -551,147 +521,6 @@ fn load_rsa_public_key(der_bytes: &[u8]) -> Result<RsaPublicKey, AegisError> {
         .map_err(|e| AegisError::ConfigError {
             message: format!("解析 Org Public Key DER 失败: {e}"),
         })
-}
-
-fn get_or_create_host_uuid(mode: &str) -> Result<[u8; 16], AegisError> {
-    let uuid = get_persisted_host_uuid(mode)?;
-    if let Some(uuid) = uuid {
-        return Ok(uuid);
-    }
-
-    let new_uuid = *Uuid::new_v4().as_bytes();
-    persist_host_uuid(mode, &new_uuid)?;
-    Ok(new_uuid)
-}
-
-fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
-    #[cfg(windows)]
-    {
-        use winreg::enums::HKEY_LOCAL_MACHINE;
-        if let Some(v) =
-            try_read_host_uuid_registry(HKEY_LOCAL_MACHINE).map_err(AegisError::IoError)?
-        {
-            return Ok(Some(v));
-        }
-        if mode == "dev" {
-            use winreg::enums::HKEY_CURRENT_USER;
-            return try_read_host_uuid_registry(HKEY_CURRENT_USER).map_err(AegisError::IoError);
-        }
-        Ok(None)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let primary = Path::new("/etc/aegis/uuid");
-        if let Some(v) = try_read_host_uuid_file(primary).map_err(AegisError::IoError)? {
-            return Ok(Some(v));
-        }
-        if mode == "dev" {
-            let fallback = user_uuid_path();
-            if let Some(v) =
-                try_read_host_uuid_file(fallback.as_path()).map_err(AegisError::IoError)?
-            {
-                return Ok(Some(v));
-            }
-        }
-        Ok(None)
-    }
-}
-
-fn persist_host_uuid(mode: &str, uuid: &[u8; 16]) -> Result<(), AegisError> {
-    #[cfg(windows)]
-    {
-        use winreg::enums::HKEY_LOCAL_MACHINE;
-        if try_write_host_uuid_registry(HKEY_LOCAL_MACHINE, uuid).is_ok() {
-            return Ok(());
-        }
-        if mode == "dev" {
-            use winreg::enums::HKEY_CURRENT_USER;
-            if try_write_host_uuid_registry(HKEY_CURRENT_USER, uuid).is_ok() {
-                return Ok(());
-            }
-            return Err(AegisError::ConfigError {
-                message: "无法写入 HostUUID 至 HKLM/HKCU\\SOFTWARE\\Aegis（请以管理员权限运行）"
-                    .to_string(),
-            });
-        }
-        Err(AegisError::ConfigError {
-            message: "无法写入 HostUUID 至 HKLM\\SOFTWARE\\Aegis（请以管理员权限运行）".to_string(),
-        })
-    }
-
-    #[cfg(not(windows))]
-    {
-        let primary = Path::new("/etc/aegis/uuid");
-        if try_write_host_uuid_file(primary, uuid).is_ok() {
-            return Ok(());
-        }
-        if mode != "dev" {
-            return Err(AegisError::ConfigError {
-                message: "无法写入 HostUUID 至 /etc/aegis/uuid（请以 root 权限运行）".to_string(),
-            });
-        }
-        let fallback = user_uuid_path();
-        try_write_host_uuid_file(fallback.as_path(), uuid).map_err(AegisError::IoError)
-    }
-}
-
-#[cfg(windows)]
-fn try_read_host_uuid_registry(hive: winreg::HKEY) -> io::Result<Option<[u8; 16]>> {
-    use winreg::RegKey;
-    let root = RegKey::predef(hive);
-    let key = match root.open_subkey("SOFTWARE\\Aegis") {
-        Ok(k) => k,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-
-    let uuid_str: String = match key.get_value("HostUUID") {
-        Ok(v) => v,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-
-    match Uuid::parse_str(uuid_str.trim()) {
-        Ok(u) => Ok(Some(*u.as_bytes())),
-        Err(_) => Ok(None),
-    }
-}
-
-#[cfg(windows)]
-fn try_write_host_uuid_registry(hive: winreg::HKEY, uuid: &[u8; 16]) -> io::Result<()> {
-    use winreg::RegKey;
-    let root = RegKey::predef(hive);
-    let (key, _) = root.create_subkey("SOFTWARE\\Aegis")?;
-    let uuid_str = Uuid::from_bytes(*uuid).to_string();
-    key.set_value("HostUUID", &uuid_str)
-}
-
-#[cfg(not(windows))]
-fn user_uuid_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".config").join("aegis").join("uuid")
-}
-
-#[cfg(not(windows))]
-fn try_read_host_uuid_file(path: &Path) -> io::Result<Option<[u8; 16]>> {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let Ok(arr) = bytes.as_slice().try_into() else {
-        return Ok(None);
-    };
-    Ok(Some(arr))
-}
-
-#[cfg(not(windows))]
-fn try_write_host_uuid_file(path: &Path, uuid: &[u8; 16]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, uuid)
 }
 
 fn write_file(path: &Path, content: &[u8]) -> Result<(), AegisError> {
@@ -730,7 +559,9 @@ fn io_error_with_path(err: &io::Error, path: &Path) -> AegisError {
 mod tests {
     use super::*;
 
-    use common::protocol::{MessagePayload, validate_first_chunk_is_system_info};
+    use common::protocol::{
+        MessagePayload, PayloadEnvelope, payload_envelope, validate_first_chunk_is_system_info,
+    };
     use rsa::RsaPrivateKey;
     use rsa::RsaPublicKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -772,7 +603,7 @@ mod tests {
         artifact: &[u8],
         rsa_ct_len: usize,
     ) -> Result<ArtifactParts<'_>, AegisError> {
-        let user_slot_start = HEADER_LEN;
+        let user_slot_start = crypto::AES_HEADER_LEN;
         let user_slot_end = user_slot_start + USER_SLOT_LEN;
         let user_slot =
             artifact
@@ -801,7 +632,6 @@ mod tests {
         stream: &[u8],
         session_key: &[u8; 32],
     ) -> Result<Vec<Vec<u8>>, AegisError> {
-        const MAX_CHUNK_PAYLOAD_LEN: usize = 50 * 1024 * 1024;
         let mut offset = 0usize;
         let mut plaintexts = Vec::new();
 
@@ -822,10 +652,10 @@ mod tests {
                             code: None,
                         })?,
                 ) as usize;
-            if payload_len > MAX_CHUNK_PAYLOAD_LEN {
+            if payload_len > crypto::AES_MAX_PAYLOAD_LEN {
                 return Err(AegisError::PacketTooLarge {
                     size: payload_len,
-                    limit: MAX_CHUNK_PAYLOAD_LEN,
+                    limit: crypto::AES_MAX_PAYLOAD_LEN,
                 });
             }
 
@@ -923,27 +753,33 @@ events:
         )?;
         let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
 
-        let expected_fp = xxh64(public_key_der.as_slice(), 0).to_be_bytes();
+        let expected_fp =
+            crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice()).to_be_bytes();
         assert_eq!(
-            &artifact[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8],
+            &artifact[crypto::AES_ORG_KEY_FP_OFFSET..crypto::AES_ORG_KEY_FP_OFFSET + 8],
             expected_fp.as_slice()
         );
 
-        assert_eq!(&artifact[0..MAGIC.len()], MAGIC.as_slice());
-        assert_eq!(artifact[0x05], VERSION);
-        assert_eq!(artifact[0x06], CIPHER_ID_XCHACHA20);
-        assert_eq!(artifact[0x07], 0);
+        assert_eq!(
+            &artifact[0..crypto::AES_MAGIC.len()],
+            crypto::AES_MAGIC.as_slice()
+        );
+        assert_eq!(artifact[0x05], crypto::AES_VERSION_V1);
+        assert_eq!(artifact[0x06], crypto::AES_CIPHER_ID_XCHACHA20_POLY1305);
+        assert_eq!(artifact[0x07], crypto::AES_COMP_ID_NONE);
         assert!(
             artifact[0x40..0x40 + 80].iter().all(|b| *b == 0),
             "Reserved 区必须全 0"
         );
         assert!(
-            artifact[KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+            artifact[crypto::AES_KDF_SALT_OFFSET
+                ..crypto::AES_KDF_SALT_OFFSET + crypto::AES_KDF_SALT_LEN]
                 .iter()
                 .any(|b| *b != 0)
         );
         assert!(
-            artifact[HOST_UUID_OFFSET..HOST_UUID_OFFSET + HOST_UUID_LEN]
+            artifact[crypto::AES_HOST_UUID_OFFSET
+                ..crypto::AES_HOST_UUID_OFFSET + crypto::AES_HOST_UUID_LEN]
                 .iter()
                 .any(|b| *b != 0)
         );
@@ -966,14 +802,14 @@ events:
         let first_chunk_len = 24usize + 4 + first_payload_len + 16;
         assert!(stream.len() >= first_chunk_len);
 
-        let kdf_salt: [u8; KDF_SALT_LEN] = artifact
-            [KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+        let kdf_salt: [u8; crypto::AES_KDF_SALT_LEN] = artifact
+            [crypto::AES_KDF_SALT_OFFSET..crypto::AES_KDF_SALT_OFFSET + crypto::AES_KDF_SALT_LEN]
             .try_into()
             .map_err(|_| AegisError::ProtocolError {
                 message: "读取 KDF_Salt 失败".to_string(),
                 code: None,
             })?;
-        let kek_bytes = derive_kek(passphrase.as_bytes(), kdf_salt.as_ref())?;
+        let kek_bytes = crypto::derive_kek_argon2id(passphrase.as_bytes(), kdf_salt.as_ref())?;
         let kek = Kek::from(kek_bytes);
         let unwrapped = kek
             .unwrap_vec(user_slot)
@@ -1020,37 +856,61 @@ events:
             });
         }
 
-        let system_info = SystemInfo::decode(plaintexts[0].as_slice()).map_err(|e| {
+        let env0 = PayloadEnvelope::decode(plaintexts[0].as_slice()).map_err(|e| {
             AegisError::ProtocolError {
-                message: format!("SystemInfo Protobuf 反序列化失败: {e}"),
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
                 code: None,
             }
         })?;
+        let Some(payload_envelope::Payload::SystemInfo(system_info)) = env0.payload else {
+            return Err(AegisError::ProtocolError {
+                message: "第一个 Chunk 必须是 SystemInfo".to_string(),
+                code: None,
+            });
+        };
         validate_first_chunk_is_system_info(&MessagePayload::SystemInfo(system_info.clone()))?;
         assert!(!system_info.hostname.is_empty());
 
-        let process = ProcessInfo::decode(plaintexts[1].as_slice()).map_err(|e| {
+        let env1 = PayloadEnvelope::decode(plaintexts[1].as_slice()).map_err(|e| {
             AegisError::ProtocolError {
-                message: format!("ProcessInfo Protobuf 反序列化失败: {e}"),
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
                 code: None,
             }
         })?;
+        let Some(payload_envelope::Payload::ProcessInfo(process)) = env1.payload else {
+            return Err(AegisError::ProtocolError {
+                message: "第 2 个 Chunk 必须是 ProcessInfo".to_string(),
+                code: None,
+            });
+        };
         assert_eq!(process.exec_id, 42);
 
-        let telemetry = AgentTelemetry::decode(plaintexts[2].as_slice()).map_err(|e| {
+        let env2 = PayloadEnvelope::decode(plaintexts[2].as_slice()).map_err(|e| {
             AegisError::ProtocolError {
-                message: format!("AgentTelemetry Protobuf 反序列化失败: {e}"),
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
                 code: None,
             }
         })?;
+        let Some(payload_envelope::Payload::AgentTelemetry(telemetry)) = env2.payload else {
+            return Err(AegisError::ProtocolError {
+                message: "第 3 个 Chunk 必须是 AgentTelemetry".to_string(),
+                code: None,
+            });
+        };
         assert_eq!(telemetry.dropped_events_count, 9);
 
-        let net = NetworkInterfaceUpdate::decode(plaintexts[3].as_slice()).map_err(|e| {
+        let env3 = PayloadEnvelope::decode(plaintexts[3].as_slice()).map_err(|e| {
             AegisError::ProtocolError {
-                message: format!("NetworkInterfaceUpdate Protobuf 反序列化失败: {e}"),
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
                 code: None,
             }
         })?;
+        let Some(payload_envelope::Payload::NetworkInterfaceUpdate(net)) = env3.payload else {
+            return Err(AegisError::ProtocolError {
+                message: "第 4 个 Chunk 必须是 NetworkInterfaceUpdate".to_string(),
+                code: None,
+            });
+        };
         assert_eq!(net.new_ip_addresses.len(), 2);
         Ok(())
     }
@@ -1143,7 +1003,7 @@ events:
             None,
         )?;
         let out = fs::read(out_path.as_path()).map_err(io_error)?;
-        assert!(out.len() > HEADER_LEN);
+        assert!(out.len() > crypto::AES_HEADER_LEN);
         Ok(())
     }
 
@@ -1157,20 +1017,28 @@ events:
         let expected = Uuid::new_v4().to_string();
         key.set_value("HostUUID", &expected).map_err(io_error)?;
 
-        let hklm = try_read_host_uuid_registry(HKEY_LOCAL_MACHINE).map_err(io_error)?;
-        let first = get_or_create_host_uuid("dev")?;
-        if hklm.is_none() {
+        let hklm_uuid: Option<String> = {
+            let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+            match root.open_subkey("SOFTWARE\\Aegis") {
+                Ok(key) => key.get_value("HostUUID").ok(),
+                Err(_) => None,
+            }
+        };
+
+        let first = crypto::get_or_create_host_uuid("dev")?;
+        if hklm_uuid.is_none() {
             assert_eq!(Uuid::from_bytes(first).to_string(), expected);
         }
 
-        let second = get_or_create_host_uuid("dev")?;
+        let second = crypto::get_or_create_host_uuid("dev")?;
         assert_eq!(first, second);
         Ok(())
     }
 
     #[test]
     fn decrypt_rejects_payload_len_over_50mb() {
-        let too_big_payload_len_u32: u32 = 50 * 1024 * 1024 + 1;
+        let too_big_payload_len_u32: u32 =
+            u32::try_from(crypto::AES_MAX_PAYLOAD_LEN.saturating_add(1)).unwrap_or(u32::MAX);
         let mut stream = vec![0u8; 24 + 4 + 16];
         stream[24..28].copy_from_slice(&too_big_payload_len_u32.to_be_bytes());
         let key = [0u8; 32];
@@ -1178,7 +1046,7 @@ events:
         assert!(matches!(
             err,
             Some(AegisError::PacketTooLarge { size, limit })
-                if size == (50 * 1024 * 1024 + 1) as usize && limit == 50 * 1024 * 1024
+                if size == (crypto::AES_MAX_PAYLOAD_LEN + 1) && limit == crypto::AES_MAX_PAYLOAD_LEN
         ));
     }
 
@@ -1224,14 +1092,14 @@ events:
         let rsa_ct_len = private_key.size();
         let (user_slot, rsa_ct, stream) =
             read_artifact_parts(artifact.bytes.as_slice(), rsa_ct_len)?;
-        let kdf_salt: [u8; KDF_SALT_LEN] = artifact.bytes
-            [KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+        let kdf_salt: [u8; crypto::AES_KDF_SALT_LEN] = artifact.bytes
+            [crypto::AES_KDF_SALT_OFFSET..crypto::AES_KDF_SALT_OFFSET + crypto::AES_KDF_SALT_LEN]
             .try_into()
             .map_err(|_| AegisError::ProtocolError {
                 message: "读取 KDF_Salt 失败".to_string(),
                 code: None,
             })?;
-        let kek_bytes = derive_kek("aegis-dev".as_bytes(), kdf_salt.as_ref())?;
+        let kek_bytes = crypto::derive_kek_argon2id("aegis-dev".as_bytes(), kdf_salt.as_ref())?;
         let kek = Kek::from(kek_bytes);
         let unwrapped = kek
             .unwrap_vec(user_slot)
@@ -1299,12 +1167,19 @@ events:
             decrypt_stream_to_plaintexts(truncated_stream, &session_key_from_org)?;
 
         assert_eq!(truncated_plaintexts.len() + 1, full_plaintexts.len());
-        let _ = SystemInfo::decode(truncated_plaintexts[0].as_slice()).map_err(|e| {
+        let env = PayloadEnvelope::decode(truncated_plaintexts[0].as_slice()).map_err(|e| {
             AegisError::ProtocolError {
-                message: format!("SystemInfo Protobuf 反序列化失败: {e}"),
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
                 code: None,
             }
         })?;
+        match env.payload {
+            Some(payload_envelope::Payload::SystemInfo(_)) => Ok(()),
+            _ => Err(AegisError::ProtocolError {
+                message: "第一个 Chunk 必须是 SystemInfo".to_string(),
+                code: None,
+            }),
+        }?;
         Ok(())
     }
 
@@ -1454,21 +1329,22 @@ events:
         };
 
         let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
-        let expected_fp = xxh64(expected_public_der.as_slice(), 0).to_be_bytes();
+        let expected_fp =
+            crypto::org_pubkey_fingerprint_xxh64(expected_public_der.as_slice()).to_be_bytes();
         assert_eq!(
-            &artifact[ORG_KEY_FP_OFFSET..ORG_KEY_FP_OFFSET + 8],
+            &artifact[crypto::AES_ORG_KEY_FP_OFFSET..crypto::AES_ORG_KEY_FP_OFFSET + 8],
             expected_fp.as_slice()
         );
         let rsa_ct_len = private_key.size();
         let (user_slot, rsa_ct, stream) = read_artifact_parts(artifact.as_slice(), rsa_ct_len)?;
-        let kdf_salt: [u8; KDF_SALT_LEN] = artifact
-            [KDF_SALT_OFFSET..KDF_SALT_OFFSET + KDF_SALT_LEN]
+        let kdf_salt: [u8; crypto::AES_KDF_SALT_LEN] = artifact
+            [crypto::AES_KDF_SALT_OFFSET..crypto::AES_KDF_SALT_OFFSET + crypto::AES_KDF_SALT_LEN]
             .try_into()
             .map_err(|_| AegisError::ProtocolError {
                 message: "读取 KDF_Salt 失败".to_string(),
                 code: None,
             })?;
-        let kek_bytes = derive_kek(passphrase.as_bytes(), kdf_salt.as_ref())?;
+        let kek_bytes = crypto::derive_kek_argon2id(passphrase.as_bytes(), kdf_salt.as_ref())?;
         let kek = Kek::from(kek_bytes);
         let unwrapped = kek
             .unwrap_vec(user_slot)
@@ -1506,12 +1382,18 @@ events:
         );
 
         let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key_from_org)?;
-        let system_info = SystemInfo::decode(plaintexts[0].as_slice()).map_err(|e| {
+        let env = PayloadEnvelope::decode(plaintexts[0].as_slice()).map_err(|e| {
             AegisError::ProtocolError {
-                message: format!("SystemInfo Protobuf 反序列化失败: {e}"),
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
                 code: None,
             }
         })?;
+        let Some(payload_envelope::Payload::SystemInfo(system_info)) = env.payload else {
+            return Err(AegisError::ProtocolError {
+                message: "第一个 Chunk 必须是 SystemInfo".to_string(),
+                code: None,
+            });
+        };
         assert!(!system_info.hostname.is_empty());
         Ok(())
     }

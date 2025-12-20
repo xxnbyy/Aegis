@@ -10,6 +10,7 @@ fn deserialize_yaml_sets_fields() -> Result<(), Box<dyn std::error::Error>> {
     let yaml = r#"
 crypto:
   org_key_path: "./keys/org.der"
+  user_passphrase: "test-passphrase"
 governor:
   max_single_core_usage: 12
   net_packet_limit_per_sec: 6000
@@ -30,6 +31,10 @@ networking:
     assert_eq!(
         cfg.crypto.org_key_path,
         Some(PathBuf::from("./keys/org.der"))
+    );
+    assert_eq!(
+        cfg.crypto.user_passphrase.as_deref(),
+        Some("test-passphrase")
     );
     assert_eq!(cfg.governor.max_single_core_usage, 12);
     assert_eq!(cfg.governor.net_packet_limit_per_sec, 6000);
