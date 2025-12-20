@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+pub mod collectors;
 pub mod config;
 pub mod crypto;
 pub mod error;

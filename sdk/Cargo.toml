@@ -5,6 +5,10 @@ version.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
+common = { path = "../common" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
