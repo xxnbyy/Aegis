@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aes_kw::Kek;
 use common::config::{ConfigManager, load_yaml_file};
 use common::crypto;
+use common::detection::{RuleManager, RuleSet};
 use common::governor::Governor;
 use common::protocol::{
     AgentTelemetry, FileInfo, NetworkInterfaceUpdate, PayloadEnvelope, ProcessInfo, SystemInfo,
@@ -58,13 +59,13 @@ fn run() -> Result<(), String> {
     init_telemetry().map_err(|e| format!("初始化日志失败: {e}"))?;
 
     let args = parse_args(std::env::args().skip(1))?;
-    let (mgr, encryptor_tx) = init_runtime(args)?;
-    run_forever(&mgr, &encryptor_tx);
+    let (mgr, rule_mgr, encryptor_tx) = init_runtime(args)?;
+    run_forever(&mgr, &rule_mgr, &encryptor_tx);
 }
 
 fn init_runtime(
     args: ProbeArgs,
-) -> Result<(ConfigManager, mpsc::Sender<EncryptorCommand>), String> {
+) -> Result<(ConfigManager, RuleManager, mpsc::Sender<EncryptorCommand>), String> {
     let Some(config_path) = args.config_path else {
         return Err("缺少必需参数: --config <FILE>".to_string());
     };
@@ -114,12 +115,19 @@ fn init_runtime(
         PayloadEnvelope::system_info(build_system_info()).encode_to_vec(),
     );
 
+    let rule_config_path = config_path.clone();
     let mut mgr = ConfigManager::from_config(config_path, cfg)
         .map_err(|e| format!("初始化配置管理器失败: {e}"))?;
     mgr.start_watching()
         .map_err(|e| format!("启动配置热加载失败: {e}"))?;
 
-    Ok((mgr, encryptor_tx))
+    let mut rule_mgr =
+        RuleManager::load(rule_config_path).map_err(|e| format!("初始化检测规则失败: {e}"))?;
+    rule_mgr
+        .start_watching()
+        .map_err(|e| format!("启动检测规则热加载失败: {e}"))?;
+
+    Ok((mgr, rule_mgr, encryptor_tx))
 }
 
 struct LoopState {
@@ -156,18 +164,23 @@ impl LoopState {
     }
 }
 
-fn run_forever(mgr: &ConfigManager, encryptor_tx: &mpsc::Sender<EncryptorCommand>) -> ! {
+fn run_forever(
+    mgr: &ConfigManager,
+    rule_mgr: &RuleManager,
+    encryptor_tx: &mpsc::Sender<EncryptorCommand>,
+) -> ! {
     tracing::info!("probe started");
     let mut governor = Governor::new(mgr.current().governor.clone());
     let mut state = LoopState::new();
 
     loop {
         let cfg = mgr.current();
+        let rules = rule_mgr.current();
         governor.apply_config(cfg.governor.clone());
         let (cpu_usage_percent, sleep) = governor.tick_with_usage();
 
         maybe_emit_process_snapshot(&mut state, &mut governor, encryptor_tx);
-        maybe_emit_file_snapshot(&mut state, &mut governor, cfg.as_ref(), encryptor_tx);
+        maybe_emit_file_snapshot(&mut state, &mut governor, rules.as_ref(), encryptor_tx);
         maybe_emit_network_update(&mut state, &mut governor, encryptor_tx);
         maybe_emit_linux_bpf_snapshot(&mut state, &mut governor);
         maybe_emit_telemetry(
@@ -216,7 +229,7 @@ fn maybe_emit_process_snapshot(
 fn maybe_emit_file_snapshot(
     state: &mut LoopState,
     governor: &mut Governor,
-    cfg: &common::config::AegisConfig,
+    rules: &RuleSet,
     encryptor_tx: &mpsc::Sender<EncryptorCommand>,
 ) {
     if state.last_file_snapshot.elapsed() < Duration::from_secs(300) {
@@ -226,12 +239,12 @@ fn maybe_emit_file_snapshot(
         state.last_file_snapshot = Instant::now();
         return;
     }
-    if cfg.security.scan_whitelist.is_empty() {
+    if rules.scan_whitelist().is_empty() {
         state.last_file_snapshot = Instant::now();
         return;
     }
 
-    let files = collect_file_snapshot(cfg);
+    let files = collect_file_snapshot(rules);
     let total = files.len();
     let mut sent: usize = 0;
     for f in files {
@@ -279,11 +292,11 @@ fn maybe_emit_network_update(
     state.last_network_snapshot = Instant::now();
 }
 
-fn collect_file_snapshot(cfg: &common::config::AegisConfig) -> Vec<FileInfo> {
+fn collect_file_snapshot(rules: &RuleSet) -> Vec<FileInfo> {
     #[cfg(windows)]
     {
         let mut by_drive: BTreeMap<Option<char>, Vec<String>> = BTreeMap::new();
-        for p in &cfg.security.scan_whitelist {
+        for p in rules.scan_whitelist() {
             let drive = common::collectors::windows::drive_letter(Path::new(p));
             by_drive.entry(drive).or_default().push(p.clone());
         }
@@ -303,7 +316,7 @@ fn collect_file_snapshot(cfg: &common::config::AegisConfig) -> Vec<FileInfo> {
 
             let mut infos = common::collectors::windows::collect_file_infos(
                 paths.as_slice(),
-                cfg.security.timestomp_threshold_ms,
+                rules.timestomp_threshold_ms(),
                 vss_drive,
                 vss_device_path,
             );
@@ -313,7 +326,7 @@ fn collect_file_snapshot(cfg: &common::config::AegisConfig) -> Vec<FileInfo> {
     }
     #[cfg(not(windows))]
     {
-        let _ = cfg;
+        let _ = rules;
         Vec::new()
     }
 }
