@@ -907,11 +907,8 @@ fn collect_process_snapshot_linux_multiview(
 
     let hidden = common::collectors::linux::diff_hidden_u32(view_a.as_slice(), view_b.as_slice());
     for pid in hidden.into_iter().take(hidden_slots) {
-        let Some(mut info) =
-            common::collectors::linux::collect_process_info_for_pid(pid, exec_id_counter)
-        else {
-            continue;
-        };
+        let mut info =
+            common::collectors::linux::collect_process_info_for_pid(pid, exec_id_counter);
         info.is_ghost = true;
         out.push(info);
     }

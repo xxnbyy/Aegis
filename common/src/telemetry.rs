@@ -48,10 +48,7 @@ fn sample_memory_usage_mb_windows() -> u32 {
     let mut sys = System::new();
     sys.refresh_memory();
     let used_memory_mb = sys.used_memory() / 1024;
-    match u32::try_from(used_memory_mb) {
-        Ok(v) => v,
-        Err(_) => u32::MAX,
-    }
+    u32::try_from(used_memory_mb).unwrap_or(u32::MAX)
 }
 
 #[cfg(not(windows))]
@@ -63,10 +60,7 @@ fn sample_memory_usage_mb_linux() -> u32 {
         return 0;
     };
     let used_memory_mb = total_kb.saturating_sub(available_kb) / 1024;
-    match u32::try_from(used_memory_mb) {
-        Ok(v) => v,
-        Err(_) => u32::MAX,
-    }
+    u32::try_from(used_memory_mb).unwrap_or(u32::MAX)
 }
 
 #[cfg(not(windows))]
