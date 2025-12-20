@@ -20,6 +20,9 @@ security:
   timestomp_threshold_ms: 2000
   scan_whitelist:
     - "C:/Windows/System32"
+  yara_rule_paths:
+    - "./rules/a.yar"
+    - "C:/rules/b.yar"
 networking:
   c2_url: "https://c2.example.com"
   heartbeat_interval_sec: 30
@@ -42,6 +45,9 @@ networking:
     assert!(!cfg.security.enable_native_plugins);
     assert_eq!(cfg.security.timestomp_threshold_ms, 2000);
     assert_eq!(cfg.security.scan_whitelist.len(), 1);
+    assert_eq!(cfg.security.yara_rule_paths.len(), 2);
+    assert_eq!(cfg.security.yara_rule_paths[0], "./rules/a.yar");
+    assert_eq!(cfg.security.yara_rule_paths[1], "C:/rules/b.yar");
     assert_eq!(cfg.networking.c2_url, "https://c2.example.com");
     assert_eq!(cfg.networking.heartbeat_interval_sec, 30);
     Ok(())
@@ -83,5 +89,17 @@ fn watcher_updates_config() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    Ok(())
+}
+
+#[test]
+fn yara_rule_paths_rejects_empty_path() -> Result<(), Box<dyn std::error::Error>> {
+    let yaml = r#"
+security:
+  yara_rule_paths:
+    - ""
+"#;
+    let cfg: AegisConfig = serde_yaml::from_str(yaml)?;
+    assert!(cfg.validate().is_err());
     Ok(())
 }
