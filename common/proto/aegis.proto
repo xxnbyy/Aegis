@@ -2,6 +2,16 @@ syntax = "proto3";
 
 package aegis;
 
+message PayloadEnvelope {
+  oneof payload {
+    SystemInfo system_info = 1;
+    ProcessInfo process_info = 2;
+    FileInfo file_info = 3;
+    NetworkInterfaceUpdate network_interface_update = 4;
+    AgentTelemetry agent_telemetry = 5;
+  }
+}
+
 message SystemInfo {
   string hostname = 1;
   string os_version = 2;
@@ -22,6 +32,7 @@ message ProcessInfo {
   bool is_mismatched = 9;
   bool has_floating_code = 10;
   uint64 exec_id = 11;
+  string exec_id_quality = 12;
 }
 
 message FileInfo {
@@ -32,6 +43,7 @@ message FileInfo {
   int64 modified = 5;
   bool is_timestomped = 6;
   bool is_locked = 7;
+  repeated string ads_streams = 8;
 }
 
 message NetworkInterfaceUpdate {
@@ -45,4 +57,3 @@ message AgentTelemetry {
   uint32 memory_usage_mb = 3;
   uint64 dropped_events_count = 4;
 }
-

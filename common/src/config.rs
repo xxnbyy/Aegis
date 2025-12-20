@@ -35,6 +35,7 @@ impl AegisConfig {
 #[serde(default)]
 pub struct CryptoConfig {
     pub org_key_path: Option<PathBuf>,
+    pub user_passphrase: Option<String>,
 }
 
 impl CryptoConfig {
@@ -137,6 +138,11 @@ impl TokenBucketConfig {
         if self.capacity == 0 {
             return Err(AegisError::ConfigError {
                 message: "token_bucket.capacity 不能为 0".to_string(),
+            });
+        }
+        if self.refill_per_sec == 0 {
+            return Err(AegisError::ConfigError {
+                message: "token_bucket.refill_per_sec 不能为 0".to_string(),
             });
         }
         Ok(())

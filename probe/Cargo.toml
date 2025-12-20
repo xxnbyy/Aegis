@@ -6,7 +6,20 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 common = { path = "../common" }
+prost = "0.12"
 tracing = "0.1"
+hmac = "0.12"
+aes-kw = { version = "0.2", features = ["std"] }
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+wmi = "0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true
