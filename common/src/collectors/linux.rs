@@ -230,15 +230,7 @@ fn parse_nspid_first(status: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> {
-    use std::ffi::CString;
-    use std::io::{Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    if limit == 0 {
-        return Vec::new();
-    }
-
+fn open_pidns_files(target_pid: u32) -> Option<(std::fs::File, std::fs::File)> {
     let mnt_ns_path = std::path::PathBuf::from("/proc")
         .join(target_pid.to_string())
         .join("ns")
@@ -248,24 +240,132 @@ fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> 
         .join("ns")
         .join("pid");
 
-    let mnt_ns = std::fs::File::open(mnt_ns_path.as_path()).ok();
-    let pid_ns = std::fs::File::open(pid_ns_path.as_path()).ok();
-    let (Some(mnt_ns), Some(pid_ns)) = (mnt_ns, pid_ns) else {
+    let mnt_ns = std::fs::File::open(mnt_ns_path.as_path()).ok()?;
+    let pid_ns = std::fs::File::open(pid_ns_path.as_path()).ok()?;
+    Some((mnt_ns, pid_ns))
+}
+
+#[cfg(target_os = "linux")]
+fn create_pipe_cloexec() -> Option<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    #[allow(unsafe_code)]
+    let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ok != 0 {
+        return None;
+    }
+    Some((fds[0], fds[1]))
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_pidns_host_pids(limit: usize) -> Vec<u32> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut host_pids: Vec<u32> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for entry in rd.flatten() {
+            if host_pids.len() >= limit {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(proc_pid) = name.parse::<u32>() else {
+                continue;
+            };
+            let status_path = std::path::PathBuf::from("/proc")
+                .join(proc_pid.to_string())
+                .join("status");
+            let Ok(status) = std::fs::read_to_string(status_path.as_path()) else {
+                continue;
+            };
+            let Some(host_pid) = parse_nspid_first(status.as_str()) else {
+                continue;
+            };
+            host_pids.push(host_pid);
+        }
+    }
+    host_pids.sort_unstable();
+    host_pids.dedup();
+    host_pids
+}
+
+#[cfg(target_os = "linux")]
+fn remount_proc_best_effort() {
+    use std::ffi::CString;
+
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            libc::_exit(1);
+        }
+    }
+
+    let root = CString::new("/").ok();
+    let Some(root) = root else {
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::_exit(1);
+        }
+    };
+
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        ) != 0
+        {
+            libc::_exit(1);
+        }
+    }
+
+    let src = CString::new("proc").ok();
+    let fstype = CString::new("proc").ok();
+    let target = CString::new("/proc").ok();
+    let (Some(src), Some(fstype), Some(target)) = (src, fstype, target) else {
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::_exit(1);
+        }
+    };
+
+    #[allow(unsafe_code)]
+    unsafe {
+        let _ = libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        let _ = libc::mount(
+            src.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV) as libc::c_ulong,
+            std::ptr::null(),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let Some((mnt_ns, pid_ns)) = open_pidns_files(target_pid) else {
+        return Vec::new();
+    };
+    let Some((read_fd, write_fd)) = create_pipe_cloexec() else {
         return Vec::new();
     };
 
-    let mut fds = [0i32; 2];
     #[allow(unsafe_code)]
-    let pipe_ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if pipe_ok != 0 {
-        return Vec::new();
-    }
-    let read_fd = fds[0];
-    let write_fd = fds[1];
-
-    #[allow(unsafe_code)]
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
         #[allow(unsafe_code)]
         unsafe {
             libc::close(read_fd);
@@ -274,7 +374,7 @@ fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> 
         return Vec::new();
     }
 
-    if pid == 0 {
+    if child_pid == 0 {
         #[allow(unsafe_code)]
         unsafe {
             libc::close(read_fd);
@@ -291,98 +391,24 @@ fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> 
         }
 
         #[allow(unsafe_code)]
-        let pid2 = unsafe { libc::fork() };
-        if pid2 < 0 {
+        let grandchild_pid = unsafe { libc::fork() };
+        if grandchild_pid < 0 {
             #[allow(unsafe_code)]
             unsafe {
                 libc::_exit(1);
             }
         }
 
-        if pid2 == 0 {
+        if grandchild_pid == 0 {
+            use std::io::Write;
+
+            remount_proc_best_effort();
+
+            let host_pids = enumerate_pidns_host_pids(limit);
             #[allow(unsafe_code)]
-            unsafe {
-                if libc::unshare(libc::CLONE_NEWNS) != 0 {
-                    libc::_exit(1);
-                }
-            }
-
-            let root = CString::new("/").ok();
-            let Some(root) = root else {
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::_exit(1);
-                }
-            };
-
-            #[allow(unsafe_code)]
-            unsafe {
-                if libc::mount(
-                    std::ptr::null(),
-                    root.as_ptr(),
-                    std::ptr::null(),
-                    (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
-                    std::ptr::null(),
-                ) != 0
-                {
-                    libc::_exit(1);
-                }
-            }
-
-            let src = CString::new("proc").ok();
-            let fstype = CString::new("proc").ok();
-            let target = CString::new("/proc").ok();
-            let (Some(src), Some(fstype), Some(target)) = (src, fstype, target) else {
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::_exit(1);
-                }
-            };
-
-            #[allow(unsafe_code)]
-            unsafe {
-                let _ = libc::umount2(target.as_ptr(), libc::MNT_DETACH);
-            }
-            #[allow(unsafe_code)]
-            unsafe {
-                let _ = libc::mount(
-                    src.as_ptr(),
-                    target.as_ptr(),
-                    fstype.as_ptr(),
-                    (libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV) as libc::c_ulong,
-                    std::ptr::null(),
-                );
-            }
-
-            let mut pids: Vec<u32> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir("/proc") {
-                for entry in rd.flatten() {
-                    if pids.len() >= limit {
-                        break;
-                    }
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let Ok(pid) = name.parse::<u32>() else {
-                        continue;
-                    };
-                    let status_path = std::path::PathBuf::from("/proc")
-                        .join(pid.to_string())
-                        .join("status");
-                    let Ok(status) = std::fs::read_to_string(status_path.as_path()) else {
-                        continue;
-                    };
-                    let Some(host_pid) = parse_nspid_first(status.as_str()) else {
-                        continue;
-                    };
-                    pids.push(host_pid);
-                }
-            }
-            pids.sort_unstable();
-            pids.dedup();
-
-            #[allow(unsafe_code)]
-            let mut w = unsafe { std::fs::File::from_raw_fd(write_fd) };
-            for pid in pids {
-                let _ = w.write_all(format!("{pid}\n").as_bytes());
+            let mut writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
+            for pid_value in host_pids {
+                let _write_result = writer.write_all(format!("{pid_value}\n").as_bytes());
             }
             #[allow(unsafe_code)]
             unsafe {
@@ -393,7 +419,7 @@ fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> 
         #[allow(unsafe_code)]
         unsafe {
             let mut status: i32 = 0;
-            let _ = libc::waitpid(pid2, &mut status as *mut i32, 0);
+            let _ = libc::waitpid(grandchild_pid, &raw mut status, 0);
             libc::_exit(0);
         }
     }
@@ -406,13 +432,13 @@ fn collect_host_pids_in_target_pidns(target_pid: u32, limit: usize) -> Vec<u32> 
     #[allow(unsafe_code)]
     let mut reader = unsafe { std::fs::File::from_raw_fd(read_fd) };
     let mut bytes: Vec<u8> = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
+    let _read_result = reader.read_to_end(&mut bytes);
     drop(reader);
 
     #[allow(unsafe_code)]
     unsafe {
         let mut status: i32 = 0;
-        let _ = libc::waitpid(pid, &mut status as *mut i32, 0);
+        let _ = libc::waitpid(child_pid, &raw mut status, 0);
     }
 
     let s = String::from_utf8_lossy(bytes.as_slice()).to_string();
@@ -503,9 +529,7 @@ fn collect_process_info_for_pid_with_ctx(
     now: i64,
     uptime: f64,
     exec_id_counter: &AtomicU64,
-) -> Option<ProcessInfo> {
-    let hz_f = hz.max(1) as f64;
-
+) -> ProcessInfo {
     let base = std::path::PathBuf::from("/proc").join(pid.to_string());
     let stat_path = base.join("stat");
     let status_path = base.join("status");
@@ -514,15 +538,21 @@ fn collect_process_info_for_pid_with_ctx(
     let exe_link = base.join("exe");
 
     let stat = std::fs::read_to_string(stat_path.as_path()).ok();
-    let (ppid, start_ticks) = stat
+    let (parent_pid, start_ticks) = stat
         .as_deref()
         .and_then(parse_proc_stat_ppid_and_starttime_ticks)
         .unwrap_or((0, 0));
 
-    let start_sec = (start_ticks as f64) / hz_f;
-    let age_sec = (uptime - start_sec).max(0.0);
-    let age_i64 = i64::try_from(age_sec.round() as i128).unwrap_or(i64::MAX);
-    let start_time = now.saturating_sub(age_i64);
+    let hz_nonzero = hz.max(1);
+    let start_uptime_sec = start_ticks / hz_nonzero;
+    let uptime_i64 = i64::try_from(uptime.round() as i128).unwrap_or(i64::MAX);
+    let start_uptime_i64 = i64::try_from(start_uptime_sec).unwrap_or(i64::MAX);
+    let age_sec = if uptime_i64 > start_uptime_i64 {
+        uptime_i64.saturating_sub(start_uptime_i64)
+    } else {
+        0
+    };
+    let start_time = now.saturating_sub(age_sec);
 
     let name = read_to_string_trimmed(comm_path.as_path()).unwrap_or_default();
     let cmdline = read_cmdline(cmdline_path.as_path()).unwrap_or_else(|| name.clone());
@@ -550,9 +580,9 @@ fn collect_process_info_for_pid_with_ctx(
         )
     };
 
-    Some(ProcessInfo {
+    ProcessInfo {
         pid,
-        ppid,
+        ppid: parent_pid,
         name,
         cmdline,
         exe_path,
@@ -563,11 +593,11 @@ fn collect_process_info_for_pid_with_ctx(
         has_floating_code: false,
         exec_id,
         exec_id_quality,
-    })
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub fn collect_process_info_for_pid(pid: u32, exec_id_counter: &AtomicU64) -> Option<ProcessInfo> {
+pub fn collect_process_info_for_pid(pid: u32, exec_id_counter: &AtomicU64) -> ProcessInfo {
     let hz = proc_clk_ticks_per_sec().unwrap_or(100);
     let now = unix_timestamp_now_seconds();
     let uptime = read_proc_uptime_seconds().unwrap_or(0.0);
@@ -594,9 +624,8 @@ pub fn collect_cgroup_pids(max_pids: usize, max_files: usize) -> Vec<u32> {
             break;
         }
 
-        let rd = match std::fs::read_dir(dir.as_path()) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(rd) = std::fs::read_dir(dir.as_path()) else {
+            continue;
         };
 
         for entry in rd.flatten() {
@@ -604,9 +633,8 @@ pub fn collect_cgroup_pids(max_pids: usize, max_files: usize) -> Vec<u32> {
                 break;
             }
             let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Ok(ft) = entry.file_type() else {
+                continue;
             };
             if ft.is_dir() {
                 dirs.push(path);
@@ -668,9 +696,8 @@ pub fn collect_cgroup_pids_governed(
         }
         wait_for_budget(governor, 1);
 
-        let rd = match std::fs::read_dir(dir.as_path()) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(rd) = std::fs::read_dir(dir.as_path()) else {
+            continue;
         };
 
         for entry in rd.flatten() {
@@ -678,9 +705,8 @@ pub fn collect_cgroup_pids_governed(
                 break;
             }
             let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Ok(ft) = entry.file_type() else {
+                continue;
             };
             if ft.is_dir() {
                 dirs.push(path);
@@ -736,12 +762,13 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
         if out.len() >= limit {
             break;
         }
-        let Some(info) =
-            collect_process_info_for_pid_with_ctx(pid, hz, now, uptime, exec_id_counter)
-        else {
-            continue;
-        };
-        out.push(info);
+        out.push(collect_process_info_for_pid_with_ctx(
+            pid,
+            hz,
+            now,
+            uptime,
+            exec_id_counter,
+        ));
     }
 
     out
@@ -992,7 +1019,7 @@ impl BpfEnumerator for SysBpfEnumerator {
         let mut info = BpfProgInfo::default();
         let mut info_len = u32::try_from(std::mem::size_of::<BpfProgInfo>()).unwrap_or(u32::MAX);
         let mut attr = BpfAttrObjGetInfoByFd {
-            bpf_fd: std::os::fd::AsRawFd::as_raw_fd(&owned) as u32,
+            bpf_fd: std::os::fd::AsRawFd::as_raw_fd(&owned).cast_unsigned(),
             info_len,
             info: std::ptr::from_mut(&mut info) as u64,
         };
@@ -1123,9 +1150,9 @@ fn bpf_syscall<T>(cmd: u32, attr: &mut T) -> Result<(), std::io::Error> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
-            cmd as libc::c_long,
-            std::ptr::from_mut(attr) as *mut libc::c_void,
-            std::mem::size_of::<T>() as libc::c_long,
+            libc::c_long::from(cmd),
+            std::ptr::from_mut(attr).cast::<libc::c_void>(),
+            libc::c_long::try_from(std::mem::size_of::<T>()).unwrap_or(libc::c_long::MAX),
         )
     };
     if ret < 0 {
@@ -1140,9 +1167,9 @@ fn bpf_syscall_ret_fd<T>(cmd: u32, attr: &mut T) -> Result<i32, std::io::Error> 
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
-            cmd as libc::c_long,
-            std::ptr::from_mut(attr) as *mut libc::c_void,
-            std::mem::size_of::<T>() as libc::c_long,
+            libc::c_long::from(cmd),
+            std::ptr::from_mut(attr).cast::<libc::c_void>(),
+            libc::c_long::try_from(std::mem::size_of::<T>()).unwrap_or(libc::c_long::MAX),
         )
     };
     if ret < 0 {
