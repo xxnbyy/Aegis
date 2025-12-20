@@ -146,5 +146,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build probe (static)
+        env:
+          YARA_CRYPTO_LIB_x86_64_unknown_linux_musl: disable
         run: cargo build -p probe --release --target x86_64-unknown-linux-musl
 
