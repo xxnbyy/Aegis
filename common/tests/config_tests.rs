@@ -54,6 +54,18 @@ networking:
 }
 
 #[test]
+fn deserialize_yaml_accepts_tokens_per_sec_alias() -> Result<(), Box<dyn std::error::Error>> {
+    let yaml = r"
+governor:
+  tokens_per_sec: 4321
+";
+    let cfg: AegisConfig = serde_yaml::from_str(yaml)?;
+    cfg.validate()?;
+    assert_eq!(cfg.governor.net_packet_limit_per_sec, 4321);
+    Ok(())
+}
+
+#[test]
 fn defaults_are_secure() {
     let cfg = AegisConfig::default();
     assert!(!cfg.security.enable_native_plugins);

@@ -84,6 +84,35 @@ impl TokenBucket {
         }
     }
 
+    pub fn has_budget(&mut self, cost: u32) -> bool {
+        self.has_budget_at(cost, Instant::now())
+    }
+
+    pub fn has_budget_at(&mut self, cost: u32, now: Instant) -> bool {
+        self.refill(now);
+        if cost == 0 {
+            return true;
+        }
+        self.tokens >= f64::from(cost)
+    }
+
+    pub fn try_consume(&mut self, cost: u32) -> bool {
+        self.try_consume_at(cost, Instant::now())
+    }
+
+    pub fn try_consume_at(&mut self, cost: u32, now: Instant) -> bool {
+        self.refill(now);
+        if cost == 0 {
+            return true;
+        }
+        let cost_f = f64::from(cost);
+        if self.tokens >= cost_f {
+            self.tokens -= cost_f;
+            return true;
+        }
+        false
+    }
+
     pub fn update_params(&mut self, cfg: &TokenBucketConfig) {
         self.capacity = cfg.capacity;
         self.refill_per_sec = cfg.refill_per_sec;
@@ -99,13 +128,7 @@ impl TokenBucket {
     }
 
     pub fn check_budget_at(&mut self, cost: u32, now: Instant) -> bool {
-        self.refill(now);
-        if cost == 0 {
-            return true;
-        }
-        let cost_f = f64::from(cost);
-        if self.tokens >= cost_f {
-            self.tokens -= cost_f;
+        if self.try_consume_at(cost, now) {
             return true;
         }
         self.dropped = self.dropped.saturating_add(u64::from(cost));
@@ -212,7 +235,8 @@ impl Governor {
     pub fn new(cfg: GovernorConfig) -> Self {
         let now = Instant::now();
         let pid = PidController::new(&cfg.pid);
-        let bucket = TokenBucket::new(&cfg.token_bucket, now);
+        let token_bucket_cfg = cfg.effective_token_bucket();
+        let bucket = TokenBucket::new(&token_bucket_cfg, now);
         let io = IoLimiter::new(cfg.io_limit_mb, now);
         let cpu = CpuUsageTracker::new();
         Self {
@@ -227,7 +251,8 @@ impl Governor {
 
     pub fn apply_config(&mut self, cfg: GovernorConfig) {
         self.pid.update_params(&cfg.pid);
-        self.bucket.update_params(&cfg.token_bucket);
+        let token_bucket_cfg = cfg.effective_token_bucket();
+        self.bucket.update_params(&token_bucket_cfg);
         self.io.update_limit(cfg.io_limit_mb);
         self.cfg = cfg;
     }
@@ -238,6 +263,14 @@ impl Governor {
 
     pub fn check_budget(&mut self, cost: u32) -> bool {
         self.bucket.check_budget(cost)
+    }
+
+    pub fn has_budget(&mut self, cost: u32) -> bool {
+        self.bucket.has_budget(cost)
+    }
+
+    pub fn try_consume_budget(&mut self, cost: u32) -> bool {
+        self.bucket.try_consume(cost)
     }
 
     pub fn dropped_events(&self) -> u64 {
