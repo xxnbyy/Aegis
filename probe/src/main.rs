@@ -686,6 +686,106 @@ fn run_diskshadow_script(script: &str) -> std::io::Result<(std::process::ExitSta
 }
 
 #[cfg(windows)]
+fn vss_log_create_exec_failed<E: std::fmt::Display>(
+    method: &str,
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+    exe_path: &std::path::Path,
+    error: &E,
+) {
+    tracing::warn!(
+        drive_letter = %drive_letter,
+        volume = %volume,
+        context,
+        exe_path = %exe_path.display(),
+        error = %error,
+        method,
+        "vss create failed to execute"
+    );
+}
+
+#[cfg(windows)]
+fn vss_log_create_failed(
+    method: &str,
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+    exit_code: Option<i32>,
+    output_trim: &str,
+) {
+    if output_trim.is_empty() {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            exit_code = ?exit_code,
+            method,
+            "vss create failed"
+        );
+    } else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            exit_code = ?exit_code,
+            output = %output_trim,
+            method,
+            "vss create failed"
+        );
+    }
+}
+
+#[cfg(windows)]
+fn vss_snapshot_from_text_output(
+    method: &str,
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+    output: &str,
+) -> Option<VssSnapshot> {
+    let output_trim = output.trim();
+    let Some(shadow_id) = choose_shadow_id_from_output(output) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            output = %output_trim,
+            method,
+            "vss create missing shadow_id"
+        );
+        return None;
+    };
+    let Some(device_path) = find_shadow_device_path_in_output(output) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            shadow_id = %shadow_id,
+            output = %output_trim,
+            method,
+            "vss create missing device_path"
+        );
+        return None;
+    };
+
+    tracing::info!(
+        drive_letter = %drive_letter,
+        volume = %volume,
+        context,
+        shadow_id = %shadow_id,
+        device_path = %device_path,
+        method,
+        "vss snapshot created"
+    );
+    Some(VssSnapshot {
+        drive_letter,
+        shadow_id,
+        device_path,
+    })
+}
+
+#[cfg(windows)]
 fn create_vss_snapshot_for_drive_diskshadow(
     drive_letter: char,
     volume: &str,
@@ -705,81 +805,31 @@ fn create_vss_snapshot_for_drive_diskshadow(
     let (status, output) = match run_diskshadow_script(script.as_str()) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                drive_letter = %drive_letter,
-                volume = %volume,
+            vss_log_create_exec_failed(
+                "diskshadow",
+                drive_letter,
+                volume,
                 context,
-                exe_path = %windows_find_diskshadow_exe().display(),
-                error = %e,
-                method = "diskshadow",
-                "vss create failed to execute"
+                windows_find_diskshadow_exe().as_path(),
+                &e,
             );
             return None;
         }
     };
     let output_trim = output.trim();
     if !status.success() {
-        if output_trim.is_empty() {
-            tracing::warn!(
-                drive_letter = %drive_letter,
-                volume = %volume,
-                context,
-                exit_code = ?status.code(),
-                method = "diskshadow",
-                "vss create failed"
-            );
-        } else {
-            tracing::warn!(
-                drive_letter = %drive_letter,
-                volume = %volume,
-                context,
-                exit_code = ?status.code(),
-                output = %output_trim,
-                method = "diskshadow",
-                "vss create failed"
-            );
-        }
+        vss_log_create_failed(
+            "diskshadow",
+            drive_letter,
+            volume,
+            context,
+            status.code(),
+            output_trim,
+        );
         return None;
     }
 
-    let Some(shadow_id) = choose_shadow_id_from_output(output.as_str()) else {
-        tracing::warn!(
-            drive_letter = %drive_letter,
-            volume = %volume,
-            context,
-            output = %output_trim,
-            method = "diskshadow",
-            "vss create missing shadow_id"
-        );
-        return None;
-    };
-    let Some(device_path) = find_shadow_device_path_in_output(output.as_str()) else {
-        tracing::warn!(
-            drive_letter = %drive_letter,
-            volume = %volume,
-            context,
-            shadow_id = %shadow_id,
-            output = %output_trim,
-            method = "diskshadow",
-            "vss create missing device_path"
-        );
-        return None;
-    };
-
-    tracing::info!(
-        drive_letter = %drive_letter,
-        volume = %volume,
-        context,
-        shadow_id = %shadow_id,
-        device_path = %device_path,
-        method = "diskshadow",
-        "vss snapshot created"
-    );
-    Some(VssSnapshot {
-        drive_letter,
-        shadow_id,
-        device_path,
-    })
+    vss_snapshot_from_text_output("diskshadow", drive_letter, volume, context, output.as_str())
 }
 
 #[cfg(windows)]
@@ -805,14 +855,13 @@ fn create_vss_snapshot_for_drive_vssadmin(
     let out = match out {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                drive_letter = %drive_letter,
-                volume = %volume,
+            vss_log_create_exec_failed(
+                "vssadmin",
+                drive_letter,
+                volume,
                 context,
-                exe_path = %windows_find_vssadmin_exe().display(),
-                error = %e,
-                method = "vssadmin",
-                "vss create failed to execute"
+                windows_find_vssadmin_exe().as_path(),
+                &e,
             );
             return None;
         }
@@ -823,67 +872,18 @@ fn create_vss_snapshot_for_drive_vssadmin(
     let combined = format!("{stdout}\n{stderr}");
     let output_trim = combined.trim();
     if !out.status.success() {
-        if output_trim.is_empty() {
-            tracing::warn!(
-                drive_letter = %drive_letter,
-                volume = %volume,
-                context,
-                exit_code = ?out.status.code(),
-                method = "vssadmin",
-                "vss create failed"
-            );
-        } else {
-            tracing::warn!(
-                drive_letter = %drive_letter,
-                volume = %volume,
-                context,
-                exit_code = ?out.status.code(),
-                output = %output_trim,
-                method = "vssadmin",
-                "vss create failed"
-            );
-        }
+        vss_log_create_failed(
+            "vssadmin",
+            drive_letter,
+            volume,
+            context,
+            out.status.code(),
+            output_trim,
+        );
         return None;
     }
 
-    let Some(shadow_id) = choose_shadow_id_from_output(output_trim) else {
-        tracing::warn!(
-            drive_letter = %drive_letter,
-            volume = %volume,
-            context,
-            output = %output_trim,
-            method = "vssadmin",
-            "vss create missing shadow_id"
-        );
-        return None;
-    };
-    let Some(device_path) = find_shadow_device_path_in_output(output_trim) else {
-        tracing::warn!(
-            drive_letter = %drive_letter,
-            volume = %volume,
-            context,
-            shadow_id = %shadow_id,
-            output = %output_trim,
-            method = "vssadmin",
-            "vss create missing device_path"
-        );
-        return None;
-    };
-
-    tracing::info!(
-        drive_letter = %drive_letter,
-        volume = %volume,
-        context,
-        shadow_id = %shadow_id,
-        device_path = %device_path,
-        method = "vssadmin",
-        "vss snapshot created"
-    );
-    Some(VssSnapshot {
-        drive_letter,
-        shadow_id,
-        device_path,
-    })
+    vss_snapshot_from_text_output("vssadmin", drive_letter, volume, context, combined.as_str())
 }
 
 #[cfg(windows)]
@@ -905,6 +905,21 @@ fn lookup_vss_device_object_vssadmin(shadow_id: &str) -> Option<String> {
     let idx = combined.find(shadow_id)?;
     let window = combined.get(idx..(idx + 4096).min(combined.len()))?;
     find_shadow_device_path_in_output(window)
+}
+
+#[cfg(windows)]
+fn create_vss_snapshot_for_drive_fallback(
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+) -> Option<VssSnapshot> {
+    if let Some(s) = create_vss_snapshot_for_drive_powershell(drive_letter, volume, context) {
+        return Some(s);
+    }
+    if let Some(s) = create_vss_snapshot_for_drive_diskshadow(drive_letter, volume, context) {
+        return Some(s);
+    }
+    create_vss_snapshot_for_drive_vssadmin(drive_letter, volume, context)
 }
 
 #[cfg(windows)]
@@ -945,21 +960,7 @@ fn create_vss_snapshot_for_drive(drive_letter: char) -> Option<VssSnapshot> {
             tracing::warn!(error = %e, drive_letter = %drive_letter, "wmi connection failed");
             if vss_fallback_enabled_for_error(&e) {
                 for context in ["ClientAccessibleWriters", "ClientAccessible"] {
-                    if let Some(s) = create_vss_snapshot_for_drive_powershell(
-                        drive_letter,
-                        volume.as_str(),
-                        context,
-                    ) {
-                        return Some(s);
-                    }
-                    if let Some(s) = create_vss_snapshot_for_drive_diskshadow(
-                        drive_letter,
-                        volume.as_str(),
-                        context,
-                    ) {
-                        return Some(s);
-                    }
-                    if let Some(s) = create_vss_snapshot_for_drive_vssadmin(
+                    if let Some(s) = create_vss_snapshot_for_drive_fallback(
                         drive_letter,
                         volume.as_str(),
                         context,
@@ -991,21 +992,7 @@ fn create_vss_snapshot_for_drive(drive_letter: char) -> Option<VssSnapshot> {
                     "vss create wmi error"
                 );
                 if fallback_enabled {
-                    if let Some(s) = create_vss_snapshot_for_drive_powershell(
-                        drive_letter,
-                        volume.as_str(),
-                        context,
-                    ) {
-                        return Some(s);
-                    }
-                    if let Some(s) = create_vss_snapshot_for_drive_diskshadow(
-                        drive_letter,
-                        volume.as_str(),
-                        context,
-                    ) {
-                        return Some(s);
-                    }
-                    if let Some(s) = create_vss_snapshot_for_drive_vssadmin(
+                    if let Some(s) = create_vss_snapshot_for_drive_fallback(
                         drive_letter,
                         volume.as_str(),
                         context,
