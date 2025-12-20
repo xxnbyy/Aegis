@@ -517,7 +517,6 @@ fn effective_telemetry_interval_sec(cfg: &common::config::AegisConfig) -> u64 {
 #[cfg(target_os = "linux")]
 fn collect_ip_addresses() -> Vec<String> {
     use std::collections::BTreeSet;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     let mut out: BTreeSet<String> = BTreeSet::new();
 
@@ -532,7 +531,14 @@ fn collect_ip_addresses() -> Vec<String> {
             let ifa = &*cur;
             let addr = ifa.ifa_addr;
             if !addr.is_null() {
-                insert_ip_from_sockaddr(&mut out, addr);
+                let family = i32::from((*addr).sa_family);
+                if family == libc::AF_INET {
+                    let sa = std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in>());
+                    insert_ipv4_if_valid(&mut out, sa.sin_addr.s_addr.to_ne_bytes());
+                } else if family == libc::AF_INET6 {
+                    let sa = std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in6>());
+                    insert_ipv6_if_valid(&mut out, sa.sin6_addr.s6_addr);
+                }
             }
             cur = ifa.ifa_next;
         }
@@ -543,28 +549,18 @@ fn collect_ip_addresses() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn insert_ip_from_sockaddr(
-    out: &mut std::collections::BTreeSet<String>,
-    addr: *mut libc::sockaddr,
-) {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    let family = unsafe { i32::from((*addr).sa_family) };
-    if family == libc::AF_INET {
-        let sa = unsafe { std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in>()) };
-        let ip = Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes());
-        if !ip.is_loopback() && !ip.is_unspecified() {
-            out.insert(ip.to_string());
-        }
-        return;
+fn insert_ipv4_if_valid(out: &mut std::collections::BTreeSet<String>, bytes: [u8; 4]) {
+    let ip = std::net::Ipv4Addr::from(bytes);
+    if !ip.is_loopback() && !ip.is_unspecified() {
+        out.insert(ip.to_string());
     }
+}
 
-    if family == libc::AF_INET6 {
-        let sa = unsafe { std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in6>()) };
-        let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
-        if !ip.is_loopback() && !ip.is_unspecified() {
-            out.insert(ip.to_string());
-        }
+#[cfg(target_os = "linux")]
+fn insert_ipv6_if_valid(out: &mut std::collections::BTreeSet<String>, bytes: [u8; 16]) {
+    let ip = std::net::Ipv6Addr::from(bytes);
+    if !ip.is_loopback() && !ip.is_unspecified() {
+        out.insert(ip.to_string());
     }
 }
 
