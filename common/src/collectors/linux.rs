@@ -806,7 +806,7 @@ pub fn collect_process_infos(_limit: usize, _exec_id_counter: &AtomicU64) -> Vec
 
 pub fn wait_for_budget(governor: &mut Governor, cost: u32) {
     loop {
-        if governor.check_budget(cost) {
+        if governor.try_consume_budget(cost) {
             return;
         }
         let sleep = governor.tick();

@@ -14,6 +14,7 @@ rand = "0.8"
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 wmi = "0.18"

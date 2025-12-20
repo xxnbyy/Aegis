@@ -21,5 +21,9 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
+[dev-dependencies]
+sdk = { path = "../sdk" }
+tempfile = "3"
+
 [lints]
 workspace = true

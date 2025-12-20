@@ -51,6 +51,7 @@ pub struct GovernorConfig {
     pub pid: PidConfig,
     pub token_bucket: TokenBucketConfig,
     pub max_single_core_usage: u32,
+    #[serde(alias = "tokens_per_sec")]
     pub net_packet_limit_per_sec: u32,
     pub io_limit_mb: u32,
 }
@@ -78,6 +79,25 @@ impl GovernorConfig {
         self.pid.validate()?;
         self.token_bucket.validate()?;
         Ok(())
+    }
+
+    pub fn effective_token_bucket(&self) -> TokenBucketConfig {
+        if self.net_packet_limit_per_sec == 0 {
+            return self.token_bucket.clone();
+        }
+
+        if self.token_bucket != TokenBucketConfig::default() {
+            return self.token_bucket.clone();
+        }
+
+        TokenBucketConfig {
+            capacity: self.net_packet_limit_per_sec,
+            refill_per_sec: self.net_packet_limit_per_sec,
+        }
+    }
+
+    pub fn effective_tokens_per_sec(&self) -> u32 {
+        self.effective_token_bucket().refill_per_sec
     }
 }
 
@@ -352,4 +372,33 @@ fn is_relevant_config_event(kind: EventKind) -> bool {
             | EventKind::Remove(RemoveKind::File)
             | EventKind::Any
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GovernorConfig, TokenBucketConfig};
+
+    #[test]
+    fn effective_token_bucket_prefers_explicit_token_bucket() {
+        let cfg = GovernorConfig {
+            net_packet_limit_per_sec: 111,
+            token_bucket: TokenBucketConfig {
+                capacity: 222,
+                refill_per_sec: 333,
+            },
+            ..GovernorConfig::default()
+        };
+        assert_eq!(cfg.effective_token_bucket(), cfg.token_bucket);
+    }
+
+    #[test]
+    fn effective_token_bucket_maps_net_packet_limit_when_token_bucket_default() {
+        let cfg = GovernorConfig {
+            net_packet_limit_per_sec: 1234,
+            token_bucket: TokenBucketConfig::default(),
+            ..GovernorConfig::default()
+        };
+        assert_eq!(cfg.effective_token_bucket().capacity, 1234);
+        assert_eq!(cfg.effective_token_bucket().refill_per_sec, 1234);
+    }
 }

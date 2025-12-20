@@ -560,7 +560,8 @@ mod tests {
     use super::*;
 
     use common::protocol::{
-        MessagePayload, PayloadEnvelope, payload_envelope, validate_first_chunk_is_system_info,
+        Chunker, MessagePayload, PayloadEnvelope, payload_envelope,
+        validate_first_chunk_is_system_info,
     };
     use rsa::RsaPrivateKey;
     use rsa::RsaPublicKey;
@@ -568,6 +569,8 @@ mod tests {
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
+    use sdk::ArtifactUploadReceiver;
+    use std::io::Cursor;
     #[cfg(windows)]
     use std::sync::Mutex;
     #[cfg(windows)]
@@ -916,6 +919,141 @@ events:
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn artifact_chunk_upload_receiver_roundtrip_preserves_bytes() -> Result<(), AegisError> {
+        let temp_dir = unique_temp_dir()?;
+        let scenario_path = temp_dir.join("scenario.yml");
+        let out_path = temp_dir.join("out.aes");
+        let cert_path = temp_dir.join("org_public.der");
+
+        let passphrase = test_passphrase();
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| AegisError::CryptoError {
+                message: format!("生成 RSA 私钥失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let public_key = RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("导出 Org Public Key DER 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?
+            .as_bytes()
+            .to_vec();
+        fs::write(cert_path.as_path(), public_key_der.as_slice()).map_err(io_error)?;
+
+        let scenario_yaml = r#"
+events:
+  - type: process
+    exec_id: 42
+    pid: 777
+    name: "p1"
+  - type: telemetry
+    dropped_events: 9
+    cpu_usage_percent: 33
+    memory_usage_mb: 2048
+  - type: network_change
+    new_ip_addresses: ["10.0.0.1", "10.0.0.2"]
+"#;
+        fs::write(scenario_path.as_path(), scenario_yaml).map_err(io_error)?;
+
+        run_with_paths(
+            scenario_path.as_path(),
+            out_path.as_path(),
+            "dev",
+            Some(cert_path.as_path()),
+            Some(passphrase.as_str()),
+        )?;
+        let artifact = fs::read(out_path.as_path()).map_err(io_error)?;
+
+        let request_id = 123u64;
+        let mut chunker = Chunker::new(Cursor::new(artifact.clone()), 128 * 1024, request_id)?;
+
+        let upload_dir = temp_dir.join("upload");
+        fs::create_dir_all(upload_dir.as_path()).map_err(io_error)?;
+        let mut rx = ArtifactUploadReceiver::new(upload_dir.as_path());
+
+        let mut completed = None;
+        for msg in chunker.by_ref() {
+            completed = rx.push(&msg?)?;
+        }
+        let done = completed.ok_or(AegisError::ProtocolError {
+            message: "未完成 artifact".to_string(),
+            code: None,
+        })?;
+        assert_eq!(done.request_id, request_id);
+
+        let rebuilt = fs::read(done.path.as_path()).map_err(io_error)?;
+        assert_eq!(rebuilt, artifact);
+
+        let rsa_ct_len = private_key.size();
+        let (user_slot, rsa_ct, stream) = read_artifact_parts(rebuilt.as_slice(), rsa_ct_len)?;
+
+        let kdf_salt: [u8; crypto::AES_KDF_SALT_LEN] = rebuilt
+            [crypto::AES_KDF_SALT_OFFSET..crypto::AES_KDF_SALT_OFFSET + crypto::AES_KDF_SALT_LEN]
+            .try_into()
+            .map_err(|_| AegisError::ProtocolError {
+                message: "读取 KDF_Salt 失败".to_string(),
+                code: None,
+            })?;
+        let kek_bytes = crypto::derive_kek_argon2id(passphrase.as_bytes(), kdf_salt.as_ref())?;
+        let kek = Kek::from(kek_bytes);
+        let unwrapped = kek
+            .unwrap_vec(user_slot)
+            .map_err(|e| AegisError::CryptoError {
+                message: format!("AES-256-KeyWrap 解密 SessionKey 失败: {e}"),
+                code: Some(ErrorCode::Crypto003),
+            })?;
+        let session_key_from_user: [u8; 32] =
+            unwrapped
+                .as_slice()
+                .try_into()
+                .map_err(|_| AegisError::CryptoError {
+                    message: "User Slot 解出的 SessionKey 长度不是 32 bytes".to_string(),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+
+        let session_key_bytes =
+            private_key
+                .decrypt(Oaep::new::<Sha256>(), rsa_ct)
+                .map_err(|e| AegisError::CryptoError {
+                    message: format!("RSA-OAEP 解密 SessionKey 失败: {e}"),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        let session_key_from_org: [u8; 32] =
+            session_key_bytes
+                .try_into()
+                .map_err(|_| AegisError::CryptoError {
+                    message: "SessionKey 长度不是 32 bytes".to_string(),
+                    code: Some(ErrorCode::Crypto003),
+                })?;
+        assert_eq!(session_key_from_user, session_key_from_org);
+
+        assert_eq!(
+            crypto::verify_hmac_sig_trailer_v1(rebuilt.as_slice(), &session_key_from_org)?,
+            crypto::HmacSigVerification::Valid
+        );
+
+        let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key_from_org)?;
+        let env0 = PayloadEnvelope::decode(plaintexts[0].as_slice()).map_err(|e| {
+            AegisError::ProtocolError {
+                message: format!("PayloadEnvelope Protobuf 反序列化失败: {e}"),
+                code: None,
+            }
+        })?;
+        let Some(payload_envelope::Payload::SystemInfo(system_info)) = env0.payload else {
+            return Err(AegisError::ProtocolError {
+                message: "第一个 Chunk 必须是 SystemInfo".to_string(),
+                code: None,
+            });
+        };
+        validate_first_chunk_is_system_info(&MessagePayload::SystemInfo(system_info.clone()))?;
+        Ok(())
+    }
+
+    #[test]
     fn warns_on_data_loss_events() -> Result<(), AegisError> {
         let mut rng = OsRng;
         let private_key =
@@ -1032,6 +1170,21 @@ events:
 
         let second = crypto::get_or_create_host_uuid("dev")?;
         assert_eq!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_uuid_can_be_read_from_hkcu_in_prod_mode() -> Result<(), AegisError> {
+        let _guard = lock_registry_mutex()?;
+
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = root.create_subkey("SOFTWARE\\Aegis").map_err(io_error)?;
+        let expected = Uuid::new_v4().to_string();
+        key.set_value("HostUUID", &expected).map_err(io_error)?;
+
+        let got = crypto::get_or_create_host_uuid("prod")?;
+        assert_eq!(Uuid::from_bytes(got).to_string(), expected);
         Ok(())
     }
 

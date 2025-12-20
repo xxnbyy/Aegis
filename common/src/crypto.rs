@@ -200,14 +200,14 @@ pub fn get_or_create_host_uuid(mode: &str) -> Result<[u8; 16], AegisError> {
 fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
     #[cfg(windows)]
     {
-        use winreg::enums::HKEY_LOCAL_MACHINE;
+        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
         if let Some(v) = try_read_host_uuid_registry(HKEY_LOCAL_MACHINE)? {
             return Ok(Some(v));
         }
-        if mode == "dev" {
-            use winreg::enums::HKEY_CURRENT_USER;
-            return try_read_host_uuid_registry(HKEY_CURRENT_USER);
+        if let Some(v) = try_read_host_uuid_registry(HKEY_CURRENT_USER)? {
+            return Ok(Some(v));
         }
+        let _ = mode;
         Ok(None)
     }
 
@@ -217,12 +217,11 @@ fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
         if let Some(v) = try_read_host_uuid_file(primary)? {
             return Ok(Some(v));
         }
-        if mode == "dev" {
-            let fallback = user_uuid_path();
-            if let Some(v) = try_read_host_uuid_file(fallback.as_path())? {
-                return Ok(Some(v));
-            }
+        let fallback = user_uuid_path();
+        if let Some(v) = try_read_host_uuid_file(fallback.as_path())? {
+            return Ok(Some(v));
         }
+        let _ = mode;
         Ok(None)
     }
 }
@@ -230,22 +229,21 @@ fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
 fn persist_host_uuid(mode: &str, uuid: &[u8; 16]) -> Result<(), AegisError> {
     #[cfg(windows)]
     {
-        use winreg::enums::HKEY_LOCAL_MACHINE;
+        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
         if try_write_host_uuid_registry(HKEY_LOCAL_MACHINE, uuid).is_ok() {
             return Ok(());
         }
-        if mode == "dev" {
-            use winreg::enums::HKEY_CURRENT_USER;
-            if try_write_host_uuid_registry(HKEY_CURRENT_USER, uuid).is_ok() {
-                return Ok(());
+        if try_write_host_uuid_registry(HKEY_CURRENT_USER, uuid).is_ok() {
+            if mode != "dev" {
+                tracing::warn!(
+                    "HostUUID 写入 HKLM\\SOFTWARE\\Aegis 失败，已降级写入 HKCU\\SOFTWARE\\Aegis"
+                );
             }
-            return Err(AegisError::ConfigError {
-                message: "无法写入 HostUUID 至 HKLM/HKCU\\SOFTWARE\\Aegis（请以管理员权限运行）"
-                    .to_string(),
-            });
+            return Ok(());
         }
         Err(AegisError::ConfigError {
-            message: "无法写入 HostUUID 至 HKLM\\SOFTWARE\\Aegis（请以管理员权限运行）".to_string(),
+            message: "无法写入 HostUUID 至 HKLM/HKCU\\SOFTWARE\\Aegis（请以管理员权限运行）"
+                .to_string(),
         })
     }
 
@@ -255,12 +253,13 @@ fn persist_host_uuid(mode: &str, uuid: &[u8; 16]) -> Result<(), AegisError> {
         if try_write_host_uuid_file(primary, uuid).is_ok() {
             return Ok(());
         }
-        if mode != "dev" {
-            return Err(AegisError::ConfigError {
-                message: "无法写入 HostUUID 至 /etc/aegis/uuid（请以 root 权限运行）".to_string(),
-            });
-        }
         let fallback = user_uuid_path();
+        if mode != "dev" {
+            tracing::warn!(
+                "HostUUID 写入 /etc/aegis/uuid 失败，已降级写入 {}",
+                fallback.display()
+            );
+        }
         try_write_host_uuid_file(fallback.as_path(), uuid)?;
         Ok(())
     }

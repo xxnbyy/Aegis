@@ -15,7 +15,7 @@ use aes_kw::Kek;
 use common::config::{ConfigManager, load_yaml_file};
 use common::crypto;
 use common::detection::{RuleManager, RuleSet};
-use common::governor::Governor;
+use common::governor::{Governor, IoLimiter};
 use common::protocol::{
     AgentTelemetry, FileInfo, NetworkInterfaceUpdate, PayloadEnvelope, ProcessInfo, SystemInfo,
 };
@@ -29,6 +29,7 @@ use rsa::RsaPublicKey;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
 use sha2::Sha256;
+use tokio::sync::mpsc as tokio_mpsc;
 #[cfg(windows)]
 use wmi::WMIConnection;
 
@@ -41,30 +42,55 @@ mod embedded_key {
 const USER_SLOT_LEN: usize = 40;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+type EventBusTx = tokio_mpsc::UnboundedSender<EncryptorCommand>;
+type EventBusRx = tokio_mpsc::UnboundedReceiver<EncryptorCommand>;
 
 #[derive(Debug)]
 enum EncryptorCommand {
     Payload(Vec<u8>),
     Flush,
+    UpdateIoLimitMb(u32),
 }
 
 fn main() {
-    if let Err(e) = run() {
+    if let Err(e) = try_main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
+fn try_main() -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("初始化 tokio 运行时失败: {e}"))?;
+    rt.block_on(run_async())
+}
+
+async fn run_async() -> Result<(), String> {
     init_telemetry().map_err(|e| format!("初始化日志失败: {e}"))?;
 
     let args = parse_args(std::env::args().skip(1))?;
-    let (mgr, rule_mgr, encryptor_tx) = init_runtime(args)?;
-    run_forever(&mgr, &rule_mgr, &encryptor_tx);
+    let (bus_tx, bus_rx) = tokio_mpsc::unbounded_channel::<EncryptorCommand>();
+    let (mgr, rule_mgr, encryptor_tx) = init_runtime(args, &bus_tx)?;
+
+    tokio::spawn(forward_encryptor(bus_rx, encryptor_tx));
+
+    run_forever_async(&mgr, &rule_mgr, &bus_tx).await;
+    Ok(())
+}
+
+async fn forward_encryptor(mut bus_rx: EventBusRx, encryptor_tx: mpsc::Sender<EncryptorCommand>) {
+    while let Some(cmd) = bus_rx.recv().await {
+        if encryptor_tx.send(cmd).is_err() {
+            break;
+        }
+    }
 }
 
 fn init_runtime(
     args: ProbeArgs,
+    bus_tx: &EventBusTx,
 ) -> Result<(ConfigManager, RuleManager, mpsc::Sender<EncryptorCommand>), String> {
     let Some(config_path) = args.config_path else {
         return Err("缺少必需参数: --config <FILE>".to_string());
@@ -109,9 +135,10 @@ fn init_runtime(
         org_key_fp,
         uuid_mode,
         user_passphrase,
+        cfg.governor.io_limit_mb,
     );
     enqueue_payload(
-        &encryptor_tx,
+        bus_tx,
         PayloadEnvelope::system_info(build_system_info()).encode_to_vec(),
     );
 
@@ -164,14 +191,11 @@ impl LoopState {
     }
 }
 
-fn run_forever(
-    mgr: &ConfigManager,
-    rule_mgr: &RuleManager,
-    encryptor_tx: &mpsc::Sender<EncryptorCommand>,
-) -> ! {
+async fn run_forever_async(mgr: &ConfigManager, rule_mgr: &RuleManager, bus_tx: &EventBusTx) {
     tracing::info!("probe started");
     let mut governor = Governor::new(mgr.current().governor.clone());
     let mut state = LoopState::new();
+    let mut last_encryptor_io_limit_mb: Option<u32> = None;
 
     loop {
         let cfg = mgr.current();
@@ -179,32 +203,41 @@ fn run_forever(
         governor.apply_config(cfg.governor.clone());
         let (cpu_usage_percent, sleep) = governor.tick_with_usage();
 
-        maybe_emit_process_snapshot(&mut state, &mut governor, encryptor_tx);
-        maybe_emit_file_snapshot(&mut state, &mut governor, rules.as_ref(), encryptor_tx);
-        maybe_emit_network_update(&mut state, &mut governor, encryptor_tx);
+        if last_encryptor_io_limit_mb != Some(cfg.governor.io_limit_mb) {
+            if bus_tx
+                .send(EncryptorCommand::UpdateIoLimitMb(cfg.governor.io_limit_mb))
+                .is_err()
+            {
+                tracing::warn!("encryptor channel closed");
+            }
+            last_encryptor_io_limit_mb = Some(cfg.governor.io_limit_mb);
+        }
+
+        maybe_emit_process_snapshot(&mut state, &mut governor, bus_tx);
+        maybe_emit_file_snapshot(&mut state, &mut governor, rules.as_ref(), bus_tx);
+        maybe_emit_network_update(&mut state, &mut governor, bus_tx);
         maybe_emit_linux_bpf_snapshot(&mut state, &mut governor);
         maybe_emit_telemetry(
             &mut state,
             cfg.as_ref(),
             &mut governor,
-            encryptor_tx,
+            bus_tx,
             cpu_usage_percent,
         );
 
-        thread::sleep(Duration::from_millis(50).saturating_add(sleep));
+        tokio::time::sleep(Duration::from_millis(50).saturating_add(sleep)).await;
     }
 }
 
 fn maybe_emit_process_snapshot(
     state: &mut LoopState,
     governor: &mut Governor,
-    encryptor_tx: &mpsc::Sender<EncryptorCommand>,
+    bus_tx: &EventBusTx,
 ) {
     if state.last_process_snapshot.elapsed() < Duration::from_secs(60) {
         return;
     }
-    if !governor.check_budget(1) {
-        state.last_process_snapshot = Instant::now();
+    if !governor.try_consume_budget(1) {
         return;
     }
 
@@ -212,15 +245,12 @@ fn maybe_emit_process_snapshot(
     let total = processes.len();
     let mut sent: usize = 0;
     for p in processes {
-        if !governor.check_budget(1) {
+        if !governor.try_consume_budget(1) {
             let dropped = u64::try_from(total.saturating_sub(sent)).unwrap_or(u64::MAX);
             state.dropped_counter.add(dropped);
             break;
         }
-        enqueue_payload(
-            encryptor_tx,
-            PayloadEnvelope::process_info(p).encode_to_vec(),
-        );
+        enqueue_payload(bus_tx, PayloadEnvelope::process_info(p).encode_to_vec());
         sent = sent.saturating_add(1);
     }
     state.last_process_snapshot = Instant::now();
@@ -230,17 +260,16 @@ fn maybe_emit_file_snapshot(
     state: &mut LoopState,
     governor: &mut Governor,
     rules: &RuleSet,
-    encryptor_tx: &mpsc::Sender<EncryptorCommand>,
+    bus_tx: &EventBusTx,
 ) {
-    if state.last_file_snapshot.elapsed() < Duration::from_secs(300) {
-        return;
-    }
-    if !governor.check_budget(1) {
-        state.last_file_snapshot = Instant::now();
+    if state.last_file_snapshot.elapsed() < effective_file_snapshot_interval() {
         return;
     }
     if rules.scan_whitelist().is_empty() {
         state.last_file_snapshot = Instant::now();
+        return;
+    }
+    if !governor.try_consume_budget(1) {
         return;
     }
 
@@ -248,27 +277,22 @@ fn maybe_emit_file_snapshot(
     let total = files.len();
     let mut sent: usize = 0;
     for f in files {
-        if !governor.check_budget(1) {
+        if !governor.try_consume_budget(1) {
             let dropped = u64::try_from(total.saturating_sub(sent)).unwrap_or(u64::MAX);
             state.dropped_counter.add(dropped);
             break;
         }
-        enqueue_payload(encryptor_tx, PayloadEnvelope::file_info(f).encode_to_vec());
+        enqueue_payload(bus_tx, PayloadEnvelope::file_info(f).encode_to_vec());
         sent = sent.saturating_add(1);
     }
     state.last_file_snapshot = Instant::now();
 }
 
-fn maybe_emit_network_update(
-    state: &mut LoopState,
-    governor: &mut Governor,
-    encryptor_tx: &mpsc::Sender<EncryptorCommand>,
-) {
+fn maybe_emit_network_update(state: &mut LoopState, governor: &mut Governor, bus_tx: &EventBusTx) {
     if state.last_network_snapshot.elapsed() < Duration::from_secs(60) {
         return;
     }
-    if !governor.check_budget(1) {
-        state.last_network_snapshot = Instant::now();
+    if !governor.try_consume_budget(1) {
         return;
     }
 
@@ -279,7 +303,7 @@ fn maybe_emit_network_update(
             ts = state.last_network_update_ts.saturating_add(1);
         }
         enqueue_payload(
-            encryptor_tx,
+            bus_tx,
             PayloadEnvelope::network_interface_update(NetworkInterfaceUpdate {
                 timestamp: ts,
                 new_ip_addresses: ip_addresses.clone(),
@@ -304,12 +328,18 @@ fn collect_file_snapshot(rules: &RuleSet) -> Vec<FileInfo> {
         let mut out = Vec::new();
         for (drive, paths) in by_drive {
             let snapshot = drive.and_then(|d| {
-                if paths.iter().any(|p| file_should_use_vss(Path::new(p))) {
+                if vss_fast_mode() || paths.iter().any(|p| file_should_use_vss(Path::new(p))) {
                     create_vss_snapshot_for_drive(d)
                 } else {
                     None
                 }
             });
+            if snapshot.is_some() {
+                let hold = vss_hold_duration();
+                if hold > Duration::from_millis(0) {
+                    thread::sleep(hold);
+                }
+            }
             let (vss_drive, vss_device_path) = snapshot.as_ref().map_or((None, None), |s| {
                 (Some(s.drive_letter), Some(s.device_path.as_str()))
             });
@@ -329,6 +359,45 @@ fn collect_file_snapshot(rules: &RuleSet) -> Vec<FileInfo> {
         let _ = rules;
         Vec::new()
     }
+}
+
+fn truthy_env(key: &str) -> bool {
+    std::env::var(key).ok().is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes"
+    })
+}
+
+fn vss_fast_mode() -> bool {
+    truthy_env("AEGIS_VSS_FAST")
+}
+
+#[cfg(windows)]
+fn vss_ps_fallback_enabled() -> bool {
+    vss_fast_mode() || truthy_env("AEGIS_VSS_PS_FALLBACK")
+}
+
+#[cfg(windows)]
+fn vss_fallback_enabled_for_error(err: &impl std::fmt::Display) -> bool {
+    if vss_ps_fallback_enabled() {
+        return true;
+    }
+    let s = err.to_string();
+    s.contains("0x80041014") || s.contains("0x80041002")
+}
+
+fn vss_hold_duration() -> Duration {
+    if vss_fast_mode() {
+        return Duration::from_secs(2);
+    }
+    Duration::from_millis(0)
+}
+
+fn effective_file_snapshot_interval() -> Duration {
+    if vss_fast_mode() {
+        return Duration::from_secs(5);
+    }
+    Duration::from_secs(300)
 }
 
 #[cfg(windows)]
@@ -355,7 +424,9 @@ struct VssSnapshot {
 #[cfg(windows)]
 impl Drop for VssSnapshot {
     fn drop(&mut self) {
-        let _ignored = delete_vss_snapshot(self.shadow_id.as_str());
+        if delete_vss_snapshot(self.shadow_id.as_str()).is_err() {
+            let _ignored = delete_vss_snapshot_vssadmin(self.shadow_id.as_str());
+        }
     }
 }
 
@@ -365,8 +436,9 @@ fn delete_vss_snapshot(shadow_id: &str) -> std::io::Result<()> {
         std::io::Error::other(e.to_string())
     }
 
+    #[allow(non_camel_case_types)]
     #[derive(serde::Deserialize)]
-    struct Win32ShadowCopy;
+    struct Win32_ShadowCopy;
 
     #[derive(serde::Deserialize)]
     struct DeleteOutput {
@@ -390,7 +462,7 @@ fn delete_vss_snapshot(shadow_id: &str) -> std::io::Result<()> {
     };
 
     let out: DeleteOutput = con
-        .exec_instance_method::<Win32ShadowCopy, _>(instance.path.as_str(), "Delete", ())
+        .exec_instance_method::<Win32_ShadowCopy, _>(instance.path.as_str(), "Delete", ())
         .map_err(io_err)?;
     if out.return_value == 0 {
         Ok(())
@@ -403,9 +475,443 @@ fn delete_vss_snapshot(shadow_id: &str) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+fn delete_vss_snapshot_vssadmin(shadow_id: &str) -> std::io::Result<()> {
+    use std::process::Command;
+
+    fn io_err(e: impl std::fmt::Display) -> std::io::Error {
+        std::io::Error::other(e.to_string())
+    }
+
+    let arg_shadow = format!("/shadow={shadow_id}");
+    let out = Command::new(windows_find_vssadmin_exe())
+        .args(["delete", "shadows", arg_shadow.as_str(), "/quiet"])
+        .output()
+        .map_err(io_err)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(out.stderr.as_slice())
+            .trim()
+            .to_string();
+        if stderr.is_empty() {
+            Err(std::io::Error::other("vssadmin delete shadows failed"))
+        } else {
+            Err(std::io::Error::other(stderr))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn normalize_volume_arg(volume: &str) -> String {
+    let v = volume.trim();
+    if let Some(rest) = v.strip_suffix("\\") {
+        return rest.to_string();
+    }
+    v.to_string()
+}
+
+#[cfg(windows)]
+fn windows_system32_exe_path(relative: &str) -> std::path::PathBuf {
+    let sysroot = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .unwrap_or_else(|| "C:\\Windows".into());
+    std::path::PathBuf::from(sysroot)
+        .join("System32")
+        .join(relative)
+}
+
+#[cfg(windows)]
+fn windows_find_powershell_exe() -> std::path::PathBuf {
+    let p0 = windows_system32_exe_path(r"WindowsPowerShell\v1.0\powershell.exe");
+    if p0.exists() {
+        return p0;
+    }
+    let p1 = windows_system32_exe_path("powershell.exe");
+    if p1.exists() {
+        return p1;
+    }
+    std::path::PathBuf::from("powershell")
+}
+
+#[cfg(windows)]
+fn windows_find_diskshadow_exe() -> std::path::PathBuf {
+    let p0 = windows_system32_exe_path("diskshadow.exe");
+    if p0.exists() {
+        return p0;
+    }
+    let sysroot = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .unwrap_or_else(|| "C:\\Windows".into());
+    let p1 = std::path::PathBuf::from(sysroot)
+        .join("Sysnative")
+        .join("diskshadow.exe");
+    if p1.exists() {
+        return p1;
+    }
+    std::path::PathBuf::from("diskshadow")
+}
+
+#[cfg(windows)]
+fn windows_find_vssadmin_exe() -> std::path::PathBuf {
+    let p0 = windows_system32_exe_path("vssadmin.exe");
+    if p0.exists() {
+        return p0;
+    }
+    std::path::PathBuf::from("vssadmin")
+}
+
+#[cfg(windows)]
+fn find_braced_guid_candidates(s: &str) -> Vec<(usize, String)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i = i.saturating_add(1);
+            continue;
+        }
+        let max_end = (i + 64).min(bytes.len());
+        let mut j = i + 1;
+        while j < max_end && bytes[j] != b'}' {
+            j = j.saturating_add(1);
+        }
+        if j < bytes.len() && bytes[j] == b'}' {
+            let candidate = &s[i..=j];
+            if candidate.len() == 38 && is_braced_guid(candidate) {
+                out.push((i, candidate.to_string()));
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn is_braced_guid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 38 {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        match i {
+            0 => {
+                if b != b'{' {
+                    return false;
+                }
+            }
+            37 => {
+                if b != b'}' {
+                    return false;
+                }
+            }
+            9 | 14 | 19 | 24 => {
+                if b != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !b.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+fn choose_shadow_id_from_output(output: &str) -> Option<String> {
+    let candidates = find_braced_guid_candidates(output);
+    if candidates.is_empty() {
+        return None;
+    }
+    for (pos, guid) in candidates {
+        let start = pos.saturating_sub(32);
+        let prefix = output
+            .get(start..pos)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if prefix.contains(r"\\?\volume") || prefix.contains("volume") {
+            continue;
+        }
+        return Some(guid);
+    }
+    find_braced_guid_candidates(output)
+        .into_iter()
+        .next()
+        .map(|(_, g)| g)
+}
+
+#[cfg(windows)]
+fn find_shadow_device_path_in_output(output: &str) -> Option<String> {
+    const PREFIX: &str = r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy";
+    let start = output.find(PREFIX)?;
+    let rest = &output[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .unwrap_or(rest.len());
+    let val = rest[..end].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn run_diskshadow_script(script: &str) -> std::io::Result<(std::process::ExitStatus, String)> {
+    use std::process::Command;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = std::env::temp_dir().join(format!(
+        "aegis_diskshadow_{}_{}.txt",
+        std::process::id(),
+        ts
+    ));
+    std::fs::write(path.as_path(), script)?;
+
+    let out = Command::new(windows_find_diskshadow_exe())
+        .args(["/s", path.to_string_lossy().as_ref()])
+        .output()?;
+
+    let _ignored = std::fs::remove_file(path.as_path());
+
+    let stdout = String::from_utf8_lossy(out.stdout.as_slice());
+    let stderr = String::from_utf8_lossy(out.stderr.as_slice());
+    Ok((out.status, format!("{stdout}\n{stderr}")))
+}
+
+#[cfg(windows)]
+fn create_vss_snapshot_for_drive_diskshadow(
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+) -> Option<VssSnapshot> {
+    let vol = normalize_volume_arg(volume);
+    let diskshadow_context = "CLIENTACCESSIBLE";
+
+    let script = format!(
+        "SET CONTEXT {diskshadow_context} NOWRITERS\r\n\
+         BEGIN BACKUP\r\n\
+         ADD VOLUME {vol} ALIAS aegis\r\n\
+         CREATE\r\n\
+         END BACKUP\r\n"
+    );
+
+    let (status, output) = match run_diskshadow_script(script.as_str()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                exe_path = %windows_find_diskshadow_exe().display(),
+                error = %e,
+                method = "diskshadow",
+                "vss create failed to execute"
+            );
+            return None;
+        }
+    };
+    let output_trim = output.trim();
+    if !status.success() {
+        if output_trim.is_empty() {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                exit_code = ?status.code(),
+                method = "diskshadow",
+                "vss create failed"
+            );
+        } else {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                exit_code = ?status.code(),
+                output = %output_trim,
+                method = "diskshadow",
+                "vss create failed"
+            );
+        }
+        return None;
+    }
+
+    let Some(shadow_id) = choose_shadow_id_from_output(output.as_str()) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            output = %output_trim,
+            method = "diskshadow",
+            "vss create missing shadow_id"
+        );
+        return None;
+    };
+    let Some(device_path) = find_shadow_device_path_in_output(output.as_str()) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            shadow_id = %shadow_id,
+            output = %output_trim,
+            method = "diskshadow",
+            "vss create missing device_path"
+        );
+        return None;
+    };
+
+    tracing::info!(
+        drive_letter = %drive_letter,
+        volume = %volume,
+        context,
+        shadow_id = %shadow_id,
+        device_path = %device_path,
+        method = "diskshadow",
+        "vss snapshot created"
+    );
+    Some(VssSnapshot {
+        drive_letter,
+        shadow_id,
+        device_path,
+    })
+}
+
+#[cfg(windows)]
+fn create_vss_snapshot_for_drive_vssadmin(
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+) -> Option<VssSnapshot> {
+    use std::process::Command;
+
+    let help_out = Command::new(windows_find_vssadmin_exe()).output().ok()?;
+    let help_stdout = String::from_utf8_lossy(help_out.stdout.as_slice());
+    let help_stderr = String::from_utf8_lossy(help_out.stderr.as_slice());
+    let help_combined = format!("{help_stdout}\n{help_stderr}");
+    if !help_combined.to_ascii_lowercase().contains("create shadow") {
+        return None;
+    }
+
+    let for_arg = format!("/for={drive_letter}:");
+    let out = Command::new(windows_find_vssadmin_exe())
+        .args(["create", "shadow", for_arg.as_str()])
+        .output();
+    let out = match out {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                exe_path = %windows_find_vssadmin_exe().display(),
+                error = %e,
+                method = "vssadmin",
+                "vss create failed to execute"
+            );
+            return None;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(out.stdout.as_slice());
+    let stderr = String::from_utf8_lossy(out.stderr.as_slice());
+    let combined = format!("{stdout}\n{stderr}");
+    let output_trim = combined.trim();
+    if !out.status.success() {
+        if output_trim.is_empty() {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                exit_code = ?out.status.code(),
+                method = "vssadmin",
+                "vss create failed"
+            );
+        } else {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                exit_code = ?out.status.code(),
+                output = %output_trim,
+                method = "vssadmin",
+                "vss create failed"
+            );
+        }
+        return None;
+    }
+
+    let Some(shadow_id) = choose_shadow_id_from_output(output_trim) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            output = %output_trim,
+            method = "vssadmin",
+            "vss create missing shadow_id"
+        );
+        return None;
+    };
+    let Some(device_path) = find_shadow_device_path_in_output(output_trim) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            shadow_id = %shadow_id,
+            output = %output_trim,
+            method = "vssadmin",
+            "vss create missing device_path"
+        );
+        return None;
+    };
+
+    tracing::info!(
+        drive_letter = %drive_letter,
+        volume = %volume,
+        context,
+        shadow_id = %shadow_id,
+        device_path = %device_path,
+        method = "vssadmin",
+        "vss snapshot created"
+    );
+    Some(VssSnapshot {
+        drive_letter,
+        shadow_id,
+        device_path,
+    })
+}
+
+#[cfg(windows)]
+fn lookup_vss_device_object_vssadmin(shadow_id: &str) -> Option<String> {
+    use std::process::Command;
+
+    let out = Command::new(windows_find_vssadmin_exe())
+        .args(["list", "shadows"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(out.stdout.as_slice());
+    let stderr = String::from_utf8_lossy(out.stderr.as_slice());
+    let combined = format!("{stdout}\n{stderr}");
+
+    let idx = combined.find(shadow_id)?;
+    let window = combined.get(idx..(idx + 4096).min(combined.len()))?;
+    find_shadow_device_path_in_output(window)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 fn create_vss_snapshot_for_drive(drive_letter: char) -> Option<VssSnapshot> {
+    #[allow(non_camel_case_types)]
     #[derive(serde::Deserialize)]
-    struct Win32ShadowCopy;
+    struct Win32_ShadowCopy;
 
     #[derive(serde::Serialize)]
     struct CreateInput {
@@ -431,38 +937,483 @@ fn create_vss_snapshot_for_drive(drive_letter: char) -> Option<VssSnapshot> {
         device_object: String,
     }
 
-    let con = WMIConnection::new().ok()?;
-
     let volume = format!("{drive_letter}:\\");
-    let input = CreateInput {
-        volume,
-        context: "Backup".to_string(),
+    let con = match WMIConnection::new() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, drive_letter = %drive_letter, "wmi connection failed");
+            if vss_fallback_enabled_for_error(&e) {
+                for context in ["ClientAccessibleWriters", "ClientAccessible"] {
+                    if let Some(s) = create_vss_snapshot_for_drive_powershell(
+                        drive_letter,
+                        volume.as_str(),
+                        context,
+                    ) {
+                        return Some(s);
+                    }
+                    if let Some(s) = create_vss_snapshot_for_drive_diskshadow(
+                        drive_letter,
+                        volume.as_str(),
+                        context,
+                    ) {
+                        return Some(s);
+                    }
+                    if let Some(s) = create_vss_snapshot_for_drive_vssadmin(
+                        drive_letter,
+                        volume.as_str(),
+                        context,
+                    ) {
+                        return Some(s);
+                    }
+                }
+            }
+            return None;
+        }
     };
-    let out: CreateOutput = con
-        .exec_class_method::<Win32ShadowCopy, _>("Create", input)
-        .ok()?;
-    if out.return_value != 0 {
+
+    for context in ["ClientAccessibleWriters", "ClientAccessible"] {
+        let input = CreateInput {
+            volume: volume.clone(),
+            context: context.to_string(),
+        };
+        let out: CreateOutput = match con.exec_class_method::<Win32_ShadowCopy, _>("Create", input)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let fallback_enabled = vss_fallback_enabled_for_error(&e);
+                tracing::warn!(
+                    error = %e,
+                    drive_letter = %drive_letter,
+                    volume = %volume,
+                    context,
+                    fallback_enabled,
+                    "vss create wmi error"
+                );
+                if fallback_enabled {
+                    if let Some(s) = create_vss_snapshot_for_drive_powershell(
+                        drive_letter,
+                        volume.as_str(),
+                        context,
+                    ) {
+                        return Some(s);
+                    }
+                    if let Some(s) = create_vss_snapshot_for_drive_diskshadow(
+                        drive_letter,
+                        volume.as_str(),
+                        context,
+                    ) {
+                        return Some(s);
+                    }
+                    if let Some(s) = create_vss_snapshot_for_drive_vssadmin(
+                        drive_letter,
+                        volume.as_str(),
+                        context,
+                    ) {
+                        return Some(s);
+                    }
+                    tracing::warn!(
+                        drive_letter = %drive_letter,
+                        volume = %volume,
+                        context,
+                        "vss create fallback failed"
+                    );
+                }
+                continue;
+            }
+        };
+        if out.return_value != 0 {
+            if out.return_value == 5 {
+                tracing::info!(
+                    drive_letter = %drive_letter,
+                    volume = %volume,
+                    context,
+                    return_value = out.return_value,
+                    "vss create context unsupported"
+                );
+                continue;
+            }
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                return_value = out.return_value,
+                "vss create returned failure"
+            );
+            continue;
+        }
+        let Some(shadow_id) = out.shadow_id else {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                "vss create returned empty shadow_id"
+            );
+            continue;
+        };
+
+        let escaped = shadow_id.replace('\'', "''");
+        let q = format!("SELECT __Path, DeviceObject FROM Win32_ShadowCopy WHERE ID='{escaped}'");
+        let rows: Vec<ShadowCopyLookup> = match con.raw_query(q.as_str()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    drive_letter = %drive_letter,
+                    volume = %volume,
+                    context,
+                    shadow_id = %shadow_id,
+                    "vss shadowcopy lookup failed"
+                );
+                let fallback_enabled = vss_fallback_enabled_for_error(&e);
+                if fallback_enabled {
+                    if let Some(device_path) =
+                        lookup_vss_device_object_powershell(shadow_id.as_str())
+                    {
+                        tracing::info!(
+                            drive_letter = %drive_letter,
+                            volume = %volume,
+                            context,
+                            shadow_id = %shadow_id,
+                            device_path = %device_path,
+                            method = "powershell",
+                            "vss snapshot created"
+                        );
+                        return Some(VssSnapshot {
+                            drive_letter,
+                            shadow_id,
+                            device_path,
+                        });
+                    }
+                    if let Some(device_path) = lookup_vss_device_object_vssadmin(shadow_id.as_str())
+                    {
+                        tracing::info!(
+                            drive_letter = %drive_letter,
+                            volume = %volume,
+                            context,
+                            shadow_id = %shadow_id,
+                            device_path = %device_path,
+                            method = "vssadmin",
+                            "vss snapshot created"
+                        );
+                        return Some(VssSnapshot {
+                            drive_letter,
+                            shadow_id,
+                            device_path,
+                        });
+                    }
+                    tracing::warn!(
+                        drive_letter = %drive_letter,
+                        volume = %volume,
+                        context,
+                        shadow_id = %shadow_id,
+                        "vss lookup fallback failed"
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(instance) = rows.first() else {
+            tracing::warn!(
+                drive_letter = %drive_letter,
+                volume = %volume,
+                context,
+                shadow_id = %shadow_id,
+                "vss shadowcopy lookup returned empty result"
+            );
+            continue;
+        };
+
+        tracing::info!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            shadow_id = %shadow_id,
+            device_path = %instance.device_object,
+            "vss snapshot created"
+        );
+        return Some(VssSnapshot {
+            drive_letter,
+            shadow_id,
+            device_path: instance.device_object.clone(),
+        });
+    }
+    None
+}
+
+#[cfg(windows)]
+fn create_vss_snapshot_for_drive_powershell(
+    drive_letter: char,
+    volume: &str,
+    context: &str,
+) -> Option<VssSnapshot> {
+    let Some(output) = run_powershell_vss_create_script(volume, context) else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            method = "powershell",
+            "vss create returned no output"
+        );
+        return None;
+    };
+    let Some((return_value, shadow_id, device_object)) =
+        parse_powershell_kv_triplet(output.as_str())
+    else {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            output = %output,
+            method = "powershell",
+            "vss create output parse failed"
+        );
+        return None;
+    };
+    if return_value != 0 || shadow_id.is_empty() || device_object.is_empty() {
+        tracing::warn!(
+            drive_letter = %drive_letter,
+            volume = %volume,
+            context,
+            return_value,
+            shadow_id = %shadow_id,
+            device_object = %device_object,
+            output = %output,
+            method = "powershell",
+            "vss create returned non-success"
+        );
         return None;
     }
-    let shadow_id = out.shadow_id?;
-
-    let escaped = shadow_id.replace('\'', "''");
-    let q = format!("SELECT __Path, DeviceObject FROM Win32_ShadowCopy WHERE ID='{escaped}'");
-    let rows: Vec<ShadowCopyLookup> = con.raw_query(q.as_str()).ok()?;
-    let instance = rows.first()?;
-
+    tracing::info!(
+        drive_letter = %drive_letter,
+        volume = %volume,
+        context,
+        shadow_id = %shadow_id,
+        device_path = %device_object,
+        method = "powershell",
+        "vss snapshot created"
+    );
     Some(VssSnapshot {
         drive_letter,
         shadow_id,
-        device_path: instance.device_object.clone(),
+        device_path: device_object,
     })
+}
+
+#[cfg(windows)]
+fn lookup_vss_device_object_powershell(shadow_id: &str) -> Option<String> {
+    use std::process::Command;
+
+    let script = format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
+         $sid='{shadow_id}';\
+         $dev='';\
+         for ($i=0; $i -lt 25 -and (-not $dev); $i++) {{\
+            try {{$dev=(Get-CimInstance Win32_ShadowCopy -Filter \"ID='$sid'\" | Select-Object -First 1 -ExpandProperty DeviceObject)}} catch {{}};\
+            if (-not $dev) {{\
+               try {{$dev=(Get-WmiObject Win32_ShadowCopy -Filter \"ID='$sid'\" | Select-Object -First 1 -ExpandProperty DeviceObject)}} catch {{}};\
+            }};\
+            if (-not $dev) {{ Start-Sleep -Milliseconds 200 }}\
+         }};\
+         \"DeviceObject=$dev\""
+    );
+    let out = Command::new(windows_find_powershell_exe())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script.as_str(),
+        ])
+        .output();
+    let out = match out {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                shadow_id = %shadow_id,
+                error = %e,
+                "powershell vss lookup failed to execute"
+            );
+            return None;
+        }
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(out.stderr.as_slice());
+        if !stderr.trim().is_empty() {
+            tracing::warn!(shadow_id = %shadow_id, error = %stderr.trim(), "powershell vss lookup failed");
+        }
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(out.stdout.as_slice());
+    let line = stdout.trim();
+    let (_, val) = line.split_once("DeviceObject=")?;
+    let val = val.trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn build_powershell_vss_create_script(volume: &str, context: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
+         $ErrorActionPreference='Stop';\
+         $vol='{volume}';\
+         $ctx='{context}';\
+         $rv=[uint32]1;\
+         $sid='';\
+         $dev='';\
+         $errCim='';\
+         $hrCim='';\
+         $fqCim='';\
+         $errWmi='';\
+         $hrWmi='';\
+         $fqWmi='';\
+         $m='';\
+         $r=$null;\
+         try {{\
+            $m='cim';\
+            $r=Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{{Volume=$vol;Context=$ctx}} -ErrorAction Stop;\
+         }} catch {{\
+            $errCim=[string]$_.Exception.Message;\
+            $hrCim=[string]$_.Exception.HResult;\
+            $fqCim=[string]$_.FullyQualifiedErrorId;\
+         }};\
+         if (-not $r) {{\
+            try {{\
+               $m='wmi';\
+               $r=([WMIClass]'Win32_ShadowCopy').Create($vol,$ctx);\
+            }} catch {{\
+               $errWmi=[string]$_.Exception.Message;\
+               $hrWmi=[string]$_.Exception.HResult;\
+               $fqWmi=[string]$_.FullyQualifiedErrorId;\
+            }}\
+         }};\
+         if ($r) {{\
+            $rv=[uint32]$r.ReturnValue;\
+            $sid=[string]$r.ShadowID;\
+         }} else {{\
+            if (-not $errCim -and -not $errWmi) {{$errWmi='Win32_ShadowCopy.Create returned null'}}\
+         }};\
+         if ($rv -eq 0 -and $sid) {{\
+            for ($i=0; $i -lt 25 -and (-not $dev); $i++) {{\
+               try {{$dev=(Get-CimInstance Win32_ShadowCopy -Filter \"ID='$sid'\" | Select-Object -First 1 -ExpandProperty DeviceObject)}} catch {{}};\
+               if (-not $dev) {{\
+                  try {{$dev=(Get-WmiObject Win32_ShadowCopy -Filter \"ID='$sid'\" | Select-Object -First 1 -ExpandProperty DeviceObject)}} catch {{}};\
+               }};\
+               if (-not $dev) {{ Start-Sleep -Milliseconds 200 }}\
+            }}\
+         }};\
+         $errCim=($errCim -replace ';', ',' -replace \"\\r|\\n\", ' ').Trim();\
+         $hrCim=($hrCim -replace ';', ',' -replace \"\\r|\\n\", ' ').Trim();\
+         $fqCim=($fqCim -replace ';', ',' -replace \"\\r|\\n\", ' ').Trim();\
+         $errWmi=($errWmi -replace ';', ',' -replace \"\\r|\\n\", ' ').Trim();\
+         $hrWmi=($hrWmi -replace ';', ',' -replace \"\\r|\\n\", ' ').Trim();\
+         $fqWmi=($fqWmi -replace ';', ',' -replace \"\\r|\\n\", ' ').Trim();\
+         \"ReturnValue=$rv;ShadowID=$sid;DeviceObject=$dev;ErrCim=$errCim;HRCim=$hrCim;FqCim=$fqCim;ErrWmi=$errWmi;HRWmi=$hrWmi;FqWmi=$fqWmi;Method=$m\""
+    )
+}
+
+#[cfg(windows)]
+fn run_powershell_vss_create_script(volume: &str, context: &str) -> Option<String> {
+    use std::process::Command;
+
+    let script = build_powershell_vss_create_script(volume, context);
+
+    let out = Command::new(windows_find_powershell_exe())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script.as_str(),
+        ])
+        .output();
+    let out = match out {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                volume = %volume,
+                context,
+                error = %e,
+                "powershell vss create failed to execute"
+            );
+            return None;
+        }
+    };
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(out.stderr.as_slice());
+        if !stderr.trim().is_empty() {
+            tracing::warn!(volume = %volume, context, error = %stderr.trim(), "powershell vss create failed");
+        }
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(out.stdout.as_slice());
+    let line = stdout.trim();
+    if line.is_empty() {
+        let stderr = String::from_utf8_lossy(out.stderr.as_slice());
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            tracing::warn!(
+                volume = %volume,
+                context,
+                method = "powershell",
+                "vss create returned empty output"
+            );
+        } else {
+            tracing::warn!(
+                volume = %volume,
+                context,
+                error = %stderr,
+                method = "powershell",
+                "vss create returned empty output"
+            );
+        }
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn parse_powershell_kv_triplet(line: &str) -> Option<(u32, String, String)> {
+    let mut return_value: Option<u32> = None;
+    let mut shadow_id: Option<String> = None;
+    let mut device_object: Option<String> = None;
+
+    for part in line.trim().split(';') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim();
+        match k {
+            "ReturnValue" => return_value = v.parse::<u32>().ok(),
+            "ShadowID" => shadow_id = Some(v.to_string()),
+            "DeviceObject" => device_object = Some(v.to_string()),
+            _ => {}
+        }
+    }
+
+    Some((
+        return_value?,
+        shadow_id.unwrap_or_default(),
+        device_object.unwrap_or_default(),
+    ))
 }
 
 fn maybe_emit_telemetry(
     state: &mut LoopState,
     cfg: &common::config::AegisConfig,
     governor: &mut Governor,
-    encryptor_tx: &mpsc::Sender<EncryptorCommand>,
+    bus_tx: &EventBusTx,
     cpu_usage_percent: u32,
 ) {
     let interval_sec = effective_telemetry_interval_sec(cfg);
@@ -480,7 +1431,7 @@ fn maybe_emit_telemetry(
     if let Some(drop_rate_percent) = compute_drop_rate_percent(
         dropped_delta,
         interval,
-        cfg.governor.token_bucket.refill_per_sec,
+        cfg.governor.effective_tokens_per_sec(),
     ) {
         if drop_rate_percent > 1 {
             state.overload_streak = state.overload_streak.saturating_add(1);
@@ -512,10 +1463,10 @@ fn maybe_emit_telemetry(
         "agent telemetry"
     );
     enqueue_payload(
-        encryptor_tx,
+        bus_tx,
         PayloadEnvelope::agent_telemetry(telemetry).encode_to_vec(),
     );
-    if encryptor_tx.send(EncryptorCommand::Flush).is_err() {
+    if bus_tx.send(EncryptorCommand::Flush).is_err() {
         tracing::warn!("encryptor channel closed");
     }
 
@@ -973,6 +1924,13 @@ struct OpenArtifactSegment {
     session_key: [u8; 32],
 }
 
+fn throttle_io_sleep(io: &mut IoLimiter, bytes: u64) {
+    let sleep = io.reserve(bytes);
+    if sleep > Duration::from_secs(0) {
+        thread::sleep(sleep);
+    }
+}
+
 impl OpenArtifactSegment {
     fn open_new(
         out_dir: &Path,
@@ -981,6 +1939,7 @@ impl OpenArtifactSegment {
         org_key_fp: u64,
         uuid_mode: &str,
         user_passphrase: Option<&str>,
+        io: &mut IoLimiter,
     ) -> Result<Self, String> {
         let mut kdf_salt = [0u8; crypto::AES_KDF_SALT_LEN];
         let mut rng = OsRng;
@@ -1008,6 +1967,7 @@ impl OpenArtifactSegment {
 
         file.write_all(header.as_slice())
             .map_err(|e| format!("写入 Header 失败: {e}"))?;
+        throttle_io_sleep(io, u64::try_from(header.len()).unwrap_or(u64::MAX));
         mac.update(header.as_slice());
 
         let user_slot = user_passphrase
@@ -1016,10 +1976,12 @@ impl OpenArtifactSegment {
             .unwrap_or([0u8; USER_SLOT_LEN]);
         file.write_all(user_slot.as_slice())
             .map_err(|e| format!("写入 UserSlot 失败: {e}"))?;
+        throttle_io_sleep(io, u64::try_from(user_slot.len()).unwrap_or(u64::MAX));
         mac.update(user_slot.as_slice());
 
         file.write_all(rsa_ct.as_slice())
             .map_err(|e| format!("写入 OrgSlot 失败: {e}"))?;
+        throttle_io_sleep(io, u64::try_from(rsa_ct.len()).unwrap_or(u64::MAX));
         mac.update(rsa_ct.as_slice());
 
         Ok(Self {
@@ -1030,18 +1992,23 @@ impl OpenArtifactSegment {
         })
     }
 
-    fn write_encrypted_chunk(&mut self, plaintext: &[u8]) -> Result<(), common::error::AegisError> {
+    fn write_encrypted_chunk(
+        &mut self,
+        io: &mut IoLimiter,
+        plaintext: &[u8],
+    ) -> Result<(), common::error::AegisError> {
         let encrypted = crypto::encrypt(plaintext, self.session_key.as_slice())?;
         self.file
             .write_all(encrypted.as_slice())
             .map_err(common::error::AegisError::IoError)?;
+        throttle_io_sleep(io, u64::try_from(encrypted.len()).unwrap_or(u64::MAX));
         if let Some(mac) = self.mac.as_mut() {
             mac.update(encrypted.as_slice());
         }
         Ok(())
     }
 
-    fn finalize_and_close(mut self) -> Result<PathBuf, String> {
+    fn finalize_and_close(mut self, io: &mut IoLimiter) -> Result<PathBuf, String> {
         let mac = self.mac.take().ok_or_else(|| "HMAC 状态缺失".to_string())?;
         let tag_bytes = mac.finalize().into_bytes();
         let tag: [u8; 32] = tag_bytes
@@ -1060,6 +2027,7 @@ impl OpenArtifactSegment {
             .write_all(trailer.as_slice())
             .and_then(|()| self.file.flush())
             .map_err(|e| format!("写入 HMAC Trailer 失败: {e}"))?;
+        throttle_io_sleep(io, u64::try_from(trailer.len()).unwrap_or(u64::MAX));
 
         Ok(self.path)
     }
@@ -1077,6 +2045,7 @@ fn spawn_encryptor(
     org_key_fp: u64,
     uuid_mode: String,
     user_passphrase: Option<String>,
+    io_limit_mb: u32,
 ) -> mpsc::Sender<EncryptorCommand> {
     let (tx, rx) = mpsc::channel::<EncryptorCommand>();
     thread::spawn(move || {
@@ -1087,6 +2056,7 @@ fn spawn_encryptor(
             org_key_fp,
             uuid_mode.as_str(),
             user_passphrase.as_deref(),
+            io_limit_mb,
         );
     });
     tx
@@ -1099,13 +2069,15 @@ fn encryptor_loop(
     org_key_fp: u64,
     uuid_mode: &str,
     user_passphrase: Option<&str>,
+    io_limit_mb: u32,
 ) {
     let mut segment_id: u64 = 0;
     let mut segment: Option<OpenArtifactSegment> = None;
+    let mut io = IoLimiter::new(io_limit_mb, Instant::now());
 
     loop {
         let Ok(cmd) = rx.recv() else {
-            flush_segment(&mut segment_id, &mut segment);
+            flush_segment(&mut segment_id, &mut segment, &mut io);
             break;
         };
 
@@ -1119,6 +2091,7 @@ fn encryptor_loop(
                         org_key_fp,
                         uuid_mode,
                         user_passphrase,
+                        &mut io,
                     ) {
                         Ok(mut s) => {
                             let write_system_info = PayloadEnvelope::decode(plaintext.as_slice())
@@ -1132,8 +2105,11 @@ fn encryptor_loop(
                                 });
                             if write_system_info {
                                 let system_info = PayloadEnvelope::system_info(build_system_info());
-                                if s.write_encrypted_chunk(system_info.encode_to_vec().as_slice())
-                                    .is_err()
+                                if s.write_encrypted_chunk(
+                                    &mut io,
+                                    system_info.encode_to_vec().as_slice(),
+                                )
+                                .is_err()
                                 {
                                     tracing::warn!("write system_info chunk failed");
                                     continue;
@@ -1149,24 +2125,31 @@ fn encryptor_loop(
                 }
 
                 if let Some(s) = segment.as_mut()
-                    && let Err(e) = s.write_encrypted_chunk(plaintext.as_slice())
+                    && let Err(e) = s.write_encrypted_chunk(&mut io, plaintext.as_slice())
                 {
                     tracing::warn!(error = %e, "encrypt/write chunk failed");
                 }
             }
             EncryptorCommand::Flush => {
-                flush_segment(&mut segment_id, &mut segment);
+                flush_segment(&mut segment_id, &mut segment, &mut io);
+            }
+            EncryptorCommand::UpdateIoLimitMb(mb) => {
+                io.update_limit(mb);
             }
         }
     }
 }
 
-fn flush_segment(segment_id: &mut u64, segment: &mut Option<OpenArtifactSegment>) {
+fn flush_segment(
+    segment_id: &mut u64,
+    segment: &mut Option<OpenArtifactSegment>,
+    io: &mut IoLimiter,
+) {
     let Some(s) = segment.take() else {
         return;
     };
 
-    match s.finalize_and_close() {
+    match s.finalize_and_close(io) {
         Ok(path) => {
             tracing::info!(path = %path.display(), "artifact segment flushed");
             *segment_id = segment_id.saturating_add(1);
@@ -1175,7 +2158,7 @@ fn flush_segment(segment_id: &mut u64, segment: &mut Option<OpenArtifactSegment>
     }
 }
 
-fn enqueue_payload(tx: &mpsc::Sender<EncryptorCommand>, bytes: Vec<u8>) {
+fn enqueue_payload(tx: &EventBusTx, bytes: Vec<u8>) {
     if tx.send(EncryptorCommand::Payload(bytes)).is_err() {
         tracing::warn!("encryptor channel closed");
     }
@@ -1327,10 +2310,13 @@ mod tests {
     #[cfg(windows)]
     use super::cim_datetime_to_unix_seconds;
     use super::{
-        OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
+        LoopState, OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
         effective_telemetry_interval_sec, validate_key_requirements,
     };
+    use common::config::{GovernorConfig, PidConfig, TokenBucketConfig};
     use common::crypto;
+    use common::governor::Governor;
+    use common::governor::IoLimiter;
     use common::protocol::{PayloadEnvelope, payload_envelope};
     use prost::Message;
     use rand::rngs::OsRng;
@@ -1339,7 +2325,7 @@ mod tests {
     use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
     use sha2::Sha256;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn unsigned_build_requires_external_key_path() {
@@ -1398,6 +2384,62 @@ mod tests {
             compute_drop_rate_percent(0, interval, tokens_per_sec),
             Some(0)
         );
+    }
+
+    #[test]
+    fn process_snapshot_does_not_reset_timestamp_when_budget_insufficient() {
+        let (bus_tx, _bus_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut governor = Governor::new(GovernorConfig {
+            pid: PidConfig::default(),
+            token_bucket: TokenBucketConfig {
+                capacity: 1,
+                refill_per_sec: 1,
+            },
+            max_single_core_usage: 100,
+            net_packet_limit_per_sec: 0,
+            io_limit_mb: 0,
+        });
+        assert!(governor.try_consume_budget(1));
+        assert!(!governor.try_consume_budget(1));
+
+        let mut state = LoopState::new();
+        let now = Instant::now();
+        let old = now.checked_sub(Duration::from_secs(61)).unwrap_or(now);
+        state.last_process_snapshot = old;
+
+        super::maybe_emit_process_snapshot(&mut state, &mut governor, &bus_tx);
+
+        assert_eq!(state.last_process_snapshot, old);
+        assert_eq!(governor.dropped_events(), 0);
+    }
+
+    #[test]
+    fn network_update_does_not_reset_timestamp_when_budget_insufficient() {
+        let (bus_tx, _bus_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut governor = Governor::new(GovernorConfig {
+            pid: PidConfig::default(),
+            token_bucket: TokenBucketConfig {
+                capacity: 1,
+                refill_per_sec: 1,
+            },
+            max_single_core_usage: 100,
+            net_packet_limit_per_sec: 0,
+            io_limit_mb: 0,
+        });
+        assert!(governor.try_consume_budget(1));
+        assert!(!governor.try_consume_budget(1));
+
+        let mut state = LoopState::new();
+        let now = Instant::now();
+        let old = now.checked_sub(Duration::from_secs(61)).unwrap_or(now);
+        state.last_network_snapshot = old;
+
+        super::maybe_emit_network_update(&mut state, &mut governor, &bus_tx);
+
+        assert_eq!(state.last_network_snapshot, old);
+        assert_eq!(governor.dropped_events(), 0);
     }
 
     #[cfg(windows)]
@@ -1469,6 +2511,7 @@ mod tests {
         std::fs::create_dir_all(dir.as_path())
             .map_err(|e| format!("创建临时目录失败（{}）: {e}", dir.display()))?;
 
+        let mut io = IoLimiter::new(0, Instant::now());
         let mut seg = OpenArtifactSegment::open_new(
             dir.as_path(),
             0,
@@ -1476,6 +2519,7 @@ mod tests {
             org_key_fp,
             "dev",
             Some("aegis-dev"),
+            &mut io,
         )?;
         let env = PayloadEnvelope::system_info(common::protocol::SystemInfo {
             hostname: "h".to_string(),
@@ -1484,9 +2528,9 @@ mod tests {
             ip_addresses: Vec::new(),
             boot_time: 1,
         });
-        seg.write_encrypted_chunk(env.encode_to_vec().as_slice())
+        seg.write_encrypted_chunk(&mut io, env.encode_to_vec().as_slice())
             .map_err(|e| format!("写入 payload 失败: {e}"))?;
-        let path = seg.finalize_and_close()?;
+        let path = seg.finalize_and_close(&mut io)?;
 
         let bytes = std::fs::read(path.as_path())
             .map_err(|e| format!("读取 artifact 文件失败（{}）: {e}", path.display()))?;
