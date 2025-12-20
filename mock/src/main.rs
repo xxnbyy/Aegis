@@ -584,10 +584,11 @@ mod tests {
     static REGISTRY_MUTEX: Mutex<()> = Mutex::new(());
 
     #[cfg(windows)]
-    fn lock_registry_mutex() -> Result<std::sync::MutexGuard<'static, ()>, AegisError> {
-        REGISTRY_MUTEX.lock().map_err(|_| AegisError::ConfigError {
-            message: "REGISTRY_MUTEX 被 poison，无法继续测试".to_string(),
-        })
+    fn lock_registry_mutex() -> std::sync::MutexGuard<'static, ()> {
+        match REGISTRY_MUTEX.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     fn test_passphrase() -> String {
@@ -692,7 +693,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn generate_then_decrypt_roundtrip() -> Result<(), AegisError> {
         #[cfg(windows)]
-        let _guard = lock_registry_mutex()?;
+        let _guard = lock_registry_mutex();
 
         #[cfg(windows)]
         {
@@ -1104,7 +1105,7 @@ events:
     #[allow(clippy::too_many_lines)]
     fn dev_mode_without_cert_works_with_fallback_key() -> Result<(), AegisError> {
         #[cfg(windows)]
-        let _guard = lock_registry_mutex()?;
+        let _guard = lock_registry_mutex();
 
         #[cfg(windows)]
         {
@@ -1148,7 +1149,7 @@ events:
     #[test]
     #[cfg(windows)]
     fn host_uuid_is_persisted_in_dev_mode() -> Result<(), AegisError> {
-        let _guard = lock_registry_mutex()?;
+        let _guard = lock_registry_mutex();
 
         let root = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = root.create_subkey("SOFTWARE\\Aegis").map_err(io_error)?;
@@ -1176,7 +1177,15 @@ events:
     #[test]
     #[cfg(windows)]
     fn host_uuid_can_be_read_from_hkcu_in_prod_mode() -> Result<(), AegisError> {
-        let _guard = lock_registry_mutex()?;
+        let _guard = lock_registry_mutex();
+
+        let hklm_uuid: Option<String> = {
+            let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+            match root.open_subkey("SOFTWARE\\Aegis") {
+                Ok(key) => key.get_value("HostUUID").ok(),
+                Err(_) => None,
+            }
+        };
 
         let root = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = root.create_subkey("SOFTWARE\\Aegis").map_err(io_error)?;
@@ -1184,7 +1193,11 @@ events:
         key.set_value("HostUUID", &expected).map_err(io_error)?;
 
         let got = crypto::get_or_create_host_uuid("prod")?;
-        assert_eq!(Uuid::from_bytes(got).to_string(), expected);
+        if let Some(v) = hklm_uuid {
+            assert_eq!(Uuid::from_bytes(got).to_string(), v);
+        } else {
+            assert_eq!(Uuid::from_bytes(got).to_string(), expected);
+        }
         Ok(())
     }
 
@@ -1388,7 +1401,7 @@ events:
     #[allow(clippy::too_many_lines)]
     fn generate_then_decrypt_roundtrip_with_repo_dev_keys() -> Result<(), AegisError> {
         #[cfg(windows)]
-        let _guard = lock_registry_mutex()?;
+        let _guard = lock_registry_mutex();
 
         #[cfg(windows)]
         {

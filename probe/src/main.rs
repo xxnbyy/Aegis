@@ -386,6 +386,7 @@ fn vss_fallback_enabled_for_error(err: &impl std::fmt::Display) -> bool {
     s.contains("0x80041014") || s.contains("0x80041002")
 }
 
+#[cfg(windows)]
 fn vss_hold_duration() -> Duration {
     if vss_fast_mode() {
         return Duration::from_secs(2);
