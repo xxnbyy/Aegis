@@ -101,10 +101,18 @@ fn read_proc_uid(path: &std::path::Path) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc_uptime_seconds() -> Option<f64> {
+fn read_proc_uptime_seconds() -> Option<i64> {
     let content = std::fs::read_to_string("/proc/uptime").ok()?;
     let first = content.split_whitespace().next()?;
-    first.parse::<f64>().ok()
+    let (secs_s, frac_s) = first.split_once('.').unwrap_or((first, ""));
+    let secs = secs_s.parse::<i64>().ok()?;
+    let frac_first = frac_s.as_bytes().first().copied();
+    let should_round_up = matches!(frac_first, Some(b'5'..=b'9'));
+    if should_round_up {
+        secs.checked_add(1)
+    } else {
+        Some(secs)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -527,7 +535,7 @@ fn collect_process_info_for_pid_with_ctx(
     pid: u32,
     hz: u64,
     now: i64,
-    uptime: f64,
+    uptime_sec: i64,
     exec_id_counter: &AtomicU64,
 ) -> ProcessInfo {
     let base = std::path::PathBuf::from("/proc").join(pid.to_string());
@@ -545,10 +553,9 @@ fn collect_process_info_for_pid_with_ctx(
 
     let hz_nonzero = hz.max(1);
     let start_uptime_sec = start_ticks / hz_nonzero;
-    let uptime_i64 = i64::try_from(uptime.round() as i128).unwrap_or(i64::MAX);
     let start_uptime_i64 = i64::try_from(start_uptime_sec).unwrap_or(i64::MAX);
-    let age_sec = if uptime_i64 > start_uptime_i64 {
-        uptime_i64.saturating_sub(start_uptime_i64)
+    let age_sec = if uptime_sec > start_uptime_i64 {
+        uptime_sec.saturating_sub(start_uptime_i64)
     } else {
         0
     };
@@ -600,8 +607,8 @@ fn collect_process_info_for_pid_with_ctx(
 pub fn collect_process_info_for_pid(pid: u32, exec_id_counter: &AtomicU64) -> ProcessInfo {
     let hz = proc_clk_ticks_per_sec().unwrap_or(100);
     let now = unix_timestamp_now_seconds();
-    let uptime = read_proc_uptime_seconds().unwrap_or(0.0);
-    collect_process_info_for_pid_with_ctx(pid, hz, now, uptime, exec_id_counter)
+    let uptime_sec = read_proc_uptime_seconds().unwrap_or(0);
+    collect_process_info_for_pid_with_ctx(pid, hz, now, uptime_sec, exec_id_counter)
 }
 
 #[cfg(target_os = "linux")]
@@ -753,7 +760,7 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
 
     let hz = proc_clk_ticks_per_sec().unwrap_or(100);
     let now = unix_timestamp_now_seconds();
-    let uptime = read_proc_uptime_seconds().unwrap_or(0.0);
+    let uptime_sec = read_proc_uptime_seconds().unwrap_or(0);
 
     let pids = list_proc_pids(usize::MAX);
 
@@ -766,11 +773,10 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
             pid,
             hz,
             now,
-            uptime,
+            uptime_sec,
             exec_id_counter,
         ));
     }
-
     out
 }
 
@@ -1029,7 +1035,7 @@ impl BpfEnumerator for SysBpfEnumerator {
                 let _ = info_len;
             }
             Err(e) => return Err(map_bpf_errno(e, "BPF_OBJ_GET_INFO_BY_FD 失败")),
-        };
+        }
 
         Ok(BpfProgramInfo {
             id,
