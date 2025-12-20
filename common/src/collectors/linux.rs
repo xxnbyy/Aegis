@@ -613,69 +613,7 @@ pub fn collect_process_info_for_pid(pid: u32, exec_id_counter: &AtomicU64) -> Pr
 
 #[cfg(target_os = "linux")]
 pub fn collect_cgroup_pids(max_pids: usize, max_files: usize) -> Vec<u32> {
-    if max_pids == 0 || max_files == 0 {
-        return Vec::new();
-    }
-
-    let root = std::path::PathBuf::from("/sys/fs/cgroup");
-    if !root.exists() {
-        return Vec::new();
-    }
-
-    let mut out: Vec<u32> = Vec::new();
-    let mut dirs: Vec<std::path::PathBuf> = vec![root];
-    let mut files_scanned: usize = 0;
-
-    while let Some(dir) = dirs.pop() {
-        if out.len() >= max_pids || files_scanned >= max_files {
-            break;
-        }
-
-        let Ok(rd) = std::fs::read_dir(dir.as_path()) else {
-            continue;
-        };
-
-        for entry in rd.flatten() {
-            if out.len() >= max_pids || files_scanned >= max_files {
-                break;
-            }
-            let path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                dirs.push(path);
-                continue;
-            }
-            if !ft.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name != "cgroup.procs" {
-                continue;
-            }
-
-            files_scanned = files_scanned.saturating_add(1);
-            let Ok(text) = std::fs::read_to_string(path.as_path()) else {
-                continue;
-            };
-            for line in text.lines() {
-                if out.len() >= max_pids {
-                    break;
-                }
-                let Ok(pid) = line.trim().parse::<u32>() else {
-                    continue;
-                };
-                out.push(pid);
-            }
-        }
-    }
-
-    out.sort_unstable();
-    out.dedup();
-    out
+    collect_cgroup_pids_inner(None, max_pids, max_files)
 }
 
 #[cfg(target_os = "linux")]
@@ -684,72 +622,153 @@ pub fn collect_cgroup_pids_governed(
     max_pids: usize,
     max_files: usize,
 ) -> Vec<u32> {
+    collect_cgroup_pids_inner(Some(governor), max_pids, max_files)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_cgroup_pids_inner(
+    governor: Option<&mut Governor>,
+    max_pids: usize,
+    max_files: usize,
+) -> Vec<u32> {
     if max_pids == 0 || max_files == 0 {
         return Vec::new();
     }
 
-    let root = std::path::PathBuf::from("/sys/fs/cgroup");
-    if !root.exists() {
+    let Some(root) = cgroup_root_path() else {
         return Vec::new();
+    };
+
+    let mut c = CgroupPidCollector::new(governor, max_pids, max_files, root);
+    c.collect()
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_root_path() -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from("/sys/fs/cgroup");
+    if root.exists() { Some(root) } else { None }
+}
+
+#[cfg(target_os = "linux")]
+struct CgroupPidCollector<'a> {
+    governor: Option<&'a mut Governor>,
+    max_pids: usize,
+    max_files: usize,
+    files_scanned: usize,
+    dirs: Vec<std::path::PathBuf>,
+    out: Vec<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> CgroupPidCollector<'a> {
+    fn new(
+        governor: Option<&'a mut Governor>,
+        max_pids: usize,
+        max_files: usize,
+        root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            governor,
+            max_pids,
+            max_files,
+            files_scanned: 0,
+            dirs: vec![root],
+            out: Vec::new(),
+        }
     }
 
-    let mut out: Vec<u32> = Vec::new();
-    let mut dirs: Vec<std::path::PathBuf> = vec![root];
-    let mut files_scanned: usize = 0;
+    fn collect(&mut self) -> Vec<u32> {
+        while self.step() {}
+        self.out.sort_unstable();
+        self.out.dedup();
+        std::mem::take(&mut self.out)
+    }
 
-    while let Some(dir) = dirs.pop() {
-        if out.len() >= max_pids || files_scanned >= max_files {
-            break;
+    fn step(&mut self) -> bool {
+        let Some(dir) = self.next_dir() else {
+            return false;
+        };
+        self.scan_dir(dir.as_path());
+        true
+    }
+
+    fn next_dir(&mut self) -> Option<std::path::PathBuf> {
+        if self.should_stop() {
+            None
+        } else {
+            self.dirs.pop()
         }
-        wait_for_budget(governor, 1);
+    }
 
-        let Ok(rd) = std::fs::read_dir(dir.as_path()) else {
-            continue;
+    fn should_stop(&self) -> bool {
+        self.out.len() >= self.max_pids || self.files_scanned >= self.max_files
+    }
+
+    fn budget(&mut self, cost: u32) {
+        if let Some(g) = self.governor.as_deref_mut() {
+            wait_for_budget(g, cost);
+        }
+    }
+
+    fn scan_dir(&mut self, dir: &std::path::Path) {
+        self.budget(1);
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
         };
 
         for entry in rd.flatten() {
-            if out.len() >= max_pids || files_scanned >= max_files {
+            if self.should_stop() {
                 break;
             }
-            let path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                dirs.push(path);
-                continue;
-            }
-            if !ft.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name != "cgroup.procs" {
-                continue;
-            }
-
-            files_scanned = files_scanned.saturating_add(1);
-            wait_for_budget(governor, 1);
-
-            let Ok(content) = std::fs::read_to_string(path.as_path()) else {
-                continue;
-            };
-            for line in content.lines() {
-                if out.len() >= max_pids {
-                    break;
-                }
-                let Ok(pid) = line.trim().parse::<u32>() else {
-                    continue;
-                };
-                out.push(pid);
-            }
+            self.handle_entry(entry);
         }
     }
 
-    out.sort_unstable();
-    out.dedup();
-    out
+    fn handle_entry(&mut self, entry: std::fs::DirEntry) {
+        let Some(path) = self.cgroup_procs_path_from_entry(&entry) else {
+            return;
+        };
+        self.files_scanned = self.files_scanned.saturating_add(1);
+        self.budget(1);
+        self.append_pids_from_file(path.as_path());
+    }
+
+    fn cgroup_procs_path_from_entry(
+        &mut self,
+        entry: &std::fs::DirEntry,
+    ) -> Option<std::path::PathBuf> {
+        let path = entry.path();
+        let ft = entry.file_type().ok()?;
+
+        if ft.is_dir() {
+            self.dirs.push(path);
+            return None;
+        }
+        if !ft.is_file() {
+            return None;
+        }
+        let name = path.file_name()?.to_str()?;
+        if name == "cgroup.procs" {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    fn append_pids_from_file(&mut self, path: &std::path::Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for line in text.lines() {
+            if self.out.len() >= self.max_pids {
+                break;
+            }
+            let Ok(pid) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            self.out.push(pid);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

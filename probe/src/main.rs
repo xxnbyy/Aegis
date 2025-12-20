@@ -532,25 +532,7 @@ fn collect_ip_addresses() -> Vec<String> {
             let ifa = &*cur;
             let addr = ifa.ifa_addr;
             if !addr.is_null() {
-                let family = i32::from((*addr).sa_family);
-                match family {
-                    libc::AF_INET => {
-                        let sa = std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in>());
-                        let bytes = sa.sin_addr.s_addr.to_ne_bytes();
-                        let ip = Ipv4Addr::from(bytes);
-                        if !ip.is_loopback() && !ip.is_unspecified() {
-                            out.insert(ip.to_string());
-                        }
-                    }
-                    libc::AF_INET6 => {
-                        let sa = std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in6>());
-                        let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
-                        if !ip.is_loopback() && !ip.is_unspecified() {
-                            out.insert(ip.to_string());
-                        }
-                    }
-                    _ => {}
-                }
+                insert_ip_from_sockaddr(&mut out, addr);
             }
             cur = ifa.ifa_next;
         }
@@ -560,48 +542,81 @@ fn collect_ip_addresses() -> Vec<String> {
     out.into_iter().collect()
 }
 
+#[cfg(target_os = "linux")]
+fn insert_ip_from_sockaddr(
+    out: &mut std::collections::BTreeSet<String>,
+    addr: *mut libc::sockaddr,
+) {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let family = unsafe { i32::from((*addr).sa_family) };
+    if family == libc::AF_INET {
+        let sa = unsafe { std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in>()) };
+        let ip = Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes());
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            out.insert(ip.to_string());
+        }
+        return;
+    }
+
+    if family == libc::AF_INET6 {
+        let sa = unsafe { std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in6>()) };
+        let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            out.insert(ip.to_string());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct Win32NetworkAdapterConfiguration {
+    #[serde(rename = "IPAddress")]
+    ip_address: Option<Vec<String>>,
+}
+
 #[cfg(windows)]
 fn collect_ip_addresses() -> Vec<String> {
     use std::collections::BTreeSet;
-
-    #[derive(serde::Deserialize)]
-    struct Win32NetworkAdapterConfiguration {
-        #[serde(rename = "IPAddress")]
-        ip_address: Option<Vec<String>>,
-        #[serde(rename = "IPEnabled")]
-        ip_enabled: Option<bool>,
-    }
 
     let wmi_con = WMIConnection::new().ok();
     let Some(wmi_con) = wmi_con else {
         return Vec::new();
     };
 
-    let query =
-        "SELECT IPAddress, IPEnabled FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled=True";
+    let query = "SELECT IPAddress FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled=True";
     let results: Vec<Win32NetworkAdapterConfiguration> =
         wmi_con.raw_query(query).ok().unwrap_or_default();
 
     let mut out: BTreeSet<String> = BTreeSet::new();
     for item in results {
-        if item.ip_enabled != Some(true) {
-            continue;
-        }
         let Some(addrs) = item.ip_address else {
             continue;
         };
-        for addr in addrs {
-            let s = addr.trim();
-            if s.is_empty() {
-                continue;
-            }
-            if s == "127.0.0.1" || s == "::1" {
-                continue;
-            }
-            out.insert(s.to_string());
-        }
+        insert_normalized_ip_addresses(&mut out, addrs.as_slice());
     }
     out.into_iter().collect()
+}
+
+#[cfg(windows)]
+fn insert_normalized_ip_addresses(out: &mut std::collections::BTreeSet<String>, addrs: &[String]) {
+    for addr in addrs {
+        if let Some(v) = normalize_ip_address(addr.as_str()) {
+            out.insert(v);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn normalize_ip_address(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s == "127.0.0.1" || s == "::1" {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 #[cfg(all(not(target_os = "linux"), not(windows)))]

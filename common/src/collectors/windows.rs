@@ -522,85 +522,113 @@ struct NtfsRun {
 #[cfg(windows)]
 fn decode_ntfs_runlist(bytes: &[u8]) -> Result<Vec<NtfsRun>, AegisError> {
     let mut runs: Vec<NtfsRun> = Vec::new();
-    let mut i = 0usize;
+    let mut cursor = 0usize;
     let mut lcn_acc: i64 = 0;
     let mut vcn_acc: u64 = 0;
 
-    while i < bytes.len() {
-        let header = bytes[i];
-        i = i.saturating_add(1);
-        if header == 0 {
+    while cursor < bytes.len() {
+        let Some(run) = decode_ntfs_run(bytes, &mut cursor, &mut lcn_acc, &mut vcn_acc)? else {
             break;
-        }
-
-        let len_size = usize::from(header & 0x0F);
-        let off_size = usize::from((header >> 4) & 0x0F);
-        if len_size == 0 {
-            return Err(AegisError::ProtocolError {
-                message: "NTFS runlist 长度字段为空".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-        if off_size == 0 {
-            return Err(AegisError::ProtocolError {
-                message: "NTFS runlist sparse run 不支持".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-        if i.saturating_add(len_size).saturating_add(off_size) > bytes.len() {
-            return Err(AegisError::ProtocolError {
-                message: "NTFS runlist 越界".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-
-        let mut len: u64 = 0;
-        for (k, b) in bytes[i..i + len_size].iter().copied().enumerate() {
-            len |= u64::from(b) << (k.saturating_mul(8));
-        }
-        i = i.saturating_add(len_size);
-        if len == 0 {
-            return Err(AegisError::ProtocolError {
-                message: "NTFS runlist cluster_len 为 0".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-
-        let off_bytes = &bytes[i..i + off_size];
-        i = i.saturating_add(off_size);
-        let mut delta: i64 = 0;
-        for (k, b) in off_bytes.iter().copied().enumerate() {
-            delta |= i64::from(b) << (k.saturating_mul(8));
-        }
-        let sign_bit = 1i64 << ((off_size.saturating_mul(8)).saturating_sub(1));
-        if (delta & sign_bit) != 0 {
-            let mask = (!0i64) << (off_size.saturating_mul(8));
-            delta |= mask;
-        }
-
-        lcn_acc = lcn_acc.saturating_add(delta);
-        if lcn_acc < 0 {
-            return Err(AegisError::ProtocolError {
-                message: "NTFS runlist LCN 变为负数".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-
-        runs.push(NtfsRun {
-            vcn_start: vcn_acc,
-            lcn_start: u64::try_from(lcn_acc).unwrap_or(0),
-            cluster_len: len,
-        });
-        vcn_acc = vcn_acc.saturating_add(len);
+        };
+        runs.push(run);
     }
 
     if runs.is_empty() {
-        return Err(AegisError::ProtocolError {
-            message: "NTFS runlist 为空".to_string(),
-            code: Some(ErrorCode::Probe101),
-        });
+        return Err(ntfs_proto_err("NTFS runlist 为空"));
     }
+
     Ok(runs)
+}
+
+#[cfg(windows)]
+fn ntfs_proto_err(message: &str) -> AegisError {
+    AegisError::ProtocolError {
+        message: message.to_string(),
+        code: Some(ErrorCode::Probe101),
+    }
+}
+
+#[cfg(windows)]
+fn decode_ntfs_run(
+    bytes: &[u8],
+    cursor: &mut usize,
+    lcn_acc: &mut i64,
+    vcn_acc: &mut u64,
+) -> Result<Option<NtfsRun>, AegisError> {
+    let header = *bytes.get(*cursor).unwrap_or(&0);
+    *cursor = cursor.saturating_add(1);
+    if header == 0 {
+        return Ok(None);
+    }
+
+    let (len_size, off_size) = ntfs_run_header_sizes(header)?;
+    if cursor.saturating_add(len_size).saturating_add(off_size) > bytes.len() {
+        return Err(ntfs_proto_err("NTFS runlist 越界"));
+    }
+
+    let len = ntfs_read_u64_le_sized(bytes, *cursor, len_size)?;
+    *cursor = cursor.saturating_add(len_size);
+    if len == 0 {
+        return Err(ntfs_proto_err("NTFS runlist cluster_len 为 0"));
+    }
+
+    let delta = ntfs_read_i64_le_sized(bytes, *cursor, off_size)?;
+    *cursor = cursor.saturating_add(off_size);
+
+    *lcn_acc = lcn_acc.saturating_add(delta);
+    if *lcn_acc < 0 {
+        return Err(ntfs_proto_err("NTFS runlist LCN 变为负数"));
+    }
+
+    let run = NtfsRun {
+        vcn_start: *vcn_acc,
+        lcn_start: u64::try_from(*lcn_acc).unwrap_or(0),
+        cluster_len: len,
+    };
+    *vcn_acc = vcn_acc.saturating_add(len);
+    Ok(Some(run))
+}
+
+#[cfg(windows)]
+fn ntfs_run_header_sizes(header: u8) -> Result<(usize, usize), AegisError> {
+    let len_size = usize::from(header & 0x0F);
+    let off_size = usize::from((header >> 4) & 0x0F);
+    if len_size == 0 {
+        return Err(ntfs_proto_err("NTFS runlist 长度字段为空"));
+    }
+    if off_size == 0 {
+        return Err(ntfs_proto_err("NTFS runlist sparse run 不支持"));
+    }
+    Ok((len_size, off_size))
+}
+
+#[cfg(windows)]
+fn ntfs_read_u64_le_sized(bytes: &[u8], off: usize, len: usize) -> Result<u64, AegisError> {
+    let slice = bytes
+        .get(off..off.saturating_add(len))
+        .ok_or(ntfs_proto_err("NTFS runlist 越界"))?;
+    let mut out: u64 = 0;
+    for (k, b) in slice.iter().copied().enumerate() {
+        out |= u64::from(b) << (k.saturating_mul(8));
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn ntfs_read_i64_le_sized(bytes: &[u8], off: usize, len: usize) -> Result<i64, AegisError> {
+    let slice = bytes
+        .get(off..off.saturating_add(len))
+        .ok_or(ntfs_proto_err("NTFS runlist 越界"))?;
+    let mut out: i64 = 0;
+    for (k, b) in slice.iter().copied().enumerate() {
+        out |= i64::from(b) << (k.saturating_mul(8));
+    }
+    let sign_bit = 1i64 << ((len.saturating_mul(8)).saturating_sub(1));
+    if (out & sign_bit) != 0 {
+        let mask = (!0i64) << (len.saturating_mul(8));
+        out |= mask;
+    }
+    Ok(out)
 }
 
 #[cfg(windows)]
@@ -616,63 +644,16 @@ fn find_run_for_vcn(runs: &[NtfsRun], vcn: u64) -> Option<(NtfsRun, u64)> {
 
 #[cfg(windows)]
 fn parse_mft_runs_from_mft_record_zero(record: &[u8]) -> Result<Vec<NtfsRun>, AegisError> {
-    if record.len() < 0x30 || record.get(0..4) != Some(b"FILE") {
-        return Err(AegisError::ProtocolError {
-            message: "MFT record#0 非法".to_string(),
-            code: Some(ErrorCode::Probe101),
-        });
-    }
-    let attr_off = read_u16_le(record, 0x14)? as usize;
-    if attr_off >= record.len() {
-        return Err(AegisError::ProtocolError {
-            message: "MFT record#0 attribute offset 越界".to_string(),
-            code: Some(ErrorCode::Probe101),
-        });
-    }
+    let attr_off = parse_mft_attr_start_off(record, "MFT record#0")?;
 
     let mut off = attr_off;
     while off + 4 <= record.len() {
-        let attr_type = read_u32_le(record, off)?;
+        let (attr_type, total_len) = parse_mft_attr_header(record, off)?;
         if attr_type == 0xFFFF_FFFF {
             break;
         }
-        let total_len = read_u32_le(record, off + 4)? as usize;
-        if total_len < 24 || off + total_len > record.len() {
-            return Err(AegisError::ProtocolError {
-                message: "MFT attribute 长度非法".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
 
-        let non_resident = *record.get(off + 8).ok_or(AegisError::ProtocolError {
-            message: "读取 non_resident 越界".to_string(),
-            code: Some(ErrorCode::Probe101),
-        })?;
-        let name_len = *record.get(off + 9).ok_or(AegisError::ProtocolError {
-            message: "读取 name_len 越界".to_string(),
-            code: Some(ErrorCode::Probe101),
-        })? as usize;
-
-        if attr_type == 0x80 && non_resident != 0 && name_len == 0 {
-            if total_len < 0x40 {
-                return Err(AegisError::ProtocolError {
-                    message: "$MFT $DATA non-resident header 太短".to_string(),
-                    code: Some(ErrorCode::Probe101),
-                });
-            }
-            let runlist_off = read_u16_le(record, off + 0x20)? as usize;
-            if runlist_off >= total_len {
-                return Err(AegisError::ProtocolError {
-                    message: "$MFT runlist offset 越界".to_string(),
-                    code: Some(ErrorCode::Probe101),
-                });
-            }
-            let runlist = record.get(off + runlist_off..off + total_len).ok_or(
-                AegisError::ProtocolError {
-                    message: "读取 $MFT runlist 越界".to_string(),
-                    code: Some(ErrorCode::Probe101),
-                },
-            )?;
+        if let Some(runlist) = mft_data_runlist_if_present(record, off, total_len)? {
             return decode_ntfs_runlist(runlist);
         }
 
@@ -688,142 +669,223 @@ fn parse_mft_runs_from_mft_record_zero(record: &[u8]) -> Result<Vec<NtfsRun>, Ae
 #[allow(clippy::missing_errors_doc)]
 #[allow(clippy::too_many_lines)]
 pub fn parse_mft_file_record(record: &[u8]) -> Result<MftFileRecordEvidence, AegisError> {
-    if record.len() < 0x30 {
-        return Err(AegisError::ProtocolError {
-            message: "MFT record 太短".to_string(),
-            code: Some(ErrorCode::Probe101),
-        });
-    }
-    if record.get(0..4) != Some(b"FILE") {
-        return Err(AegisError::ProtocolError {
-            message: "MFT record 缺少 FILE 签名".to_string(),
-            code: Some(ErrorCode::Probe101),
-        });
-    }
-
-    let attr_off = read_u16_le(record, 0x14)? as usize;
-    if attr_off >= record.len() {
-        return Err(AegisError::ProtocolError {
-            message: "MFT attribute offset 越界".to_string(),
-            code: Some(ErrorCode::Probe101),
-        });
-    }
-
-    let mut si_created: Option<i64> = None;
-    let mut fn_created: Option<i64> = None;
-    let mut ads_streams: Vec<String> = Vec::new();
+    let attr_off = parse_mft_attr_start_off(record, "MFT record")?;
+    let mut state = MftRecordParseState::new();
 
     let mut off = attr_off;
     while off + 4 <= record.len() {
-        let attr_type = read_u32_le(record, off)?;
+        let (attr_type, total_len) = parse_mft_attr_header(record, off)?;
         if attr_type == 0xFFFF_FFFF {
             break;
         }
-        let total_len = read_u32_le(record, off + 4)? as usize;
-        if total_len < 24 || off + total_len > record.len() {
-            return Err(AegisError::ProtocolError {
-                message: "MFT attribute 长度非法".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-        let non_resident = *record.get(off + 8).ok_or(AegisError::ProtocolError {
-            message: "读取 non_resident 越界".to_string(),
-            code: Some(ErrorCode::Probe101),
-        })?;
-        let name_len = *record.get(off + 9).ok_or(AegisError::ProtocolError {
-            message: "读取 name_len 越界".to_string(),
-            code: Some(ErrorCode::Probe101),
-        })? as usize;
-        let name_off = read_u16_le(record, off + 10)? as usize;
-
-        if name_len > 0 {
-            let end = name_off.saturating_add(name_len.saturating_mul(2));
-            if end > total_len {
-                return Err(AegisError::ProtocolError {
-                    message: "MFT attribute name 越界".to_string(),
-                    code: Some(ErrorCode::Probe101),
-                });
-            }
-        }
-
-        if attr_type == 0x80 && name_len > 0 {
-            let name_bytes = record
-                .get(off + name_off..off + name_off + name_len.saturating_mul(2))
-                .ok_or(AegisError::ProtocolError {
-                    message: "$DATA name 越界".to_string(),
-                    code: Some(ErrorCode::Probe101),
-                })?;
-            let name = decode_utf16le(name_bytes)?;
-            if !name.is_empty() {
-                ads_streams.push(name);
-            }
-        }
-
-        if non_resident != 0 {
-            off = off.saturating_add(total_len);
-            continue;
-        }
-
-        let value_len = read_u32_le(record, off + 16)? as usize;
-        let value_off = read_u16_le(record, off + 20)? as usize;
-        if value_off > total_len || value_off.saturating_add(value_len) > total_len {
-            return Err(AegisError::ProtocolError {
-                message: "MFT resident value 越界".to_string(),
-                code: Some(ErrorCode::Probe101),
-            });
-        }
-        let value = record
-            .get(off + value_off..off + value_off + value_len)
-            .ok_or(AegisError::ProtocolError {
-                message: "读取 attribute value 越界".to_string(),
-                code: Some(ErrorCode::Probe101),
-            })?;
-
-        match attr_type {
-            0x10 => {
-                if value.len() < 8 {
-                    return Err(AegisError::ProtocolError {
-                        message: "$STANDARD_INFORMATION 太短".to_string(),
-                        code: Some(ErrorCode::Probe101),
-                    });
-                }
-                let created_ft = read_u64_le(value, 0)?;
-                si_created = Some(filetime_100ns_to_unix_ms(created_ft));
-            }
-            0x30 => {
-                if value.len() < 0x20 {
-                    return Err(AegisError::ProtocolError {
-                        message: "$FILE_NAME 太短".to_string(),
-                        code: Some(ErrorCode::Probe101),
-                    });
-                }
-                let created_ft = read_u64_le(value, 8)?;
-                fn_created = Some(filetime_100ns_to_unix_ms(created_ft));
-            }
-            _ => {}
-        }
+        parse_mft_record_attribute(record, off, total_len, attr_type, &mut state)?;
 
         off = off.saturating_add(total_len);
     }
+    state.into_evidence()
+}
 
-    let Some(si_created_ms) = si_created else {
+fn parse_mft_attr_start_off(record: &[u8], label: &str) -> Result<usize, AegisError> {
+    if record.len() < 0x30 || record.get(0..4) != Some(b"FILE") {
         return Err(AegisError::ProtocolError {
-            message: "MFT record 缺少 $STANDARD_INFORMATION".to_string(),
+            message: format!("{label} 非法"),
             code: Some(ErrorCode::Probe101),
         });
-    };
-    let Some(fn_created_ms) = fn_created else {
+    }
+    let attr_off = read_u16_le(record, 0x14)? as usize;
+    if attr_off >= record.len() {
         return Err(AegisError::ProtocolError {
-            message: "MFT record 缺少 $FILE_NAME".to_string(),
+            message: format!("{label} attribute offset 越界"),
             code: Some(ErrorCode::Probe101),
         });
-    };
+    }
+    Ok(attr_off)
+}
 
-    Ok(MftFileRecordEvidence {
-        si_created_ms,
-        fn_created_ms,
-        ads_streams,
-    })
+fn parse_mft_attr_header(record: &[u8], off: usize) -> Result<(u32, usize), AegisError> {
+    let attr_type = read_u32_le(record, off)?;
+    if attr_type == 0xFFFF_FFFF {
+        return Ok((attr_type, 0));
+    }
+    let total_len = read_u32_le(record, off + 4)? as usize;
+    if total_len < 24 || off + total_len > record.len() {
+        return Err(AegisError::ProtocolError {
+            message: "MFT attribute 长度非法".to_string(),
+            code: Some(ErrorCode::Probe101),
+        });
+    }
+    Ok((attr_type, total_len))
+}
+
+fn mft_data_runlist_if_present(
+    record: &[u8],
+    off: usize,
+    total_len: usize,
+) -> Result<Option<&[u8]>, AegisError> {
+    let non_resident = *record.get(off + 8).ok_or(AegisError::ProtocolError {
+        message: "读取 non_resident 越界".to_string(),
+        code: Some(ErrorCode::Probe101),
+    })?;
+    let name_len = *record.get(off + 9).ok_or(AegisError::ProtocolError {
+        message: "读取 name_len 越界".to_string(),
+        code: Some(ErrorCode::Probe101),
+    })? as usize;
+    let attr_type = read_u32_le(record, off)?;
+
+    if attr_type != 0x80 || non_resident == 0 || name_len != 0 {
+        return Ok(None);
+    }
+    if total_len < 0x40 {
+        return Err(AegisError::ProtocolError {
+            message: "$MFT $DATA non-resident header 太短".to_string(),
+            code: Some(ErrorCode::Probe101),
+        });
+    }
+    let runlist_off = read_u16_le(record, off + 0x20)? as usize;
+    if runlist_off >= total_len {
+        return Err(AegisError::ProtocolError {
+            message: "$MFT runlist offset 越界".to_string(),
+            code: Some(ErrorCode::Probe101),
+        });
+    }
+    let runlist =
+        record
+            .get(off + runlist_off..off + total_len)
+            .ok_or(AegisError::ProtocolError {
+                message: "读取 $MFT runlist 越界".to_string(),
+                code: Some(ErrorCode::Probe101),
+            })?;
+    Ok(Some(runlist))
+}
+
+struct MftRecordParseState {
+    si_created: Option<i64>,
+    fn_created: Option<i64>,
+    ads_streams: Vec<String>,
+}
+
+impl MftRecordParseState {
+    fn new() -> Self {
+        Self {
+            si_created: None,
+            fn_created: None,
+            ads_streams: Vec::new(),
+        }
+    }
+
+    fn into_evidence(self) -> Result<MftFileRecordEvidence, AegisError> {
+        let Some(si_created_ms) = self.si_created else {
+            return Err(AegisError::ProtocolError {
+                message: "MFT record 缺少 $STANDARD_INFORMATION".to_string(),
+                code: Some(ErrorCode::Probe101),
+            });
+        };
+        let Some(fn_created_ms) = self.fn_created else {
+            return Err(AegisError::ProtocolError {
+                message: "MFT record 缺少 $FILE_NAME".to_string(),
+                code: Some(ErrorCode::Probe101),
+            });
+        };
+
+        Ok(MftFileRecordEvidence {
+            si_created_ms,
+            fn_created_ms,
+            ads_streams: self.ads_streams,
+        })
+    }
+}
+
+fn parse_mft_record_attribute(
+    record: &[u8],
+    base_off: usize,
+    total_len: usize,
+    attr_type: u32,
+    state: &mut MftRecordParseState,
+) -> Result<(), AegisError> {
+    let non_resident = *record.get(base_off + 8).ok_or(AegisError::ProtocolError {
+        message: "读取 non_resident 越界".to_string(),
+        code: Some(ErrorCode::Probe101),
+    })?;
+    let name_len = *record.get(base_off + 9).ok_or(AegisError::ProtocolError {
+        message: "读取 name_len 越界".to_string(),
+        code: Some(ErrorCode::Probe101),
+    })? as usize;
+    let name_off = read_u16_le(record, base_off + 10)? as usize;
+
+    if name_len > 0 {
+        let end = name_off.saturating_add(name_len.saturating_mul(2));
+        if end > total_len {
+            return Err(AegisError::ProtocolError {
+                message: "MFT attribute name 越界".to_string(),
+                code: Some(ErrorCode::Probe101),
+            });
+        }
+    }
+
+    if attr_type == 0x80 && name_len > 0 {
+        let name_bytes = record
+            .get(base_off + name_off..base_off + name_off + name_len.saturating_mul(2))
+            .ok_or(AegisError::ProtocolError {
+                message: "$DATA name 越界".to_string(),
+                code: Some(ErrorCode::Probe101),
+            })?;
+        let name = decode_utf16le(name_bytes)?;
+        if !name.is_empty() {
+            state.ads_streams.push(name);
+        }
+    }
+
+    if non_resident != 0 {
+        return Ok(());
+    }
+
+    let value = mft_resident_value(record, base_off, total_len)?;
+    match attr_type {
+        0x10 => {
+            if value.len() < 8 {
+                return Err(AegisError::ProtocolError {
+                    message: "$STANDARD_INFORMATION 太短".to_string(),
+                    code: Some(ErrorCode::Probe101),
+                });
+            }
+            let created_ft = read_u64_le(value, 0)?;
+            state.si_created = Some(filetime_100ns_to_unix_ms(created_ft));
+        }
+        0x30 => {
+            if value.len() < 0x20 {
+                return Err(AegisError::ProtocolError {
+                    message: "$FILE_NAME 太短".to_string(),
+                    code: Some(ErrorCode::Probe101),
+                });
+            }
+            let created_ft = read_u64_le(value, 8)?;
+            state.fn_created = Some(filetime_100ns_to_unix_ms(created_ft));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn mft_resident_value(
+    record: &[u8],
+    base_off: usize,
+    total_len: usize,
+) -> Result<&[u8], AegisError> {
+    let value_len = read_u32_le(record, base_off + 16)? as usize;
+    let value_off = read_u16_le(record, base_off + 20)? as usize;
+    if value_off > total_len || value_off.saturating_add(value_len) > total_len {
+        return Err(AegisError::ProtocolError {
+            message: "MFT resident value 越界".to_string(),
+            code: Some(ErrorCode::Probe101),
+        });
+    }
+    record
+        .get(base_off + value_off..base_off + value_off + value_len)
+        .ok_or(AegisError::ProtocolError {
+            message: "读取 attribute value 越界".to_string(),
+            code: Some(ErrorCode::Probe101),
+        })
 }
 
 pub fn filetime_100ns_to_unix_ms(filetime_100ns: u64) -> i64 {
