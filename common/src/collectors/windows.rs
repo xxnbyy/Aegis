@@ -497,10 +497,7 @@ pub fn ntfs_mft_record_size(cluster_size: u32, clusters_per_record: i8) -> u32 {
         cluster_size.saturating_mul(u32::from(clusters_per_record.unsigned_abs()))
     } else {
         let exp = u32::from((clusters_per_record.unsigned_abs()).min(31));
-        match 1u32.checked_shl(exp) {
-            Some(v) => v,
-            None => u32::MAX,
-        }
+        1u32.checked_shl(exp).unwrap_or(u32::MAX)
     }
 }
 
