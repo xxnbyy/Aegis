@@ -1,5 +1,6 @@
 # Docs (Local only)
 .docs/**
+!.docs/Doc-11-构建、签名与发布流水线设计.md
 
 # Rust
 /target/
