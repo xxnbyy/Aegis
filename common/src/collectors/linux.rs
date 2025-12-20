@@ -720,12 +720,12 @@ impl<'a> CgroupPidCollector<'a> {
             if self.should_stop() {
                 break;
             }
-            self.handle_entry(entry);
+            self.handle_entry(&entry);
         }
     }
 
-    fn handle_entry(&mut self, entry: std::fs::DirEntry) {
-        let Some(path) = self.cgroup_procs_path_from_entry(&entry) else {
+    fn handle_entry(&mut self, entry: &std::fs::DirEntry) {
+        let Some(path) = self.cgroup_procs_path_from_entry(entry) else {
             return;
         };
         self.files_scanned = self.files_scanned.saturating_add(1);
