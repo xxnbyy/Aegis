@@ -524,7 +524,7 @@ fn collect_ip_addresses() -> Vec<String> {
     #[allow(unsafe_code)]
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifap as *mut *mut libc::ifaddrs) != 0 {
+        if libc::getifaddrs(&raw mut ifap) != 0 {
             return Vec::new();
         }
         let mut cur = ifap;
@@ -532,19 +532,19 @@ fn collect_ip_addresses() -> Vec<String> {
             let ifa = &*cur;
             let addr = ifa.ifa_addr;
             if !addr.is_null() {
-                let family = (*addr).sa_family as i32;
+                let family = i32::from((*addr).sa_family);
                 match family {
                     libc::AF_INET => {
-                        let sa = addr as *const libc::sockaddr_in;
-                        let bytes = (*sa).sin_addr.s_addr.to_ne_bytes();
+                        let sa = std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in>());
+                        let bytes = sa.sin_addr.s_addr.to_ne_bytes();
                         let ip = Ipv4Addr::from(bytes);
                         if !ip.is_loopback() && !ip.is_unspecified() {
                             out.insert(ip.to_string());
                         }
                     }
                     libc::AF_INET6 => {
-                        let sa = addr as *const libc::sockaddr_in6;
-                        let ip = Ipv6Addr::from((*sa).sin6_addr.s6_addr);
+                        let sa = std::ptr::read_unaligned(addr.cast::<libc::sockaddr_in6>());
+                        let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
                         if !ip.is_loopback() && !ip.is_unspecified() {
                             out.insert(ip.to_string());
                         }
@@ -696,14 +696,17 @@ fn system_boot_time_unix() -> Option<i64> {
     #[cfg(target_os = "linux")]
     {
         let content = std::fs::read_to_string("/proc/uptime").ok()?;
-        let uptime_s = content
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
+        let first = content.split_whitespace().next()?;
+        let (secs_s, frac_s) = first.split_once('.').unwrap_or((first, ""));
+        let secs = secs_s.parse::<i64>().ok()?;
+        let frac_first = frac_s.as_bytes().first().copied();
+        let uptime_i64 = if matches!(frac_first, Some(b'5'..=b'9')) {
+            secs.checked_add(1)?
+        } else {
+            secs
+        };
         let now = unix_timestamp_now();
-        let uptime_i64 = i64::try_from(uptime_s.round() as i128).unwrap_or(i64::MAX);
-        return Some(now.saturating_sub(uptime_i64));
+        Some(now.saturating_sub(uptime_i64))
     }
     #[cfg(windows)]
     {
@@ -830,7 +833,7 @@ fn maybe_emit_linux_bpf_snapshot(state: &mut LoopState, governor: &mut Governor)
         let mut high: u32 = 0;
         let mut suspicious: u32 = 0;
         let mut low: u32 = 0;
-        for info in infos.iter() {
+        for info in &infos {
             let h = common::collectors::linux::classify_bpf_program(info, &[]);
             match h.risk {
                 common::collectors::linux::BpfRisk::HighRisk => high = high.saturating_add(1),
