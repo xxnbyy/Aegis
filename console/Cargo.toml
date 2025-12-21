@@ -1,0 +1,21 @@
+[package]
+name = "console"
+edition = "2024"
+version.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+common = { path = "../common" }
+aes-kw = { version = "0.2", features = ["std"] }
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+prost = "0.12"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.8"
+
+[lints]
+workspace = true
