@@ -57,6 +57,8 @@ enum EventSpec {
     #[serde(rename = "process")]
     Process {
         exec_id: u64,
+        #[serde(default)]
+        exec_id_quality: Option<String>,
         pid: Option<u32>,
         ppid: Option<u32>,
         name: Option<String>,
@@ -309,6 +311,7 @@ fn event_to_payload_bytes(
     let env = match event {
         EventSpec::Process {
             exec_id,
+            exec_id_quality,
             pid,
             ppid,
             name,
@@ -334,7 +337,9 @@ fn event_to_payload_bytes(
             is_mismatched: is_mismatched.unwrap_or(false),
             has_floating_code: has_floating_code.unwrap_or(false),
             exec_id: *exec_id,
-            exec_id_quality: String::new(),
+            exec_id_quality: exec_id_quality
+                .clone()
+                .unwrap_or_else(|| "mock:explicit".to_string()),
         }),
 
         EventSpec::Telemetry {

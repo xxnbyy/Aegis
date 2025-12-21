@@ -205,9 +205,13 @@ fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
             return Ok(Some(v));
         }
         if let Some(v) = try_read_host_uuid_registry(HKEY_CURRENT_USER)? {
+            if mode != "dev" {
+                tracing::warn!(
+                    "HostUUID 从 HKCU\\SOFTWARE\\Aegis 读取（HKLM\\SOFTWARE\\Aegis 不可用）"
+                );
+            }
             return Ok(Some(v));
         }
-        let _ = mode;
         Ok(None)
     }
 
@@ -219,9 +223,14 @@ fn get_persisted_host_uuid(mode: &str) -> Result<Option<[u8; 16]>, AegisError> {
         }
         let fallback = user_uuid_path();
         if let Some(v) = try_read_host_uuid_file(fallback.as_path())? {
+            if mode != "dev" {
+                tracing::warn!(
+                    "HostUUID 从 {} 读取（/etc/aegis/uuid 不可用）",
+                    fallback.display()
+                );
+            }
             return Ok(Some(v));
         }
-        let _ = mode;
         Ok(None)
     }
 }
