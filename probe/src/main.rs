@@ -54,6 +54,10 @@ enum EncryptorCommand {
 
 fn main() {
     if let Err(e) = try_main() {
+        if e.starts_with("Usage:") {
+            println!("{e}");
+            std::process::exit(0);
+        }
         eprintln!("{e}");
         std::process::exit(1);
     }
@@ -2298,14 +2302,14 @@ mod tests {
     #[cfg(windows)]
     use super::cim_datetime_to_unix_seconds;
     use super::{
-        LoopState, OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
-        effective_telemetry_interval_sec, validate_key_requirements,
+        EncryptorCommand, LoopState, OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
+        effective_telemetry_interval_sec, encryptor_loop, parse_args, validate_key_requirements,
     };
     use common::config::{GovernorConfig, PidConfig, TokenBucketConfig};
     use common::crypto;
     use common::governor::Governor;
     use common::governor::IoLimiter;
-    use common::protocol::{PayloadEnvelope, payload_envelope};
+    use common::protocol::{PayloadEnvelope, ProcessInfo, payload_envelope};
     use prost::Message;
     use rand::rngs::OsRng;
     use rsa::Oaep;
@@ -2313,6 +2317,9 @@ mod tests {
     use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
     use sha2::Sha256;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2342,6 +2349,42 @@ mod tests {
         assert!(validate_key_requirements(false, true, false).is_ok());
         assert!(validate_key_requirements(false, false, true).is_ok());
         assert!(validate_key_requirements(false, true, true).is_ok());
+    }
+
+    #[test]
+    fn parse_args_parses_all_flags() -> Result<(), String> {
+        let args = parse_args(
+            vec![
+                "--config",
+                "c.yaml",
+                "--org-key-path",
+                "k.der",
+                "--user-passphrase",
+                "pw",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )?;
+        assert_eq!(args.config_path, Some(PathBuf::from("c.yaml")));
+        assert_eq!(args.org_key_path, Some(PathBuf::from("k.der")));
+        assert_eq!(args.user_passphrase, Some("pw".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag() {
+        let err = parse_args(vec!["--wat"].into_iter().map(str::to_string))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("未知参数"));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_value() {
+        let err = parse_args(vec!["--config"].into_iter().map(str::to_string))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("--config 缺少参数"));
     }
 
     #[test]
@@ -2479,6 +2522,115 @@ mod tests {
     }
 
     #[test]
+    fn encryptor_inserts_system_info_when_first_payload_is_not_system_info() -> Result<(), String> {
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| format!("生成 RSA 私钥失败: {e}"))?;
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| format!("导出 Org Public Key DER 失败: {e}"))?
+            .as_bytes()
+            .to_vec();
+        let org_key_fp = crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aegis_probe_encryptor_test_{}_{}",
+            std::process::id(),
+            super::unix_timestamp_now()
+        ));
+        std::fs::create_dir_all(dir.as_path())
+            .map_err(|e| format!("创建临时目录失败（{}）: {e}", dir.display()))?;
+
+        let (tx, rx) = mpsc::channel::<EncryptorCommand>();
+        let out_dir = dir.clone();
+        let t = thread::spawn(move || {
+            encryptor_loop(
+                &rx,
+                out_dir.as_path(),
+                &public_key,
+                org_key_fp,
+                "dev",
+                Some("aegis-dev"),
+                0,
+            );
+        });
+
+        let proc_payload = PayloadEnvelope::process_info(ProcessInfo {
+            pid: 123,
+            ppid: 0,
+            name: "p".to_string(),
+            cmdline: "p".to_string(),
+            exe_path: "C:\\p.exe".to_string(),
+            uid: 0,
+            start_time: 1,
+            is_ghost: false,
+            is_mismatched: false,
+            has_floating_code: false,
+            exec_id: 1,
+            exec_id_quality: "test".to_string(),
+        })
+        .encode_to_vec();
+
+        tx.send(EncryptorCommand::Payload(proc_payload))
+            .map_err(|e| format!("发送 payload 失败: {e}"))?;
+        drop(tx);
+        t.join()
+            .map_err(|_| "等待 encryptor 线程失败".to_string())?;
+
+        let mut aes_files: Vec<PathBuf> = std::fs::read_dir(dir.as_path())
+            .map_err(|e| format!("读取临时目录失败（{}）: {e}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "aes"))
+            .collect();
+        aes_files.sort();
+        let path = aes_files
+            .first()
+            .ok_or("未生成 artifact 文件".to_string())?;
+
+        let bytes = std::fs::read(path.as_path())
+            .map_err(|e| format!("读取 artifact 文件失败（{}）: {e}", path.display()))?;
+
+        let rsa_ct_len = private_key.size();
+        let rsa_start = crypto::AES_HEADER_LEN + USER_SLOT_LEN;
+        let rsa_end = rsa_start + rsa_ct_len;
+        let rsa_ct = bytes
+            .get(rsa_start..rsa_end)
+            .ok_or("读取 OrgSlot 失败".to_string())?;
+        let stream = bytes.get(rsa_end..).ok_or("读取 stream 失败".to_string())?;
+
+        let session_key_bytes = private_key
+            .decrypt(Oaep::new::<Sha256>(), rsa_ct)
+            .map_err(|e| format!("RSA-OAEP 解密 SessionKey 失败: {e}"))?;
+        let session_key: [u8; 32] = session_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "OrgSlot 解出的 SessionKey 长度异常".to_string())?;
+
+        let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key, 8)
+            .map_err(|e| format!("解密 stream 失败: {e}"))?;
+        let first = plaintexts.first().ok_or("缺少第一个 chunk".to_string())?;
+        let second = plaintexts.get(1).ok_or("缺少第二个 chunk".to_string())?;
+        let env1 = PayloadEnvelope::decode(first.as_slice())
+            .map_err(|e| format!("PayloadEnvelope 反序列化失败: {e}"))?;
+        let env2 = PayloadEnvelope::decode(second.as_slice())
+            .map_err(|e| format!("PayloadEnvelope 反序列化失败: {e}"))?;
+
+        assert!(matches!(
+            env1.payload,
+            Some(payload_envelope::Payload::SystemInfo(_))
+        ));
+        assert!(matches!(
+            env2.payload,
+            Some(payload_envelope::Payload::ProcessInfo(_))
+        ));
+
+        let _cleanup = std::fs::remove_dir_all(dir.as_path());
+        Ok(())
+    }
+
+    #[test]
     fn probe_artifact_segment_roundtrip_matches_doc06_layout() -> Result<(), String> {
         let mut rng = OsRng;
         let private_key =
@@ -2586,5 +2738,137 @@ mod tests {
             Some(payload_envelope::Payload::SystemInfo(_)) => Ok(()),
             _ => Err("第一个 chunk 必须是 SystemInfo".to_string()),
         }
+    }
+
+    fn write_console_fixture_artifact(
+        dir: &std::path::Path,
+        public_key: &rsa::RsaPublicKey,
+        org_key_fp: u64,
+        passphrase: &str,
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let mut io = IoLimiter::new(0, Instant::now());
+        let mut seg = OpenArtifactSegment::open_new(
+            dir,
+            0,
+            public_key,
+            org_key_fp,
+            "dev",
+            Some(passphrase),
+            &mut io,
+        )?;
+
+        let sys = PayloadEnvelope::system_info(common::protocol::SystemInfo {
+            hostname: "h".to_string(),
+            os_version: "o".to_string(),
+            kernel_version: "k".to_string(),
+            ip_addresses: vec!["10.0.0.1".to_string()],
+            boot_time: 1,
+        })
+        .encode_to_vec();
+        seg.write_encrypted_chunk(&mut io, sys.as_slice())?;
+
+        let parent = PayloadEnvelope::process_info(ProcessInfo {
+            pid: 100,
+            ppid: 0,
+            name: "p100".to_string(),
+            cmdline: "p100".to_string(),
+            exe_path: "C:\\p100.exe".to_string(),
+            uid: 0,
+            start_time: 2_000,
+            is_ghost: false,
+            is_mismatched: false,
+            has_floating_code: false,
+            exec_id: 1,
+            exec_id_quality: "windows:psn".to_string(),
+        })
+        .encode_to_vec();
+        seg.write_encrypted_chunk(&mut io, parent.as_slice())?;
+
+        let child = PayloadEnvelope::process_info(ProcessInfo {
+            pid: 200,
+            ppid: 100,
+            name: "p200".to_string(),
+            cmdline: "p200".to_string(),
+            exe_path: "C:\\p200.exe".to_string(),
+            uid: 0,
+            start_time: 2_500,
+            is_ghost: false,
+            is_mismatched: false,
+            has_floating_code: false,
+            exec_id: 2,
+            exec_id_quality: "windows:psn".to_string(),
+        })
+        .encode_to_vec();
+        seg.write_encrypted_chunk(&mut io, child.as_slice())?;
+
+        Ok(seg.finalize_and_close(&mut io)?)
+    }
+
+    fn assert_console_can_open_and_view(
+        path: &std::path::Path,
+        passphrase: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use console::{
+            Decryption, EdgeType, GetGraphViewportInput, OpenArtifactInput, OpenArtifactOptions,
+            Source, ViewportLevel,
+        };
+
+        let mut c = console::Console::new(console::ConsoleConfig {
+            max_level01_nodes: 20_000,
+            persistence: None,
+        });
+        let out = c.open_artifact(OpenArtifactInput {
+            source: Source::LocalPath {
+                path: path.display().to_string(),
+            },
+            decryption: Decryption::UserPassphrase {
+                passphrase: passphrase.to_string(),
+            },
+            options: OpenArtifactOptions::default(),
+        })?;
+        assert!(out.sealed);
+        assert!(!out.case_id.is_empty());
+        assert!(!out.host_uuid.is_empty());
+        assert!(!out.org_key_fp.is_empty());
+
+        let v = c.get_graph_viewport(GetGraphViewportInput {
+            case_id: out.case_id,
+            level: ViewportLevel::L0,
+            viewport_bbox: None,
+            risk_score_threshold: Some(0),
+            center_node_id: None,
+            page: None,
+        })?;
+        assert!(v.nodes.len() >= 2);
+        assert!(
+            v.edges
+                .iter()
+                .any(|e| matches!(e.r#type, EdgeType::ParentOf))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probe_artifact_can_be_opened_by_console() -> Result<(), Box<dyn std::error::Error>> {
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let public_key_der = public_key.to_public_key_der()?.as_bytes().to_vec();
+        let org_key_fp = crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aegis_probe_console_e2e_test_{}_{}",
+            std::process::id(),
+            crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice())
+        ));
+        std::fs::create_dir_all(dir.as_path())?;
+
+        let passphrase = "pw_console";
+        let path =
+            write_console_fixture_artifact(dir.as_path(), &public_key, org_key_fp, passphrase)?;
+        assert_console_can_open_and_view(path.as_path(), passphrase)?;
+
+        let _cleanup = std::fs::remove_dir_all(dir.as_path());
+        Ok(())
     }
 }

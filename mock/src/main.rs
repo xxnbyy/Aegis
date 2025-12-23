@@ -27,10 +27,10 @@ const USER_SLOT_LEN: usize = 40;
 #[command(name = "mock", version)]
 struct Cli {
     #[arg(long = "scenario")]
-    scenario: PathBuf,
+    scenario: Option<PathBuf>,
 
     #[arg(long = "out")]
-    out: PathBuf,
+    out: Option<PathBuf>,
 
     #[arg(long = "mode", default_value = "dev")]
     mode: String,
@@ -40,6 +40,15 @@ struct Cli {
 
     #[arg(long = "password")]
     password: Option<String>,
+
+    #[arg(long = "verify-artifact")]
+    verify_artifact: Option<PathBuf>,
+
+    #[arg(long = "passphrase")]
+    passphrase: Option<String>,
+
+    #[arg(long = "verify-hmac-if-present", default_value_t = true)]
+    verify_hmac_if_present: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -103,13 +112,71 @@ fn main() {
 
 fn run() -> Result<(), AegisError> {
     let cli = Cli::parse();
+    if let Some(path) = cli.verify_artifact.as_deref() {
+        let passphrase = cli.passphrase.as_deref().ok_or(AegisError::ConfigError {
+            message: "--passphrase 缺少参数".to_string(),
+        })?;
+        return verify_artifact_with_console(path, passphrase, cli.verify_hmac_if_present);
+    }
+
+    let scenario = cli.scenario.as_deref().ok_or(AegisError::ConfigError {
+        message: "--scenario 缺少参数".to_string(),
+    })?;
+    let out = cli.out.as_deref().ok_or(AegisError::ConfigError {
+        message: "--out 缺少参数".to_string(),
+    })?;
     run_with_paths(
-        &cli.scenario,
-        &cli.out,
+        scenario,
+        out,
         cli.mode.as_str(),
         cli.cert.as_deref(),
         cli.password.as_deref(),
     )
+}
+
+fn verify_artifact_with_console(
+    path: &Path,
+    passphrase: &str,
+    verify_hmac_if_present: bool,
+) -> Result<(), AegisError> {
+    use console::{
+        Decryption, GetGraphViewportInput, OpenArtifactInput, OpenArtifactOptions, Source,
+        ViewportLevel,
+    };
+
+    let mut c = console::Console::new(console::ConsoleConfig {
+        max_level01_nodes: 20_000,
+        persistence: None,
+    });
+    let out = c.open_artifact(OpenArtifactInput {
+        source: Source::LocalPath {
+            path: path.display().to_string(),
+        },
+        decryption: Decryption::UserPassphrase {
+            passphrase: passphrase.to_string(),
+        },
+        options: OpenArtifactOptions {
+            verify_hmac_if_present,
+        },
+    })?;
+
+    let v = c.get_graph_viewport(GetGraphViewportInput {
+        case_id: out.case_id.clone(),
+        level: ViewportLevel::L0,
+        viewport_bbox: None,
+        risk_score_threshold: Some(0),
+        center_node_id: None,
+        page: None,
+    })?;
+
+    println!("ok=true");
+    println!("sealed={}", out.sealed);
+    println!("case_id={}", out.case_id);
+    println!("host_uuid={}", out.host_uuid);
+    println!("org_key_fp={}", out.org_key_fp);
+    println!("l0_nodes={}", v.nodes.len());
+    println!("l0_edges={}", v.edges.len());
+    Ok(())
 }
 
 fn default_dev_keys_dir() -> PathBuf {

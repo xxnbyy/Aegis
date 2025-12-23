@@ -26,6 +26,7 @@ impl Default for OpenArtifactOptions {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
     LocalPath { path: String },
+    TaskId { task_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,4 +172,73 @@ pub struct GraphEdge {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CloseCaseOutput {
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Uploading,
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalyzeEvidenceMeta {
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalyzeEvidenceChunkInput {
+    pub request_id: u64,
+    pub sequence_id: u64,
+    pub is_last: bool,
+    pub bytes: Vec<u8>,
+    pub meta: Option<AnalyzeEvidenceMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalyzeEvidenceOutput {
+    pub task_id: String,
+    pub status: TaskStatus,
+    pub bytes_written: Option<u64>,
+    pub case_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetTaskInput {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetTaskOutput {
+    pub task_id: String,
+    pub status: TaskStatus,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub bytes_written: Option<u64>,
+    pub error_message: Option<String>,
+    pub case_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub task_id: String,
+    pub status: TaskStatus,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListTasksInput {
+    pub page: Option<Page>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListTasksOutput {
+    pub tasks: Vec<TaskSummary>,
+    pub next_cursor: Option<String>,
 }
