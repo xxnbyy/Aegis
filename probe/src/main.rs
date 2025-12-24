@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_kw::Kek;
+use base64::Engine as _;
 use common::config::{ConfigManager, load_yaml_file};
 use common::crypto;
 use common::detection::{RuleManager, RuleSet};
@@ -21,15 +22,27 @@ use common::protocol::{
 };
 use common::telemetry::{init_telemetry, sample_memory_usage_mb};
 use hmac::Mac;
+use libloading::Library;
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rsa::Oaep;
+use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
+use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaPkcs1v15VerifyingKey};
+use rsa::pkcs8::DecodePrivateKey;
 use rsa::pkcs8::DecodePublicKey;
+use rsa::signature::SignatureEncoding;
+use rsa::signature::Signer;
+use rsa::signature::Verifier;
+use serde::Deserialize;
 use sha2::Sha256;
+use std::collections::HashSet;
 use tokio::sync::mpsc as tokio_mpsc;
+use wasmtime::{Caller, Engine, Linker, Module, Store};
 #[cfg(windows)]
 use wmi::WMIConnection;
 
@@ -45,6 +58,466 @@ type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 type EventBusTx = tokio_mpsc::UnboundedSender<EncryptorCommand>;
 type EventBusRx = tokio_mpsc::UnboundedReceiver<EncryptorCommand>;
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct WasmManifest {
+    permissions: Vec<String>,
+}
+
+struct PluginManager {
+    wasm: Option<WasmRuntime>,
+    native: Vec<NativePlugin>,
+}
+
+struct WasmRuntime {
+    plugins: Vec<WasmPlugin>,
+}
+
+#[derive(Clone)]
+struct WasmHostState {
+    permissions: HashSet<String>,
+}
+
+struct WasmPlugin {
+    name: String,
+    module_path: PathBuf,
+    permissions: Vec<String>,
+}
+
+struct NativePlugin {
+    name: String,
+    path: PathBuf,
+    _library: Library,
+}
+
+impl PluginManager {
+    fn load(
+        base_dir: &Path,
+        security: &common::config::SecurityConfig,
+        org_public_key: &RsaPublicKey,
+    ) -> Result<Self, String> {
+        let wasm = if security.wasm_plugin_paths.is_empty() {
+            None
+        } else {
+            Some(load_wasm_runtime(base_dir, security)?)
+        };
+
+        let native = if security.native_plugin_paths.is_empty() {
+            Vec::new()
+        } else {
+            if !security.enable_native_plugins {
+                return Err(
+                    "security.enable_native_plugins=false 时不允许加载 native_plugin_paths"
+                        .to_string(),
+                );
+            }
+            load_native_plugins(base_dir, security, org_public_key)?
+        };
+
+        Ok(Self { wasm, native })
+    }
+
+    fn wasm_count(&self) -> usize {
+        self.wasm.as_ref().map_or(0, |r| r.plugins.len())
+    }
+
+    fn native_count(&self) -> usize {
+        self.native.len()
+    }
+
+    fn wasm_plugin_names(&self) -> Vec<String> {
+        self.wasm.as_ref().map_or_else(Vec::new, |r| {
+            r.plugins.iter().map(|p| p.name.clone()).collect()
+        })
+    }
+
+    fn native_plugin_names(&self) -> Vec<String> {
+        self.native.iter().map(|p| p.name.clone()).collect()
+    }
+
+    fn wasm_plugin_entries(&self) -> Vec<(String, String, usize)> {
+        self.wasm.as_ref().map_or_else(Vec::new, |r| {
+            r.plugins
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.module_path.display().to_string(),
+                        p.permissions.len(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn native_plugin_entries(&self) -> Vec<(String, String)> {
+        self.native
+            .iter()
+            .map(|p| (p.name.clone(), p.path.display().to_string()))
+            .collect()
+    }
+}
+
+fn resolve_config_relative_path(base_dir: &Path, raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return p;
+    }
+    base_dir.join(p)
+}
+
+fn load_wasm_runtime(
+    base_dir: &Path,
+    security: &common::config::SecurityConfig,
+) -> Result<WasmRuntime, String> {
+    let cfg = wasmtime::Config::new();
+    let engine = Engine::new(&cfg).map_err(|e| format!("初始化 Wasm engine 失败: {e}"))?;
+
+    let allow: HashSet<&str> = security
+        .wasm_permissions_allow
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut plugins: Vec<WasmPlugin> = Vec::new();
+    for raw_path in &security.wasm_plugin_paths {
+        let module_path = resolve_config_relative_path(base_dir, raw_path.as_str());
+        let manifest_path = module_path
+            .parent()
+            .ok_or_else(|| format!("Wasm 插件路径缺少 parent: {}", module_path.display()))?
+            .join("manifest.json");
+        let manifest_text = std::fs::read_to_string(manifest_path.as_path()).map_err(|e| {
+            format!(
+                "读取 Wasm manifest 失败（{}）: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: WasmManifest = serde_json::from_str(manifest_text.as_str()).map_err(|e| {
+            format!(
+                "解析 Wasm manifest 失败（{}）: {e}",
+                manifest_path.display()
+            )
+        })?;
+
+        if allow.is_empty() && !manifest.permissions.is_empty() {
+            return Err(format!(
+                "Wasm 插件权限未配置 allowlist，但插件声明了 permissions: {}",
+                module_path.display()
+            ));
+        }
+
+        for perm in &manifest.permissions {
+            if !allow.contains(perm.as_str()) {
+                return Err(format!(
+                    "Wasm 插件权限不被允许: perm={perm}, plugin={}",
+                    module_path.display()
+                ));
+            }
+        }
+
+        let module = Module::from_file(&engine, module_path.as_path())
+            .map_err(|e| format!("加载 Wasm module 失败（{}）: {e}", module_path.display()))?;
+
+        let perms: HashSet<String> = manifest.permissions.iter().cloned().collect();
+        let linker = build_wasm_linker(&engine, &perms)?;
+        let mut store = Store::new(
+            &engine,
+            WasmHostState {
+                permissions: perms.clone(),
+            },
+        );
+        linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| format!("Wasm instantiate 失败（{}）: {e}", module_path.display()))?;
+
+        let name = module_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .or_else(|| module_path.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("wasm_plugin")
+            .to_string();
+
+        plugins.push(WasmPlugin {
+            name,
+            module_path,
+            permissions: manifest.permissions,
+        });
+    }
+
+    Ok(WasmRuntime { plugins })
+}
+
+fn build_wasm_linker(
+    engine: &Engine,
+    permissions: &HashSet<String>,
+) -> Result<Linker<WasmHostState>, String> {
+    let mut linker = Linker::<WasmHostState>::new(engine);
+
+    add_wasm_host_now_ms(&mut linker)?;
+
+    if permissions.contains("fs_read_logs") {
+        add_wasm_host_fs_read_logs(&mut linker)?;
+    }
+
+    if permissions.contains("net_connect_virustotal") {
+        add_wasm_host_net_connect_virustotal(&mut linker)?;
+    }
+
+    Ok(linker)
+}
+
+fn add_wasm_host_now_ms(linker: &mut Linker<WasmHostState>) -> Result<(), String> {
+    linker
+        .func_wrap("aegis", "now_ms", |_: Caller<'_, WasmHostState>| -> i64 {
+            let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+                return 0;
+            };
+            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+        })
+        .map_err(|e| format!("注册 host function aegis.now_ms 失败: {e}"))?;
+    Ok(())
+}
+
+fn add_wasm_host_fs_read_logs(linker: &mut Linker<WasmHostState>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "aegis",
+            "fs_read_logs",
+            |mut caller: Caller<'_, WasmHostState>,
+             path_ptr: i32,
+             path_len: i32,
+             out_ptr: i32,
+             out_len: i32|
+             -> i32 {
+                if !caller.data().permissions.contains("fs_read_logs") {
+                    return -3;
+                }
+
+                let Some(mem) = caller
+                    .get_export("memory")
+                    .and_then(wasmtime::Extern::into_memory)
+                else {
+                    return -1;
+                };
+
+                let Ok(path_usize) = usize::try_from(path_ptr) else {
+                    return -2;
+                };
+                let Ok(path_len_usize) = usize::try_from(path_len) else {
+                    return -2;
+                };
+                let Ok(out_usize) = usize::try_from(out_ptr) else {
+                    return -2;
+                };
+                let Ok(out_len_usize) = usize::try_from(out_len) else {
+                    return -2;
+                };
+
+                let mut path_bytes = vec![0u8; path_len_usize];
+                if mem
+                    .read(&caller, path_usize, path_bytes.as_mut_slice())
+                    .is_err()
+                {
+                    return -1;
+                }
+                let Ok(path) = String::from_utf8(path_bytes) else {
+                    return -2;
+                };
+                let path = path.trim_matches(char::from(0)).trim().to_string();
+                if path.is_empty() {
+                    return -2;
+                }
+
+                if !is_allowed_log_path(path.as_str()) {
+                    return -5;
+                }
+
+                let Ok(bytes) = std::fs::read(path.as_str()) else {
+                    return -4;
+                };
+
+                let n = bytes.len().min(out_len_usize);
+                if mem.write(&mut caller, out_usize, &bytes[..n]).is_err() {
+                    return -1;
+                }
+                i32::try_from(n).unwrap_or(i32::MAX)
+            },
+        )
+        .map_err(|e| format!("注册 host function aegis.fs_read_logs 失败: {e}"))?;
+    Ok(())
+}
+
+fn add_wasm_host_net_connect_virustotal(linker: &mut Linker<WasmHostState>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "aegis",
+            "net_connect_virustotal",
+            |mut caller: Caller<'_, WasmHostState>, host_ptr: i32, host_len: i32| -> i32 {
+                if !caller.data().permissions.contains("net_connect_virustotal") {
+                    return -3;
+                }
+
+                let Some(mem) = caller
+                    .get_export("memory")
+                    .and_then(wasmtime::Extern::into_memory)
+                else {
+                    return -1;
+                };
+                let Ok(host_usize) = usize::try_from(host_ptr) else {
+                    return -2;
+                };
+                let Ok(host_len_usize) = usize::try_from(host_len) else {
+                    return -2;
+                };
+                let mut host_bytes = vec![0u8; host_len_usize];
+                if mem
+                    .read(&caller, host_usize, host_bytes.as_mut_slice())
+                    .is_err()
+                {
+                    return -1;
+                }
+                let Ok(host) = String::from_utf8(host_bytes) else {
+                    return -2;
+                };
+                let host = host.trim_matches(char::from(0)).trim();
+                if host.eq_ignore_ascii_case("virustotal.com")
+                    || host.eq_ignore_ascii_case("www.virustotal.com")
+                {
+                    0
+                } else {
+                    -5
+                }
+            },
+        )
+        .map_err(|e| format!("注册 host function aegis.net_connect_virustotal 失败: {e}"))?;
+    Ok(())
+}
+
+fn is_allowed_log_path(path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("ProgramData")
+            .map_or_else(|| PathBuf::from("C:\\ProgramData"), PathBuf::from);
+        let allowed = base.join("Aegis").join("logs");
+        let Ok(root) = std::fs::canonicalize(allowed.as_path()) else {
+            return false;
+        };
+        let Ok(resolved) = std::fs::canonicalize(PathBuf::from(path).as_path()) else {
+            return false;
+        };
+        resolved.starts_with(root.as_path())
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(root) = std::fs::canonicalize(PathBuf::from("/var/log").as_path()) else {
+            return false;
+        };
+        let Ok(resolved) = std::fs::canonicalize(PathBuf::from(path).as_path()) else {
+            return false;
+        };
+        resolved.starts_with(root.as_path())
+    }
+}
+
+fn load_native_plugins(
+    base_dir: &Path,
+    security: &common::config::SecurityConfig,
+    org_public_key: &RsaPublicKey,
+) -> Result<Vec<NativePlugin>, String> {
+    let mut plugins: Vec<NativePlugin> = Vec::new();
+    for raw_path in &security.native_plugin_paths {
+        let path = resolve_config_relative_path(base_dir, raw_path.as_str());
+        verify_native_plugin_sig(org_public_key, path.as_path())?;
+
+        #[allow(unsafe_code)]
+        let lib = unsafe { Library::new(path.as_path()) }
+            .map_err(|e| format!("加载 native 插件失败（{}）: {e}", path.display()))?;
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("native_plugin")
+            .to_string();
+
+        plugins.push(NativePlugin {
+            name,
+            path,
+            _library: lib,
+        });
+    }
+    Ok(plugins)
+}
+
+fn verify_native_plugin_sig(org_public_key: &RsaPublicKey, path: &Path) -> Result<(), String> {
+    let sig_path = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| path.with_file_name(format!("{f}.sig")))
+        .ok_or_else(|| format!("native 插件路径缺少文件名: {}", path.display()))?;
+
+    let plugin_bytes = std::fs::read(path)
+        .map_err(|e| format!("读取 native 插件失败（{}）: {e}", path.display()))?;
+    let sig_bytes = std::fs::read(sig_path.as_path())
+        .map_err(|e| format!("读取 native 插件签名失败（{}）: {e}", sig_path.display()))?;
+
+    let signature = parse_sig_bytes(sig_bytes.as_slice())
+        .map_err(|e| format!("解析 native 插件签名失败（{}）: {e}", sig_path.display()))?;
+
+    let verifying_key = RsaPkcs1v15VerifyingKey::<Sha256>::new(org_public_key.clone());
+    verifying_key
+        .verify(plugin_bytes.as_slice(), &signature)
+        .map_err(|e| format!("native 插件签名验证失败（{}）: {e}", path.display()))
+}
+
+fn parse_sig_bytes(sig_bytes: &[u8]) -> Result<RsaPkcs1v15Signature, String> {
+    let text = String::from_utf8(sig_bytes.to_vec()).ok();
+    if let Some(text) = text {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(trimmed.as_bytes())
+                .map_err(|e| format!("base64 解码失败: {e}"))?;
+            return RsaPkcs1v15Signature::try_from(raw.as_slice())
+                .map_err(|e| format!("签名字节长度异常: {e}"));
+        }
+    }
+    RsaPkcs1v15Signature::try_from(sig_bytes).map_err(|e| format!("签名字节长度异常: {e}"))
+}
+
+fn sign_native_plugin_sig(
+    private_key_pem_path: &Path,
+    input_path: &Path,
+    out_path: &Path,
+) -> Result<(), String> {
+    let pem = std::fs::read_to_string(private_key_pem_path).map_err(|e| {
+        format!(
+            "读取签名私钥失败（{}）: {e}",
+            private_key_pem_path.display()
+        )
+    })?;
+    let private_key = RsaPrivateKey::from_pkcs8_pem(pem.as_str())
+        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem.as_str()))
+        .map_err(|e| {
+            format!(
+                "解析 RSA 私钥失败（{}）: {e}",
+                private_key_pem_path.display()
+            )
+        })?;
+
+    let plugin_bytes = std::fs::read(input_path)
+        .map_err(|e| format!("读取待签名插件失败（{}）: {e}", input_path.display()))?;
+
+    let signing_key = RsaPkcs1v15SigningKey::<Sha256>::new(private_key);
+    let signature: RsaPkcs1v15Signature = signing_key.sign(plugin_bytes.as_slice());
+
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_vec());
+    let out_text = format!("{sig_b64}\n");
+    std::fs::write(out_path, out_text.as_bytes())
+        .map_err(|e| format!("写入签名文件失败（{}）: {e}", out_path.display()))?;
+    Ok(())
+}
+
 #[derive(Debug)]
 enum EncryptorCommand {
     Payload(Vec<u8>),
@@ -54,6 +527,10 @@ enum EncryptorCommand {
 
 fn main() {
     if let Err(e) = try_main() {
+        if e.starts_with("Usage:") {
+            println!("{e}");
+            std::process::exit(0);
+        }
         eprintln!("{e}");
         std::process::exit(1);
     }
@@ -71,8 +548,17 @@ async fn run_async() -> Result<(), String> {
     init_telemetry().map_err(|e| format!("初始化日志失败: {e}"))?;
 
     let args = parse_args(std::env::args().skip(1))?;
+    if let Some(sign) = args.sign_plugin.as_ref() {
+        sign_native_plugin_sig(
+            sign.key_pem.as_path(),
+            sign.input_file.as_path(),
+            sign.sig_out.as_path(),
+        )?;
+        return Ok(());
+    }
+
     let (bus_tx, bus_rx) = tokio_mpsc::unbounded_channel::<EncryptorCommand>();
-    let (mgr, rule_mgr, encryptor_tx) = init_runtime(args, &bus_tx)?;
+    let (mgr, rule_mgr, encryptor_tx, _plugins) = init_runtime(args, &bus_tx)?;
 
     tokio::spawn(forward_encryptor(bus_rx, encryptor_tx));
 
@@ -91,7 +577,15 @@ async fn forward_encryptor(mut bus_rx: EventBusRx, encryptor_tx: mpsc::Sender<En
 fn init_runtime(
     args: ProbeArgs,
     bus_tx: &EventBusTx,
-) -> Result<(ConfigManager, RuleManager, mpsc::Sender<EncryptorCommand>), String> {
+) -> Result<
+    (
+        ConfigManager,
+        RuleManager,
+        mpsc::Sender<EncryptorCommand>,
+        PluginManager,
+    ),
+    String,
+> {
     let Some(config_path) = args.config_path else {
         return Err("缺少必需参数: --config <FILE>".to_string());
     };
@@ -129,6 +623,18 @@ fn init_runtime(
     let out_dir = config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), ToOwned::to_owned);
+
+    let plugins = PluginManager::load(out_dir.as_path(), &cfg.security, &org_public_key)?;
+    tracing::info!(
+        wasm_plugins = plugins.wasm_count(),
+        wasm_plugin_names = ?plugins.wasm_plugin_names(),
+        wasm_plugin_entries = ?plugins.wasm_plugin_entries(),
+        native_plugins = plugins.native_count(),
+        native_plugin_names = ?plugins.native_plugin_names(),
+        native_plugin_entries = ?plugins.native_plugin_entries(),
+        "plugins loaded"
+    );
+
     let encryptor_tx = spawn_encryptor(
         out_dir,
         org_public_key,
@@ -154,7 +660,7 @@ fn init_runtime(
         .start_watching()
         .map_err(|e| format!("启动检测规则热加载失败: {e}"))?;
 
-    Ok((mgr, rule_mgr, encryptor_tx))
+    Ok((mgr, rule_mgr, encryptor_tx, plugins))
 }
 
 struct LoopState {
@@ -2250,6 +2756,14 @@ struct ProbeArgs {
     config_path: Option<PathBuf>,
     org_key_path: Option<PathBuf>,
     user_passphrase: Option<String>,
+    sign_plugin: Option<SignPluginArgs>,
+}
+
+#[derive(Debug)]
+struct SignPluginArgs {
+    key_pem: PathBuf,
+    input_file: PathBuf,
+    sig_out: PathBuf,
 }
 
 fn parse_args<I>(mut it: I) -> Result<ProbeArgs, String>
@@ -2259,6 +2773,10 @@ where
     let mut config_path: Option<PathBuf> = None;
     let mut org_key_path: Option<PathBuf> = None;
     let mut user_passphrase: Option<String> = None;
+    let mut sign_plugin = false;
+    let mut sign_key_path: Option<PathBuf> = None;
+    let mut sign_input_path: Option<PathBuf> = None;
+    let mut sign_out_path: Option<PathBuf> = None;
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2276,9 +2794,24 @@ where
                     .ok_or("--user-passphrase/--password 缺少参数".to_string())?;
                 user_passphrase = Some(val);
             }
+            "--sign-plugin" => {
+                sign_plugin = true;
+            }
+            "--key" => {
+                let val = it.next().ok_or("--key 缺少参数".to_string())?;
+                sign_key_path = Some(PathBuf::from(val));
+            }
+            "--input" => {
+                let val = it.next().ok_or("--input 缺少参数".to_string())?;
+                sign_input_path = Some(PathBuf::from(val));
+            }
+            "--out" => {
+                let val = it.next().ok_or("--out 缺少参数".to_string())?;
+                sign_out_path = Some(PathBuf::from(val));
+            }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: probe --config <FILE> [--org-key-path <FILE>] [--user-passphrase <TEXT>]\n"
+                    "Usage:\n  probe --config <FILE> [--org-key-path <FILE>] [--user-passphrase <TEXT>]\n  probe --sign-plugin --key <PEM> --input <DLL/SO> [--out <SIG>]\n"
                         .to_string(),
                 );
             }
@@ -2286,10 +2819,32 @@ where
         }
     }
 
+    let sign_plugin = if sign_plugin {
+        let key_pem = sign_key_path.ok_or("--sign-plugin 需要 --key <PEM>".to_string())?;
+        let input_file = sign_input_path.ok_or("--sign-plugin 需要 --input <FILE>".to_string())?;
+        let sig_out = if let Some(p) = sign_out_path {
+            p
+        } else {
+            let fname = input_file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .ok_or_else(|| format!("input 路径缺少文件名: {}", input_file.display()))?;
+            input_file.with_file_name(format!("{fname}.sig"))
+        };
+        Some(SignPluginArgs {
+            key_pem,
+            input_file,
+            sig_out,
+        })
+    } else {
+        None
+    };
+
     Ok(ProbeArgs {
         config_path,
         org_key_path,
         user_passphrase,
+        sign_plugin,
     })
 }
 
@@ -2298,14 +2853,14 @@ mod tests {
     #[cfg(windows)]
     use super::cim_datetime_to_unix_seconds;
     use super::{
-        LoopState, OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
-        effective_telemetry_interval_sec, validate_key_requirements,
+        EncryptorCommand, LoopState, OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
+        effective_telemetry_interval_sec, encryptor_loop, parse_args, validate_key_requirements,
     };
     use common::config::{GovernorConfig, PidConfig, TokenBucketConfig};
     use common::crypto;
     use common::governor::Governor;
     use common::governor::IoLimiter;
-    use common::protocol::{PayloadEnvelope, payload_envelope};
+    use common::protocol::{PayloadEnvelope, ProcessInfo, payload_envelope};
     use prost::Message;
     use rand::rngs::OsRng;
     use rsa::Oaep;
@@ -2313,6 +2868,9 @@ mod tests {
     use rsa::pkcs8::EncodePublicKey;
     use rsa::traits::PublicKeyParts;
     use sha2::Sha256;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2342,6 +2900,42 @@ mod tests {
         assert!(validate_key_requirements(false, true, false).is_ok());
         assert!(validate_key_requirements(false, false, true).is_ok());
         assert!(validate_key_requirements(false, true, true).is_ok());
+    }
+
+    #[test]
+    fn parse_args_parses_all_flags() -> Result<(), String> {
+        let args = parse_args(
+            vec![
+                "--config",
+                "c.yaml",
+                "--org-key-path",
+                "k.der",
+                "--user-passphrase",
+                "pw",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )?;
+        assert_eq!(args.config_path, Some(PathBuf::from("c.yaml")));
+        assert_eq!(args.org_key_path, Some(PathBuf::from("k.der")));
+        assert_eq!(args.user_passphrase, Some("pw".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag() {
+        let err = parse_args(vec!["--wat"].into_iter().map(str::to_string))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("未知参数"));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_value() {
+        let err = parse_args(vec!["--config"].into_iter().map(str::to_string))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("--config 缺少参数"));
     }
 
     #[test]
@@ -2479,6 +3073,115 @@ mod tests {
     }
 
     #[test]
+    fn encryptor_inserts_system_info_when_first_payload_is_not_system_info() -> Result<(), String> {
+        let mut rng = OsRng;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| format!("生成 RSA 私钥失败: {e}"))?;
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| format!("导出 Org Public Key DER 失败: {e}"))?
+            .as_bytes()
+            .to_vec();
+        let org_key_fp = crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aegis_probe_encryptor_test_{}_{}",
+            std::process::id(),
+            super::unix_timestamp_now()
+        ));
+        std::fs::create_dir_all(dir.as_path())
+            .map_err(|e| format!("创建临时目录失败（{}）: {e}", dir.display()))?;
+
+        let (tx, rx) = mpsc::channel::<EncryptorCommand>();
+        let out_dir = dir.clone();
+        let t = thread::spawn(move || {
+            encryptor_loop(
+                &rx,
+                out_dir.as_path(),
+                &public_key,
+                org_key_fp,
+                "dev",
+                Some("aegis-dev"),
+                0,
+            );
+        });
+
+        let proc_payload = PayloadEnvelope::process_info(ProcessInfo {
+            pid: 123,
+            ppid: 0,
+            name: "p".to_string(),
+            cmdline: "p".to_string(),
+            exe_path: "C:\\p.exe".to_string(),
+            uid: 0,
+            start_time: 1,
+            is_ghost: false,
+            is_mismatched: false,
+            has_floating_code: false,
+            exec_id: 1,
+            exec_id_quality: "test".to_string(),
+        })
+        .encode_to_vec();
+
+        tx.send(EncryptorCommand::Payload(proc_payload))
+            .map_err(|e| format!("发送 payload 失败: {e}"))?;
+        drop(tx);
+        t.join()
+            .map_err(|_| "等待 encryptor 线程失败".to_string())?;
+
+        let mut aes_files: Vec<PathBuf> = std::fs::read_dir(dir.as_path())
+            .map_err(|e| format!("读取临时目录失败（{}）: {e}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "aes"))
+            .collect();
+        aes_files.sort();
+        let path = aes_files
+            .first()
+            .ok_or("未生成 artifact 文件".to_string())?;
+
+        let bytes = std::fs::read(path.as_path())
+            .map_err(|e| format!("读取 artifact 文件失败（{}）: {e}", path.display()))?;
+
+        let rsa_ct_len = private_key.size();
+        let rsa_start = crypto::AES_HEADER_LEN + USER_SLOT_LEN;
+        let rsa_end = rsa_start + rsa_ct_len;
+        let rsa_ct = bytes
+            .get(rsa_start..rsa_end)
+            .ok_or("读取 OrgSlot 失败".to_string())?;
+        let stream = bytes.get(rsa_end..).ok_or("读取 stream 失败".to_string())?;
+
+        let session_key_bytes = private_key
+            .decrypt(Oaep::new::<Sha256>(), rsa_ct)
+            .map_err(|e| format!("RSA-OAEP 解密 SessionKey 失败: {e}"))?;
+        let session_key: [u8; 32] = session_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "OrgSlot 解出的 SessionKey 长度异常".to_string())?;
+
+        let plaintexts = decrypt_stream_to_plaintexts(stream, &session_key, 8)
+            .map_err(|e| format!("解密 stream 失败: {e}"))?;
+        let first = plaintexts.first().ok_or("缺少第一个 chunk".to_string())?;
+        let second = plaintexts.get(1).ok_or("缺少第二个 chunk".to_string())?;
+        let env1 = PayloadEnvelope::decode(first.as_slice())
+            .map_err(|e| format!("PayloadEnvelope 反序列化失败: {e}"))?;
+        let env2 = PayloadEnvelope::decode(second.as_slice())
+            .map_err(|e| format!("PayloadEnvelope 反序列化失败: {e}"))?;
+
+        assert!(matches!(
+            env1.payload,
+            Some(payload_envelope::Payload::SystemInfo(_))
+        ));
+        assert!(matches!(
+            env2.payload,
+            Some(payload_envelope::Payload::ProcessInfo(_))
+        ));
+
+        let _cleanup = std::fs::remove_dir_all(dir.as_path());
+        Ok(())
+    }
+
+    #[test]
     fn probe_artifact_segment_roundtrip_matches_doc06_layout() -> Result<(), String> {
         let mut rng = OsRng;
         let private_key =
@@ -2586,5 +3289,137 @@ mod tests {
             Some(payload_envelope::Payload::SystemInfo(_)) => Ok(()),
             _ => Err("第一个 chunk 必须是 SystemInfo".to_string()),
         }
+    }
+
+    fn write_console_fixture_artifact(
+        dir: &std::path::Path,
+        public_key: &rsa::RsaPublicKey,
+        org_key_fp: u64,
+        passphrase: &str,
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let mut io = IoLimiter::new(0, Instant::now());
+        let mut seg = OpenArtifactSegment::open_new(
+            dir,
+            0,
+            public_key,
+            org_key_fp,
+            "dev",
+            Some(passphrase),
+            &mut io,
+        )?;
+
+        let sys = PayloadEnvelope::system_info(common::protocol::SystemInfo {
+            hostname: "h".to_string(),
+            os_version: "o".to_string(),
+            kernel_version: "k".to_string(),
+            ip_addresses: vec!["10.0.0.1".to_string()],
+            boot_time: 1,
+        })
+        .encode_to_vec();
+        seg.write_encrypted_chunk(&mut io, sys.as_slice())?;
+
+        let parent = PayloadEnvelope::process_info(ProcessInfo {
+            pid: 100,
+            ppid: 0,
+            name: "p100".to_string(),
+            cmdline: "p100".to_string(),
+            exe_path: "C:\\p100.exe".to_string(),
+            uid: 0,
+            start_time: 2_000,
+            is_ghost: false,
+            is_mismatched: false,
+            has_floating_code: false,
+            exec_id: 1,
+            exec_id_quality: "windows:psn".to_string(),
+        })
+        .encode_to_vec();
+        seg.write_encrypted_chunk(&mut io, parent.as_slice())?;
+
+        let child = PayloadEnvelope::process_info(ProcessInfo {
+            pid: 200,
+            ppid: 100,
+            name: "p200".to_string(),
+            cmdline: "p200".to_string(),
+            exe_path: "C:\\p200.exe".to_string(),
+            uid: 0,
+            start_time: 2_500,
+            is_ghost: false,
+            is_mismatched: false,
+            has_floating_code: false,
+            exec_id: 2,
+            exec_id_quality: "windows:psn".to_string(),
+        })
+        .encode_to_vec();
+        seg.write_encrypted_chunk(&mut io, child.as_slice())?;
+
+        Ok(seg.finalize_and_close(&mut io)?)
+    }
+
+    fn assert_console_can_open_and_view(
+        path: &std::path::Path,
+        passphrase: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use console::{
+            Decryption, EdgeType, GetGraphViewportInput, OpenArtifactInput, OpenArtifactOptions,
+            Source, ViewportLevel,
+        };
+
+        let mut c = console::Console::new(console::ConsoleConfig {
+            max_level01_nodes: 20_000,
+            persistence: None,
+        });
+        let out = c.open_artifact(OpenArtifactInput {
+            source: Source::LocalPath {
+                path: path.display().to_string(),
+            },
+            decryption: Decryption::UserPassphrase {
+                passphrase: passphrase.to_string(),
+            },
+            options: OpenArtifactOptions::default(),
+        })?;
+        assert!(out.sealed);
+        assert!(!out.case_id.is_empty());
+        assert!(!out.host_uuid.is_empty());
+        assert!(!out.org_key_fp.is_empty());
+
+        let v = c.get_graph_viewport(GetGraphViewportInput {
+            case_id: out.case_id,
+            level: ViewportLevel::L0,
+            viewport_bbox: None,
+            risk_score_threshold: Some(0),
+            center_node_id: None,
+            page: None,
+        })?;
+        assert!(v.nodes.len() >= 2);
+        assert!(
+            v.edges
+                .iter()
+                .any(|e| matches!(e.r#type, EdgeType::ParentOf))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probe_artifact_can_be_opened_by_console() -> Result<(), Box<dyn std::error::Error>> {
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let public_key_der = public_key.to_public_key_der()?.as_bytes().to_vec();
+        let org_key_fp = crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aegis_probe_console_e2e_test_{}_{}",
+            std::process::id(),
+            crypto::org_pubkey_fingerprint_xxh64(public_key_der.as_slice())
+        ));
+        std::fs::create_dir_all(dir.as_path())?;
+
+        let passphrase = "pw_console";
+        let path =
+            write_console_fixture_artifact(dir.as_path(), &public_key, org_key_fp, passphrase)?;
+        assert_console_can_open_and_view(path.as_path(), passphrase)?;
+
+        let _cleanup = std::fs::remove_dir_all(dir.as_path());
+        Ok(())
     }
 }

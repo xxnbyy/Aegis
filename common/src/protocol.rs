@@ -178,6 +178,21 @@ impl<W: Write> ArtifactBuilder<W> {
         }
     }
 
+    pub fn new_with_state(
+        request_id: u64,
+        writer: W,
+        expected_sequence_id: u64,
+        bytes_written: u64,
+    ) -> Self {
+        Self {
+            request_id,
+            expected_sequence_id,
+            finished: false,
+            writer,
+            bytes_written,
+        }
+    }
+
     #[allow(clippy::missing_errors_doc)]
     pub fn push(&mut self, message: &Message) -> Result<(), AegisError> {
         if self.finished {
@@ -218,6 +233,7 @@ impl<W: Write> ArtifactBuilder<W> {
         self.writer
             .write_all(chunk.bytes.as_slice())
             .map_err(AegisError::IoError)?;
+        self.writer.flush().map_err(AegisError::IoError)?;
         self.bytes_written = self
             .bytes_written
             .saturating_add(chunk.bytes.len().try_into().unwrap_or(0));

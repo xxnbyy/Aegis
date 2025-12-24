@@ -8,22 +8,27 @@ ignore = [
 allow = [
     "AGPL-3.0-only",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSL-1.0",
     "BSD-3-Clause",
     "CC0-1.0",
     "ISC",
     "MIT",
+    "Zlib",
     "Unicode-3.0",
 ]
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "allow"
 highlight = "all"
 skip = [
     { name = "bitflags" },
     { name = "getrandom" },
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
+    { name = "wasm-encoder" },
     { name = "windows" },
     { name = "windows-core" },
     { name = "windows-sys" },
