@@ -244,3 +244,35 @@ pub struct ListTasksOutput {
     pub tasks: Vec<TaskSummary>,
     pub next_cursor: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetAiInsightInput {
+    pub case_id: String,
+    pub node_id: Option<String>,
+    pub context: Option<AiContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiContext {
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiInsight {
+    pub summary: String,
+    pub risk_score: u32,
+    pub risk_level: String,
+    pub technique: Option<String>,
+    pub is_suggestion: bool,
+    pub is_risky: bool,
+    pub suggested_mitigation_cmd: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetAiInsightOutput {
+    pub case_id: String,
+    pub insight: AiInsight,
+    pub warnings: Option<Vec<String>>,
+}

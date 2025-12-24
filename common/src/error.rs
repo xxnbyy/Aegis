@@ -17,6 +17,8 @@ pub enum ErrorCode {
     Plugin501,
     Plugin502,
     Ai301,
+    Ai302,
+    Ai303,
     Ai399,
 }
 
@@ -38,6 +40,8 @@ impl ErrorCode {
             ErrorCode::Plugin501 => "AEGIS-PLUGIN-501",
             ErrorCode::Plugin502 => "AEGIS-PLUGIN-502",
             ErrorCode::Ai301 => "AEGIS-AI-301",
+            ErrorCode::Ai302 => "AEGIS-AI-302",
+            ErrorCode::Ai303 => "AEGIS-AI-303",
             ErrorCode::Ai399 => "AEGIS-AI-399",
         }
     }
@@ -103,6 +107,8 @@ mod tests {
             (ErrorCode::Plugin501, "AEGIS-PLUGIN-501"),
             (ErrorCode::Plugin502, "AEGIS-PLUGIN-502"),
             (ErrorCode::Ai301, "AEGIS-AI-301"),
+            (ErrorCode::Ai302, "AEGIS-AI-302"),
+            (ErrorCode::Ai303, "AEGIS-AI-303"),
             (ErrorCode::Ai399, "AEGIS-AI-399"),
             (ErrorCode::Crypto003, "AEGIS-CRYPTO-003"),
         ];

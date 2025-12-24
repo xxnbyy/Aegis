@@ -6,10 +6,10 @@ mod store;
 mod store_tests;
 
 pub use model::{
-    AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, AnalyzeEvidenceOutput, BBox, CloseCaseOutput,
-    Decryption, EdgeType, GetGraphViewportInput, GetGraphViewportOutput, GetTaskInput,
-    GetTaskOutput, GraphEdge, GraphNode, ListTasksInput, ListTasksOutput, NodeType,
-    OpenArtifactInput, OpenArtifactOptions, OpenArtifactOutput, Source, TaskStatus, TaskSummary,
-    ViewportLevel,
+    AiContext, AiInsight, AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, AnalyzeEvidenceOutput,
+    BBox, CloseCaseOutput, Decryption, EdgeType, GetAiInsightInput, GetAiInsightOutput,
+    GetGraphViewportInput, GetGraphViewportOutput, GetTaskInput, GetTaskOutput, GraphEdge,
+    GraphNode, ListTasksInput, ListTasksOutput, NodeType, OpenArtifactInput, OpenArtifactOptions,
+    OpenArtifactOutput, Source, TaskStatus, TaskSummary, ViewportLevel,
 };
 pub use store::{Console, ConsoleConfig, PersistenceConfig};
