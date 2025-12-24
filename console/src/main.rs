@@ -10,12 +10,14 @@ use axum::{Json, Router};
 use common::error::{AegisError, ErrorCode};
 use console::{
     AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, AnalyzeEvidenceOutput, CloseCaseOutput,
-    Console, ConsoleConfig, GetGraphViewportInput, GetGraphViewportOutput, GetTaskInput,
-    GetTaskOutput, ListTasksInput, ListTasksOutput, OpenArtifactInput, OpenArtifactOutput,
-    PersistenceConfig,
+    Console, ConsoleConfig, Decryption, GetAiInsightInput, GetAiInsightOutput,
+    GetGraphViewportInput, GetGraphViewportOutput, GetTaskInput, GetTaskOutput, ListTasksInput,
+    ListTasksOutput, OpenArtifactInput, OpenArtifactOptions, OpenArtifactOutput, PersistenceConfig,
+    Source,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -95,6 +97,137 @@ fn post_analyze_evidence(st: &AppState, out: &mut AnalyzeEvidenceOutput) {
     }
 }
 
+fn send_ws(events: &broadcast::Sender<WsEvent>, channel: &str, payload: serde_json::Value) {
+    drop(events.send(WsEvent {
+        channel: channel.to_string(),
+        payload,
+    }));
+}
+
+async fn run_ai_job(st: AppState, task_id: String, decryption: Decryption) {
+    let open_task_id = task_id.clone();
+    let decryption_for_open = decryption.clone();
+    let open = run_console(st.console.clone(), move |c| {
+        c.open_artifact(OpenArtifactInput {
+            source: Source::TaskId {
+                task_id: open_task_id,
+            },
+            decryption: decryption_for_open,
+            options: OpenArtifactOptions::default(),
+        })
+    })
+    .await;
+
+    let open_out = match open {
+        Ok(v) => v,
+        Err((_, e)) => {
+            send_ws(
+                &st.events,
+                "ai:failed",
+                json!({
+                    "task_id": task_id.as_str(),
+                    "percent": 0u32,
+                    "message": e.0.message,
+                    "code": e.0.code,
+                }),
+            );
+            return;
+        }
+    };
+
+    let case_id = open_out.case_id;
+    send_ws(
+        &st.events,
+        "ai:progress",
+        json!({
+            "task_id": task_id.as_str(),
+            "case_id": case_id.as_str(),
+            "percent": 20u32,
+            "message": "case opened",
+        }),
+    );
+
+    send_ws(
+        &st.events,
+        "ai:progress",
+        json!({
+            "task_id": task_id.as_str(),
+            "case_id": case_id.as_str(),
+            "percent": 60u32,
+            "message": "generating insight",
+        }),
+    );
+
+    let case_id_for_call = case_id.clone();
+    let insight = run_console(st.console.clone(), move |c| {
+        c.get_ai_insight(GetAiInsightInput {
+            case_id: case_id_for_call,
+            node_id: None,
+            context: None,
+        })
+    })
+    .await;
+
+    match insight {
+        Ok(v) => {
+            send_ws(
+                &st.events,
+                "ai:done",
+                json!({
+                    "task_id": task_id.as_str(),
+                    "case_id": v.case_id,
+                    "percent": 100u32,
+                    "message": "done",
+                    "insight": v.insight,
+                    "warnings": v.warnings,
+                }),
+            );
+        }
+        Err((_, e)) => {
+            send_ws(
+                &st.events,
+                "ai:failed",
+                json!({
+                    "task_id": task_id.as_str(),
+                    "case_id": case_id.as_str(),
+                    "percent": 0u32,
+                    "message": e.0.message,
+                    "code": e.0.code,
+                }),
+            );
+        }
+    }
+}
+
+fn spawn_ai_job(st: AppState, task_id: &str) {
+    let task_id_for_job = task_id.to_string();
+    send_ws(
+        &st.events,
+        "ai:progress",
+        json!({
+            "task_id": task_id,
+            "percent": 1u32,
+            "message": "queued",
+        }),
+    );
+
+    let Some(decryption) = resolve_ai_job_decryption() else {
+        send_ws(
+            &st.events,
+            "ai:failed",
+            json!({
+                "task_id": task_id,
+                "percent": 0u32,
+                "message": "missing decryption for AI job",
+                "code": ErrorCode::Console711.as_str(),
+            }),
+        );
+        return;
+    };
+
+    tokio::spawn(run_ai_job(st, task_id_for_job, decryption));
+}
+
 fn map_err(e: AegisError) -> (StatusCode, Json<ErrorBody>) {
     match e {
         AegisError::ProtocolError { message, code } | AegisError::CryptoError { message, code } => {
@@ -113,6 +246,8 @@ fn map_err(e: AegisError) -> (StatusCode, Json<ErrorBody>) {
                     | ErrorCode::Plugin501
                     | ErrorCode::Plugin502
                     | ErrorCode::Ai301
+                    | ErrorCode::Ai302
+                    | ErrorCode::Ai303
                     | ErrorCode::Ai399,
                 ) => StatusCode::BAD_REQUEST,
                 Some(ErrorCode::Console733) | None => StatusCode::INTERNAL_SERVER_ERROR,
@@ -158,7 +293,43 @@ fn resolve_path(p: PathBuf) -> PathBuf {
         .join(p)
 }
 
+fn read_env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn resolve_ai_job_decryption() -> Option<Decryption> {
+    let pem = read_env_trimmed("AEGIS_CONSOLE_ORG_PRIVATE_KEY_PEM")
+        .or_else(|| read_env_trimmed("AEGIS_ORG_PRIVATE_KEY_PEM"));
+    if let Some(pem) = pem {
+        return Some(Decryption::OrgPrivateKeyPem { pem });
+    }
+
+    let pem_path = read_env_trimmed("AEGIS_CONSOLE_ORG_PRIVATE_KEY_PATH")
+        .or_else(|| read_env_trimmed("AEGIS_ORG_PRIVATE_KEY_PATH"));
+    if let Some(path) = pem_path {
+        let p = resolve_path(PathBuf::from(path));
+        if let Ok(contents) = fs::read_to_string(p.as_path()) {
+            let pem = contents.trim().to_string();
+            if !pem.is_empty() {
+                return Some(Decryption::OrgPrivateKeyPem { pem });
+            }
+        }
+    }
+
+    let passphrase = read_env_trimmed("AEGIS_CONSOLE_USER_PASSPHRASE")
+        .or_else(|| read_env_trimmed("AEGIS_USER_PASSPHRASE"))
+        .or_else(|| read_env_trimmed("AEGIS_DEV_PASSWORD"));
+    passphrase.map(|passphrase| Decryption::UserPassphrase { passphrase })
+}
+
 fn cors_layer(addr: SocketAddr) -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
+    let allow_headers = [
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::HeaderName::from_static("x-aegis-ai-key"),
+    ];
     if let Ok(v) = std::env::var("AEGIS_CONSOLE_CORS_ALLOW_ORIGIN") {
         let v = v.trim();
         let allow_origin = if v == "*" {
@@ -169,7 +340,7 @@ fn cors_layer(addr: SocketAddr) -> Result<Option<CorsLayer>, Box<dyn std::error:
         let cors = CorsLayer::new()
             .allow_origin(allow_origin)
             .allow_methods([Method::GET, Method::POST])
-            .allow_headers([axum::http::header::CONTENT_TYPE]);
+            .allow_headers(allow_headers);
         return Ok(Some(cors));
     }
 
@@ -177,7 +348,7 @@ fn cors_layer(addr: SocketAddr) -> Result<Option<CorsLayer>, Box<dyn std::error:
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods([Method::GET, Method::POST])
-            .allow_headers([axum::http::header::CONTENT_TYPE]);
+            .allow_headers(allow_headers);
         return Ok(Some(cors));
     }
 
@@ -246,6 +417,9 @@ async fn analyze_evidence(
 ) -> ApiResult<AnalyzeEvidenceOutput> {
     let mut out = run_console(st.console.clone(), move |c| c.analyze_evidence(input)).await?;
     post_analyze_evidence(&st, &mut out);
+    if out.status == console::TaskStatus::Pending {
+        spawn_ai_job(st.clone(), out.task_id.as_str());
+    }
     Ok(Json(out))
 }
 
@@ -281,6 +455,9 @@ async fn analyze_evidence_bin(
 
     let mut out = run_console(st.console.clone(), move |c| c.analyze_evidence(input)).await?;
     post_analyze_evidence(&st, &mut out);
+    if out.status == console::TaskStatus::Pending {
+        spawn_ai_job(st.clone(), out.task_id.as_str());
+    }
     Ok(Json(out))
 }
 
@@ -301,6 +478,22 @@ async fn list_tasks(
     Json(input): Json<ListTasksInput>,
 ) -> ApiResult<ListTasksOutput> {
     let out = run_console(st.console.clone(), move |c| c.list_tasks(input)).await?;
+    Ok(Json(out))
+}
+
+async fn get_ai_insight(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(input): Json<GetAiInsightInput>,
+) -> ApiResult<GetAiInsightOutput> {
+    let ai_key = headers
+        .get("x-aegis-ai-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let out = run_console(st.console.clone(), move |c| {
+        c.get_ai_insight_with_ai_key(input, ai_key)
+    })
+    .await?;
     Ok(Json(out))
 }
 
@@ -362,6 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/close_case/:case_id", post(close_case))
         .route("/api/v1/analyze_evidence", post(analyze_evidence))
         .route("/api/v1/analyze_evidence_bin", post(analyze_evidence_bin))
+        .route("/api/v1/get_ai_insight", post(get_ai_insight))
         .route("/api/v1/get_task", post(get_task))
         .route("/api/v1/list_tasks", post(list_tasks))
         .with_state(st);

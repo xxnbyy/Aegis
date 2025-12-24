@@ -11,9 +11,9 @@ use rsa::pkcs8::EncodePublicKey;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::model::{
-    AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, Decryption, GetGraphViewportInput,
-    GetTaskInput, ListTasksInput, OpenArtifactInput, OpenArtifactOptions, Page, Source, TaskStatus,
-    ViewportLevel,
+    AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, Decryption, GetAiInsightInput,
+    GetGraphViewportInput, GetTaskInput, ListTasksInput, OpenArtifactInput, OpenArtifactOptions,
+    Page, Source, TaskStatus, ViewportLevel,
 };
 use crate::store::PersistenceConfig;
 use crate::{Console, ConsoleConfig};
@@ -569,6 +569,33 @@ fn open_artifact_rejects_invalid_hmac_when_required() -> Result<(), Box<dyn std:
             },
         }),
         ErrorCode::Crypto003,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn get_ai_insight_requires_loaded_case() -> Result<(), Box<dyn std::error::Error>> {
+    let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_ai")?;
+    let dir = tempfile::tempdir()?;
+    let p = dir.path().join("t_ai.aes");
+    std::fs::write(p.as_path(), artifact_bytes.as_slice())?;
+
+    let mut c = Console::new(ConsoleConfig::default());
+    let out = c.open_artifact(OpenArtifactInput {
+        source: Source::LocalPath {
+            path: p.display().to_string(),
+        },
+        decryption: Decryption::None,
+        options: OpenArtifactOptions::default(),
+    })?;
+
+    expect_err_code(
+        c.get_ai_insight(GetAiInsightInput {
+            case_id: out.case_id,
+            node_id: None,
+            context: None,
+        }),
+        ErrorCode::Console711,
     )?;
     Ok(())
 }

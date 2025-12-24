@@ -13,22 +13,25 @@ use common::protocol::{
     MessagePayload, PayloadEnvelope, ProcessInfo, payload_envelope,
 };
 use prost::Message;
+use regex::{Captures, Regex};
+use reqwest::Client;
 use rsa::Oaep;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::traits::PublicKeyParts;
-use sha2::Sha256;
+use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use crate::model::{
-    AnalyzeEvidenceChunkInput, AnalyzeEvidenceOutput, CloseCaseOutput, Decryption, EdgeType,
-    GetGraphViewportInput, GetGraphViewportOutput, GetTaskInput, GetTaskOutput, GraphEdge,
-    GraphNode, ListTasksInput, ListTasksOutput, NodeType, OpenArtifactInput, OpenArtifactOutput,
-    Source, TaskStatus, TaskSummary, ViewportLevel,
+    AiInsight, AnalyzeEvidenceChunkInput, AnalyzeEvidenceOutput, CloseCaseOutput, Decryption,
+    EdgeType, GetAiInsightInput, GetAiInsightOutput, GetGraphViewportInput, GetGraphViewportOutput,
+    GetTaskInput, GetTaskOutput, GraphEdge, GraphNode, ListTasksInput, ListTasksOutput, NodeType,
+    OpenArtifactInput, OpenArtifactOutput, Source, TaskStatus, TaskSummary, ViewportLevel,
 };
 
 const USER_SLOT_LEN: usize = 40;
@@ -65,6 +68,7 @@ pub struct Console {
     cases: HashMap<String, CaseData>,
     persistence: Option<PersistenceState>,
     upload_sessions: HashMap<u64, UploadSession>,
+    ai_cache: HashMap<String, AiInsight>,
 }
 
 struct UploadSession {
@@ -94,6 +98,7 @@ impl Console {
             cases: HashMap::new(),
             persistence: None,
             upload_sessions: HashMap::new(),
+            ai_cache: HashMap::new(),
         }
     }
 
@@ -234,6 +239,82 @@ impl Console {
     pub fn close_case(&mut self, case_id: &str) -> Result<CloseCaseOutput, AegisError> {
         let _ = self.cases.remove(case_id);
         Ok(CloseCaseOutput { ok: true })
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn get_ai_insight(
+        &mut self,
+        input: GetAiInsightInput,
+    ) -> Result<GetAiInsightOutput, AegisError> {
+        self.get_ai_insight_with_ai_key(input, None)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn get_ai_insight_with_ai_key(
+        &mut self,
+        input: GetAiInsightInput,
+        ai_key: Option<String>,
+    ) -> Result<GetAiInsightOutput, AegisError> {
+        let ai_key = ai_key.filter(|s| !s.trim().is_empty());
+        let case_id = input.case_id;
+        let node_id = input.node_id.clone().unwrap_or_default();
+        let max_chars = input
+            .context
+            .as_ref()
+            .and_then(|c| c.max_chars)
+            .unwrap_or_else(ai_max_prompt_chars);
+        let cache_key = format!("{case_id}|node={node_id}|max_chars={max_chars}");
+
+        let (brief, warnings) = {
+            let case =
+                self.cases
+                    .get(case_id.as_str())
+                    .ok_or_else(|| AegisError::ProtocolError {
+                        message: "case_id 不存在".to_string(),
+                        code: Some(ErrorCode::Console721),
+                    })?;
+
+            if !case.loaded {
+                return Err(AegisError::ProtocolError {
+                    message: "case 未加载图谱（仅 header）".to_string(),
+                    code: Some(ErrorCode::Console711),
+                });
+            }
+
+            if let Some(insight) = self.ai_cache.get(cache_key.as_str()) {
+                return Ok(GetAiInsightOutput {
+                    case_id,
+                    insight: insight.clone(),
+                    warnings: if case.warnings.is_empty() {
+                        None
+                    } else {
+                        Some(case.warnings.clone())
+                    },
+                });
+            }
+
+            (
+                build_ai_brief(case, input.node_id.as_deref()),
+                if case.warnings.is_empty() {
+                    None
+                } else {
+                    Some(case.warnings.clone())
+                },
+            )
+        };
+
+        let compacted = ai_compact_base64_blobs(brief.as_str());
+        let sanitized = ai_sanitize_text(compacted.as_str());
+        let prompt = token_limit_head_tail(sanitized.as_str(), max_chars);
+        let mut insight = ai_generate_insight(prompt.as_str(), ai_key.as_deref())?;
+        insight = validate_and_clean_ai_insight(insight)?;
+
+        self.ai_cache.insert(cache_key, insight.clone());
+        Ok(GetAiInsightOutput {
+            case_id,
+            insight,
+            warnings,
+        })
     }
 
     fn validate_evidence_chunk_size(size: usize) -> Result<(), AegisError> {
@@ -2237,6 +2318,665 @@ fn unix_timestamp_now_ms() -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn ai_max_prompt_chars() -> usize {
+    let Ok(v) = std::env::var("AEGIS_AI_MAX_PROMPT_CHARS") else {
+        return 24_000;
+    };
+    v.trim().parse::<usize>().unwrap_or(24_000)
+}
+
+fn ai_timeout_secs() -> u64 {
+    let Ok(v) = std::env::var("AEGIS_AI_TIMEOUT_SECS") else {
+        return 30;
+    };
+    v.trim().parse::<u64>().unwrap_or(30)
+}
+
+fn build_node_attr_brief(n: &GraphNode) -> String {
+    let mut attrs = String::new();
+    if let Some(pid) = n.attrs.get("pid") {
+        write!(attrs, " pid={pid}").unwrap_or(());
+    }
+    if let Some(ppid) = n.attrs.get("ppid") {
+        write!(attrs, " ppid={ppid}").unwrap_or(());
+    }
+    if let Some(exe) = n.attrs.get("exe_path") {
+        write!(attrs, " exe_path={exe}").unwrap_or(());
+    }
+    if let Some(cmdline) = n.attrs.get("cmdline") {
+        write!(attrs, " cmdline={cmdline}").unwrap_or(());
+    }
+    attrs
+}
+
+fn append_case_header(out: &mut String, case: &CaseData) {
+    writeln!(
+        out,
+        "sealed: {}, loaded: {}, warnings: {}",
+        case.sealed,
+        case.loaded,
+        case.warnings.len()
+    )
+    .unwrap_or(());
+    for w in case.warnings.iter().take(20) {
+        writeln!(out, "warning: {w}").unwrap_or(());
+    }
+
+    writeln!(
+        out,
+        "graph: nodes={}, edges={}",
+        case.graph.nodes.len(),
+        case.graph.edges.len()
+    )
+    .unwrap_or(());
+}
+
+fn append_focus_section(out: &mut String, case: &CaseData, node_id: &str) {
+    let Some(n) = case.graph.nodes.get(node_id) else {
+        writeln!(out, "focus_node: missing node_id={node_id}").unwrap_or(());
+        return;
+    };
+
+    let attrs = build_node_attr_brief(n);
+    writeln!(
+        out,
+        "focus_node: id={} type={:?} risk={} label={} tags={:?}{}",
+        n.id, n.r#type, n.risk_score, n.label, n.tags, attrs
+    )
+    .unwrap_or(());
+
+    let mut neighbor_ids: HashSet<String> = HashSet::new();
+    for e in &case.graph.edges {
+        if e.src == node_id {
+            neighbor_ids.insert(e.dst.clone());
+        } else if e.dst == node_id {
+            neighbor_ids.insert(e.src.clone());
+        }
+        if neighbor_ids.len() >= 20 {
+            break;
+        }
+    }
+    for nid in neighbor_ids {
+        if let Some(nn) = case.graph.nodes.get(nid.as_str()) {
+            writeln!(
+                out,
+                "neighbor_node: id={} type={:?} risk={} label={} tags={:?}",
+                nn.id, nn.r#type, nn.risk_score, nn.label, nn.tags
+            )
+            .unwrap_or(());
+        }
+    }
+
+    for e in case
+        .graph
+        .edges
+        .iter()
+        .filter(|e| e.src == node_id || e.dst == node_id)
+        .take(80)
+    {
+        writeln!(
+            out,
+            "focus_edge: src={} dst={} type={:?} confidence={}",
+            e.src, e.dst, e.r#type, e.confidence
+        )
+        .unwrap_or(());
+    }
+}
+
+fn append_top_risky_nodes(out: &mut String, case: &CaseData) {
+    let mut nodes: Vec<&GraphNode> = case.graph.nodes.values().collect();
+    nodes.sort_by_key(|n| std::cmp::Reverse(n.risk_score));
+    for n in nodes.into_iter().take(50) {
+        let attrs = build_node_attr_brief(n);
+        writeln!(
+            out,
+            "node: id={} type={:?} risk={} label={} tags={:?}{}",
+            n.id, n.r#type, n.risk_score, n.label, n.tags, attrs
+        )
+        .unwrap_or(());
+    }
+}
+
+fn append_top_confidence_edges(out: &mut String, case: &CaseData) {
+    let mut edges = case.graph.edges.clone();
+    edges.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    for e in edges.into_iter().take(80) {
+        writeln!(
+            out,
+            "edge: src={} dst={} type={:?} confidence={}",
+            e.src, e.dst, e.r#type, e.confidence
+        )
+        .unwrap_or(());
+    }
+}
+
+fn build_ai_brief(case: &CaseData, focus_node_id: Option<&str>) -> String {
+    let mut out = String::new();
+    append_case_header(&mut out, case);
+    if let Some(node_id) = focus_node_id {
+        append_focus_section(&mut out, case, node_id);
+    }
+    append_top_risky_nodes(&mut out, case);
+    append_top_confidence_edges(&mut out, case);
+
+    out
+}
+
+fn ai_sanitize_text(text: &str) -> String {
+    let mut out = text.to_string();
+
+    if let Ok(re) = Regex::new(r"(?i)([A-Z]:\\Users\\)([^\\\s]+)") {
+        out = re
+            .replace_all(out.as_str(), |caps: &Captures| {
+                format!("{}<USER>", &caps[1])
+            })
+            .to_string();
+    }
+
+    if let Ok(re) = Regex::new(r"(?i)(/home/)([^/\s]+)") {
+        out = re
+            .replace_all(out.as_str(), |caps: &Captures| {
+                format!("{}<USER>", &caps[1])
+            })
+            .to_string();
+    }
+
+    if let Ok(re) = Regex::new(r"(?i)(/Users/)([^/\s]+)") {
+        out = re
+            .replace_all(out.as_str(), |caps: &Captures| {
+                format!("{}<USER>", &caps[1])
+            })
+            .to_string();
+    }
+
+    if let Ok(re) = Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}\b") {
+        out = re.replace_all(out.as_str(), "[EMAIL]").to_string();
+    }
+
+    if let Ok(re) = Regex::new(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}\b") {
+        out = re
+            .replace_all(out.as_str(), |caps: &Captures| {
+                let s = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+                let Some(last) = s.rsplit('.').next() else {
+                    return s.to_string();
+                };
+                let ext = last.to_ascii_lowercase();
+                if matches!(
+                    ext.as_str(),
+                    "dll"
+                        | "exe"
+                        | "sys"
+                        | "log"
+                        | "txt"
+                        | "dat"
+                        | "json"
+                        | "xml"
+                        | "html"
+                        | "js"
+                        | "css"
+                        | "rs"
+                        | "py"
+                ) {
+                    s.to_string()
+                } else {
+                    "[DOMAIN]".to_string()
+                }
+            })
+            .to_string();
+    }
+
+    sanitize_ipv4(out.as_str())
+}
+
+fn sanitize_ipv4(text: &str) -> String {
+    let Ok(re) =
+        Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+    else {
+        return text.to_string();
+    };
+
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut public_map: HashMap<String, usize> = HashMap::new();
+    let mut next_public_idx = 1usize;
+
+    for m in re.find_iter(text) {
+        out.push_str(&text[last..m.start()]);
+        let ip = &text[m.start()..m.end()];
+        if is_private_ipv4(ip) {
+            out.push_str("[INTERNAL_IP]");
+        } else {
+            let idx = *public_map.entry(ip.to_string()).or_insert_with(|| {
+                let v = next_public_idx;
+                next_public_idx += 1;
+                v
+            });
+            out.push_str(format!("[PUBLIC_IP_{idx}]").as_str());
+        }
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn is_private_ipv4(ip: &str) -> bool {
+    let mut it = ip.split('.');
+    let Some(a) = it.next().and_then(|v| v.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(b) = it.next().and_then(|v| v.parse::<u8>().ok()) else {
+        return false;
+    };
+    if a == 10 {
+        return true;
+    }
+    if a == 172 && (16..=31).contains(&b) {
+        return true;
+    }
+    a == 192 && b == 168
+}
+
+fn ai_compact_base64_blobs(text: &str) -> String {
+    let Ok(re) = Regex::new(r"[A-Za-z0-9+/]{512,}={0,2}") else {
+        return text.to_string();
+    };
+    re.replace_all(text, |caps: &Captures| {
+        let blob = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(blob.as_bytes());
+        let hash = hasher.finalize();
+        format!("[BASE64_BLOB: SHA256={hash:x}]")
+    })
+    .to_string()
+}
+
+fn token_limit_head_tail(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let placeholder = "\n... [TRUNCATED] ...\n";
+    let placeholder_chars = placeholder.chars().count();
+    let mut head_chars = (max_chars * 2) / 10;
+    let mut tail_chars = (max_chars * 2) / 10;
+    if head_chars + tail_chars + placeholder_chars > max_chars {
+        let available = max_chars.saturating_sub(placeholder_chars);
+        head_chars = available / 2;
+        tail_chars = available.saturating_sub(head_chars);
+    }
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}{placeholder}{tail}")
+}
+
+fn ai_system_prompt() -> &'static str {
+    r#"You are a security analyst. Return STRICT JSON only, no markdown, no code fences.
+Schema:
+{
+  "summary": string,
+  "risk_score": number,
+  "risk_level": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO",
+  "technique": string|null,
+  "is_suggestion": true,
+  "is_risky": boolean,
+  "suggested_mitigation_cmd": string|null
+}
+Rules:
+- is_suggestion must be true.
+- suggested_mitigation_cmd is optional; if uncertain set null.
+- Keep summary concise."#
+}
+
+fn read_env_url(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn is_likely_container() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/self/cgroup").is_ok_and(|s| {
+            let s = s.to_lowercase();
+            s.contains("docker") || s.contains("containerd") || s.contains("kubepods")
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn probe_ollama_base_url(rt: &Runtime, client: &Client, base: &str) -> bool {
+    let url = format!("{}/api/tags", base.trim_end_matches('/'));
+    rt.block_on(async {
+        let resp = client
+            .get(url)
+            .timeout(std::time::Duration::from_millis(800))
+            .send()
+            .await;
+        resp.is_ok_and(|r| r.status().is_success())
+    })
+}
+
+fn resolve_ollama_base_url(rt: &Runtime, client: &Client) -> String {
+    if let Some(v) = read_env_url("AEGIS_AI_OLLAMA_URL").or_else(|| read_env_url("AI_PROVIDER_URL"))
+    {
+        return v;
+    }
+
+    let in_container = is_likely_container();
+    let candidates = if in_container {
+        [
+            "http://host.docker.internal:11434",
+            "http://localhost:11434",
+        ]
+    } else {
+        [
+            "http://localhost:11434",
+            "http://host.docker.internal:11434",
+        ]
+    };
+    for base in candidates {
+        if probe_ollama_base_url(rt, client, base) {
+            return base.to_string();
+        }
+    }
+    candidates[0].to_string()
+}
+
+fn ai_call_ollama(
+    rt: &Runtime,
+    client: &Client,
+    system_prompt: &str,
+    prompt: &str,
+) -> Result<(String, String), AegisError> {
+    let base = resolve_ollama_base_url(rt, client);
+    let model = std::env::var("AEGIS_AI_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".to_string());
+    let url = format!("{}/api/generate", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": format!("{system_prompt}\n\nINPUT:\n{prompt}"),
+        "stream": false
+    });
+    let raw = rt
+        .block_on(async {
+            let resp = client.post(url).json(&body).send().await?;
+            resp.error_for_status()?.json::<JsonValue>().await
+        })
+        .map_err(|e| AegisError::ProtocolError {
+            message: format!("ollama 请求失败: {e}"),
+            code: Some(ErrorCode::Ai301),
+        })?;
+    let text = raw
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok((text, model))
+}
+
+fn ai_call_openai(
+    rt: &Runtime,
+    client: &Client,
+    system_prompt: &str,
+    prompt: &str,
+    api_key_override: Option<&str>,
+) -> Result<(String, String), AegisError> {
+    let base = std::env::var("AEGIS_AI_OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let api_key = api_key_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("AEGIS_AI_OPENAI_API_KEY").ok())
+        .ok_or_else(|| AegisError::ProtocolError {
+            message: "missing AEGIS_AI_OPENAI_API_KEY".to_string(),
+            code: Some(ErrorCode::Ai302),
+        })?;
+    let model = std::env::var("AEGIS_AI_OPENAI_MODEL").map_err(|_| AegisError::ProtocolError {
+        message: "missing AEGIS_AI_OPENAI_MODEL".to_string(),
+        code: Some(ErrorCode::Ai301),
+    })?;
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role":"system","content": system_prompt},
+            {"role":"user","content": prompt}
+        ]
+    });
+    let raw = rt.block_on(async {
+        let resp = client
+            .post(url)
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AegisError::ProtocolError {
+                message: format!("openai 请求失败: {e}"),
+                code: Some(ErrorCode::Ai301),
+            })?;
+
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let detail = resp.text().await.unwrap_or_default();
+            let msg = if detail.trim().is_empty() {
+                "openai API key 无效或无权限".to_string()
+            } else {
+                format!("openai API key 无效或无权限: {detail}")
+            };
+            return Err(AegisError::ProtocolError {
+                message: msg,
+                code: Some(ErrorCode::Ai302),
+            });
+        }
+
+        resp.error_for_status_ref()
+            .map_err(|e| AegisError::ProtocolError {
+                message: format!("openai 请求失败: {e}"),
+                code: Some(ErrorCode::Ai301),
+            })?;
+
+        resp.json::<JsonValue>()
+            .await
+            .map_err(|e| AegisError::ProtocolError {
+                message: format!("openai 响应解析失败: {e}"),
+                code: Some(ErrorCode::Ai301),
+            })
+    })?;
+    let text = raw
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok((text, model))
+}
+
+fn ai_generate_insight(prompt: &str, ai_key: Option<&str>) -> Result<AiInsight, AegisError> {
+    let provider = std::env::var("AEGIS_AI_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
+    ai_generate_insight_with_provider(prompt, provider.as_str(), ai_key)
+}
+
+fn ai_generate_insight_with_provider(
+    prompt: &str,
+    provider: &str,
+    ai_key: Option<&str>,
+) -> Result<AiInsight, AegisError> {
+    let provider = provider.trim().to_lowercase();
+    if provider.is_empty() || provider == "none" || provider == "disabled" {
+        return Err(AegisError::ProtocolError {
+            message: "AI provider disabled".to_string(),
+            code: Some(ErrorCode::Ai301),
+        });
+    }
+
+    let system_prompt = ai_system_prompt();
+
+    let rt = Runtime::new().map_err(|e| AegisError::ProtocolError {
+        message: format!("创建 runtime 失败: {e}"),
+        code: Some(ErrorCode::Ai301),
+    })?;
+
+    let timeout = std::time::Duration::from_secs(ai_timeout_secs());
+    let client =
+        Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| AegisError::ProtocolError {
+                message: format!("创建 AI client 失败: {e}"),
+                code: Some(ErrorCode::Ai301),
+            })?;
+
+    let (raw, model) = if provider == "ollama" {
+        let (raw, model) = ai_call_ollama(&rt, &client, system_prompt, prompt)?;
+        (raw, Some(model))
+    } else if provider == "openai" {
+        let (raw, model) = ai_call_openai(&rt, &client, system_prompt, prompt, ai_key)?;
+        (raw, Some(model))
+    } else {
+        return Err(AegisError::ProtocolError {
+            message: format!("unknown AI provider: {provider}"),
+            code: Some(ErrorCode::Ai301),
+        });
+    };
+
+    let json_str = extract_json_object(raw.as_str()).ok_or_else(|| AegisError::ProtocolError {
+        message: "AI 输出不是有效 JSON".to_string(),
+        code: Some(ErrorCode::Ai303),
+    })?;
+    let mut insight: AiInsight =
+        serde_json::from_str(json_str.as_str()).map_err(|e| AegisError::ProtocolError {
+            message: format!("AI JSON 反序列化失败: {e}"),
+            code: Some(ErrorCode::Ai303),
+        })?;
+    insight.provider = Some(provider);
+    insight.model = model;
+    Ok(insight)
+}
+
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(text[start..=end].to_string())
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn is_risky_cmd(cmd: &str) -> bool {
+    let s = cmd.to_lowercase();
+    let patterns = [
+        r"\brm\s+-rf\b",
+        r"\bdel\s+/f\b",
+        r"\bformat\b",
+        r"\bmkfs\.",
+        r"\bshutdown\b",
+        r"\breboot\b",
+        r"\bpoweroff\b",
+        r"\breg\s+delete\b",
+        r"\bsc\s+delete\b",
+    ];
+    for p in patterns {
+        if Regex::new(p).ok().is_some_and(|re| re.is_match(s.as_str())) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_risk_level(level: &str, score: u32) -> String {
+    let lv = level.trim().to_uppercase();
+    if matches!(lv.as_str(), "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO") {
+        return lv;
+    }
+    if score >= 90 {
+        "CRITICAL".to_string()
+    } else if score >= 70 {
+        "HIGH".to_string()
+    } else if score >= 40 {
+        "MEDIUM".to_string()
+    } else if score >= 10 {
+        "LOW".to_string()
+    } else {
+        "INFO".to_string()
+    }
+}
+
+fn validate_and_clean_ai_insight(mut insight: AiInsight) -> Result<AiInsight, AegisError> {
+    let summary = insight.summary.trim();
+    if summary.is_empty() {
+        return Err(AegisError::ProtocolError {
+            message: "AI summary 为空".to_string(),
+            code: Some(ErrorCode::Ai303),
+        });
+    }
+    let mut score = insight.risk_score;
+    if score > 100 {
+        score = 100;
+    }
+
+    let mut technique = insight
+        .technique
+        .take()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if technique.as_ref().is_some_and(|s| s.len() > 128) {
+        technique = technique.map(|s| s.chars().take(128).collect());
+    }
+
+    let mut cmd = insight
+        .suggested_mitigation_cmd
+        .take()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if cmd.as_ref().is_some_and(|s| s.len() > 512) {
+        cmd = cmd.map(|s| s.chars().take(512).collect());
+    }
+
+    let mut is_risky = insight.is_risky;
+    if let Some(c) = cmd.as_deref() {
+        is_risky = is_risky || is_risky_cmd(c);
+    }
+
+    let risk_level = normalize_risk_level(insight.risk_level.as_str(), score);
+
+    insight.summary = escape_html(summary);
+    insight.risk_score = score;
+    insight.risk_level = risk_level;
+    insight.technique = technique.map(|s| escape_html(s.as_str()));
+    insight.is_suggestion = true;
+    insight.is_risky = is_risky;
+    insight.suggested_mitigation_cmd = cmd.map(|s| escape_html(s.as_str()));
+
+    Ok(insight)
+}
+
 fn default_data_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -2271,5 +3011,71 @@ fn map_console_733(e: AegisError, context: &str) -> AegisError {
     AegisError::ProtocolError {
         message: format!("{context}: {msg}"),
         code: Some(ErrorCode::Console733),
+    }
+}
+
+#[cfg(test)]
+mod ai_tests {
+    use super::*;
+
+    #[test]
+    fn token_limiter_head_tail_keeps_bounds() {
+        let s = "a".repeat(10_000);
+        let out = token_limit_head_tail(s.as_str(), 1000);
+        assert!(out.chars().count() <= 1000);
+        assert!(out.contains("[TRUNCATED]"));
+    }
+
+    #[test]
+    fn validate_and_clean_marks_risky_cmd() -> Result<(), AegisError> {
+        let insight = AiInsight {
+            summary: "<b>hi</b>".to_string(),
+            risk_score: 200,
+            risk_level: "x".to_string(),
+            technique: Some("T1059.001".to_string()),
+            is_suggestion: false,
+            is_risky: false,
+            suggested_mitigation_cmd: Some("rm -rf /".to_string()),
+            provider: None,
+            model: None,
+        };
+        let out = validate_and_clean_ai_insight(insight)?;
+        assert_eq!(out.risk_score, 100);
+        assert!(out.is_suggestion);
+        assert!(out.is_risky);
+        assert!(!out.summary.contains('<'));
+        Ok(())
+    }
+
+    #[test]
+    fn ai_generate_disabled_returns_ai301() {
+        let r = ai_generate_insight_with_provider("x", "none", None);
+        assert!(matches!(
+            r,
+            Err(AegisError::ProtocolError {
+                code: Some(ErrorCode::Ai301),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ai_sanitize_hides_ip_domain_and_username() {
+        let input = concat!(
+            "connect 192.168.1.10 to example.com; mail a@b.com; ",
+            "file kernel32.dll; path C:\\Users\\Alice\\a.txt; /home/bob/.ssh"
+        );
+        let out = ai_sanitize_text(input);
+        assert!(!out.contains("192.168.1.10"));
+        assert!(out.contains("[INTERNAL_IP]"));
+        assert!(!out.contains("example.com"));
+        assert!(out.contains("[DOMAIN]"));
+        assert!(!out.contains("a@b.com"));
+        assert!(out.contains("[EMAIL]"));
+        assert!(out.contains("kernel32.dll"));
+        assert!(!out.contains("C:\\Users\\Alice"));
+        assert!(out.contains("C:\\Users\\<USER>\\a.txt"));
+        assert!(!out.contains("/home/bob/"));
+        assert!(out.contains("/home/<USER>/.ssh"));
     }
 }
