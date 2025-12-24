@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 libloading = "0.8"
-wasmtime = { version = "29", features = ["cranelift"] }
+wasmtime = { version = "=38.0.4", features = ["cranelift"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
