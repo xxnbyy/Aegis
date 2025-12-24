@@ -71,6 +71,26 @@ fn upload_bytes_as_evidence(
     Ok(task_id.ok_or("missing task_id")?)
 }
 
+fn assert_err_code(err: AegisError, expected: ErrorCode) -> Result<(), Box<dyn std::error::Error>> {
+    match err {
+        AegisError::ProtocolError {
+            code: Some(code), ..
+        }
+        | AegisError::CryptoError {
+            code: Some(code), ..
+        } if code == expected => Ok(()),
+        other => Err(format!("unexpected error: {other:?}").into()),
+    }
+}
+
+fn expect_err_code<T>(
+    r: Result<T, AegisError>,
+    expected: ErrorCode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let err = r.err().ok_or("expected error")?;
+    assert_err_code(err, expected)
+}
+
 fn build_test_artifact_bytes(
     passphrase: &str,
 ) -> Result<(Vec<u8>, String, String), Box<dyn std::error::Error>> {
@@ -162,24 +182,16 @@ fn analyze_evidence_rejects_sequence0_without_meta() -> Result<(), Box<dyn std::
     let dir = tempfile::tempdir()?;
     let mut c = new_console_with_temp_persistence(&dir);
 
-    let err = c
-        .analyze_evidence(AnalyzeEvidenceChunkInput {
+    expect_err_code(
+        c.analyze_evidence(AnalyzeEvidenceChunkInput {
             request_id: 1000,
             sequence_id: 0,
             is_last: true,
             bytes: vec![1, 2, 3],
             meta: None,
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        AegisError::ProtocolError {
-            code: Some(ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
     Ok(())
 }
 
@@ -189,8 +201,8 @@ fn analyze_evidence_rejects_too_large_chunk() -> Result<(), Box<dyn std::error::
     let mut c = new_console_with_temp_persistence(&dir);
 
     let bytes = vec![0u8; MAX_ARTIFACT_CHUNK_SIZE.saturating_add(1)];
-    let err = c
-        .analyze_evidence(AnalyzeEvidenceChunkInput {
+    expect_err_code(
+        c.analyze_evidence(AnalyzeEvidenceChunkInput {
             request_id: 1001,
             sequence_id: 0,
             is_last: true,
@@ -199,17 +211,9 @@ fn analyze_evidence_rejects_too_large_chunk() -> Result<(), Box<dyn std::error::
                 filename: Some("big.aes".to_string()),
                 content_type: Some("application/octet-stream".to_string()),
             }),
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        AegisError::ProtocolError {
-            code: Some(ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
     Ok(())
 }
 
@@ -231,24 +235,16 @@ fn analyze_evidence_out_of_order_marks_task_failed_and_deletes_file()
         }),
     })?;
 
-    let err = c
-        .analyze_evidence(AnalyzeEvidenceChunkInput {
+    expect_err_code(
+        c.analyze_evidence(AnalyzeEvidenceChunkInput {
             request_id: 2000,
             sequence_id: 2,
             is_last: true,
             bytes: artifact_bytes[64..80].to_vec(),
             meta: None,
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        AegisError::ProtocolError {
-            code: Some(ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
 
     let t = c.get_task(GetTaskInput {
         task_id: out0.task_id.clone(),
@@ -270,24 +266,16 @@ fn analyze_evidence_rejects_chunks_after_finished_upload() -> Result<(), Box<dyn
 
     let _task_id = upload_bytes_as_evidence(&mut c, 3000, artifact_bytes.as_slice())?;
 
-    let err = c
-        .analyze_evidence(AnalyzeEvidenceChunkInput {
+    expect_err_code(
+        c.analyze_evidence(AnalyzeEvidenceChunkInput {
             request_id: 3000,
             sequence_id: 999,
             is_last: true,
             bytes: vec![1, 2, 3],
             meta: None,
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        AegisError::ProtocolError {
-            code: Some(ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
     Ok(())
 }
 
@@ -320,8 +308,8 @@ fn analyze_evidence_rehydrates_restart_failed_task() -> Result<(), Box<dyn std::
     assert_eq!(t.status, TaskStatus::Failed);
     assert_eq!(t.next_sequence_id, Some(1));
 
-    let err = c2
-        .analyze_evidence(AnalyzeEvidenceChunkInput {
+    expect_err_code(
+        c2.analyze_evidence(AnalyzeEvidenceChunkInput {
             request_id: 4000,
             sequence_id: 0,
             is_last: true,
@@ -330,17 +318,9 @@ fn analyze_evidence_rehydrates_restart_failed_task() -> Result<(), Box<dyn std::
                 filename: Some("retry.aes".to_string()),
                 content_type: Some("application/octet-stream".to_string()),
             }),
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        AegisError::ProtocolError {
-            code: Some(ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
 
     let out = c2.analyze_evidence(AnalyzeEvidenceChunkInput {
         request_id: 4000,
@@ -403,8 +383,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         Ok::<(), sqlx::Error>(())
     })?;
 
-    let err = c
-        .open_artifact(OpenArtifactInput {
+    expect_err_code(
+        c.open_artifact(OpenArtifactInput {
             source: Source::TaskId {
                 task_id: "evil_task".to_string(),
             },
@@ -414,17 +394,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
             options: OpenArtifactOptions {
                 verify_hmac_if_present: true,
             },
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        AegisError::ProtocolError {
-            code: Some(ErrorCode::Console733),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console733,
+    )?;
     Ok(())
 }
 
@@ -554,8 +526,8 @@ fn close_case_makes_case_unavailable() -> Result<(), Box<dyn std::error::Error>>
     })?;
     c.close_case(out.case_id.as_str())?;
 
-    let err = c
-        .get_graph_viewport(GetGraphViewportInput {
+    expect_err_code(
+        c.get_graph_viewport(GetGraphViewportInput {
             case_id: out.case_id,
             level: ViewportLevel::L2,
             viewport_bbox: None,
@@ -565,16 +537,9 @@ fn close_case_makes_case_unavailable() -> Result<(), Box<dyn std::error::Error>>
                 cursor: None,
                 limit: Some(10),
             }),
-        })
-        .err()
-        .ok_or("expected error")?;
-    assert!(matches!(
-        err,
-        common::error::AegisError::ProtocolError {
-            code: Some(common::error::ErrorCode::Console721),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console721,
+    )?;
     Ok(())
 }
 
@@ -591,8 +556,8 @@ fn open_artifact_rejects_invalid_hmac_when_required() -> Result<(), Box<dyn std:
     std::fs::write(p.as_path(), artifact_bytes.as_slice())?;
 
     let mut c = Console::new(ConsoleConfig::default());
-    let err = c
-        .open_artifact(OpenArtifactInput {
+    expect_err_code(
+        c.open_artifact(OpenArtifactInput {
             source: Source::LocalPath {
                 path: p.display().to_string(),
             },
@@ -602,17 +567,9 @@ fn open_artifact_rejects_invalid_hmac_when_required() -> Result<(), Box<dyn std:
             options: OpenArtifactOptions {
                 verify_hmac_if_present: true,
             },
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        common::error::AegisError::CryptoError {
-            code: Some(common::error::ErrorCode::Crypto003),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Crypto003,
+    )?;
     Ok(())
 }
 
@@ -685,8 +642,8 @@ fn analyze_evidence_rejects_duplicate_request_id() -> Result<(), Box<dyn std::er
 
     let _task_id = upload_bytes_as_evidence(&mut c, 9, artifact_bytes.as_slice())?;
 
-    let err = c
-        .analyze_evidence(AnalyzeEvidenceChunkInput {
+    expect_err_code(
+        c.analyze_evidence(AnalyzeEvidenceChunkInput {
             request_id: 9,
             sequence_id: 0,
             is_last: true,
@@ -695,17 +652,9 @@ fn analyze_evidence_rejects_duplicate_request_id() -> Result<(), Box<dyn std::er
                 filename: Some("dup.aes".to_string()),
                 content_type: None,
             }),
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        common::error::AegisError::ProtocolError {
-            code: Some(common::error::ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
 
     Ok(())
 }
@@ -732,8 +681,8 @@ fn open_artifact_by_task_id_rejects_failed_task() -> Result<(), Box<dyn std::err
     };
 
     let mut c2 = new_console_with_temp_persistence(&dir);
-    let err = c2
-        .open_artifact(OpenArtifactInput {
+    expect_err_code(
+        c2.open_artifact(OpenArtifactInput {
             source: Source::TaskId {
                 task_id: task_id.clone(),
             },
@@ -741,17 +690,9 @@ fn open_artifact_by_task_id_rejects_failed_task() -> Result<(), Box<dyn std::err
                 passphrase: "pw7".to_string(),
             },
             options: OpenArtifactOptions::default(),
-        })
-        .err()
-        .ok_or("expected error")?;
-
-    assert!(matches!(
-        err,
-        common::error::AegisError::ProtocolError {
-            code: Some(common::error::ErrorCode::Console731),
-            ..
-        }
-    ));
+        }),
+        ErrorCode::Console731,
+    )?;
 
     Ok(())
 }

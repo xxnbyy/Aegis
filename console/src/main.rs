@@ -44,6 +44,31 @@ struct ErrorBody {
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ErrorBody>)>;
 
+async fn run_console<T, F>(
+    console: Arc<Mutex<Console>>,
+    f: F,
+) -> Result<T, (StatusCode, Json<ErrorBody>)>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Console) -> Result<T, AegisError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
+            message: "console lock poisoned".to_string(),
+            code: Some(ErrorCode::Console733),
+        })?;
+        f(&mut c)
+    })
+    .await
+    .map_err(|e| {
+        map_err(AegisError::ProtocolError {
+            message: format!("join error: {e}"),
+            code: Some(ErrorCode::Console733),
+        })
+    })?
+    .map_err(map_err)
+}
+
 fn map_err(e: AegisError) -> (StatusCode, Json<ErrorBody>) {
     match e {
         AegisError::ProtocolError { message, code } | AegisError::CryptoError { message, code } => {
@@ -169,22 +194,7 @@ async fn open_artifact(
     State(st): State<AppState>,
     Json(input): Json<OpenArtifactInput>,
 ) -> ApiResult<OpenArtifactOutput> {
-    let console = st.console.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.open_artifact(input)
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let out = run_console(st.console.clone(), move |c| c.open_artifact(input)).await?;
     Ok(Json(out))
 }
 
@@ -192,22 +202,7 @@ async fn get_graph_viewport(
     State(st): State<AppState>,
     Json(input): Json<GetGraphViewportInput>,
 ) -> ApiResult<GetGraphViewportOutput> {
-    let console = st.console.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        let c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.get_graph_viewport(input)
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let out = run_console(st.console.clone(), move |c| c.get_graph_viewport(input)).await?;
     Ok(Json(out))
 }
 
@@ -215,22 +210,7 @@ async fn close_case(
     State(st): State<AppState>,
     Path(case_id): Path<String>,
 ) -> ApiResult<CloseCaseOutput> {
-    let console = st.console.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.close_case(case_id.as_str())
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let out = run_console(st.console.clone(), move |c| c.close_case(case_id.as_str())).await?;
     Ok(Json(out))
 }
 
@@ -238,22 +218,7 @@ async fn analyze_evidence(
     State(st): State<AppState>,
     Json(input): Json<AnalyzeEvidenceChunkInput>,
 ) -> ApiResult<AnalyzeEvidenceOutput> {
-    let console = st.console.clone();
-    let mut out = tokio::task::spawn_blocking(move || {
-        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.analyze_evidence(input)
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let mut out = run_console(st.console.clone(), move |c| c.analyze_evidence(input)).await?;
 
     let task_id = out.task_id.clone();
     let status = out.status.clone();
@@ -312,22 +277,7 @@ async fn analyze_evidence_bin(
         meta,
     };
 
-    let console = st.console.clone();
-    let mut out = tokio::task::spawn_blocking(move || {
-        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.analyze_evidence(input)
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let mut out = run_console(st.console.clone(), move |c| c.analyze_evidence(input)).await?;
 
     let task_id = out.task_id.clone();
     let status = out.status.clone();
@@ -360,22 +310,7 @@ async fn get_task(
     State(st): State<AppState>,
     Json(input): Json<GetTaskInput>,
 ) -> ApiResult<GetTaskOutput> {
-    let console = st.console.clone();
-    let mut out = tokio::task::spawn_blocking(move || {
-        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.get_task(input)
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let mut out = run_console(st.console.clone(), move |c| c.get_task(input)).await?;
 
     if !st.expose_paths {
         out.case_path = None;
@@ -387,22 +322,7 @@ async fn list_tasks(
     State(st): State<AppState>,
     Json(input): Json<ListTasksInput>,
 ) -> ApiResult<ListTasksOutput> {
-    let console = st.console.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        let mut c = console.lock().map_err(|_| AegisError::ProtocolError {
-            message: "console lock poisoned".to_string(),
-            code: Some(ErrorCode::Console733),
-        })?;
-        c.list_tasks(input)
-    })
-    .await
-    .map_err(|e| {
-        map_err(AegisError::ProtocolError {
-            message: format!("join error: {e}"),
-            code: Some(ErrorCode::Console733),
-        })
-    })?
-    .map_err(map_err)?;
+    let out = run_console(st.console.clone(), move |c| c.list_tasks(input)).await?;
     Ok(Json(out))
 }
 
