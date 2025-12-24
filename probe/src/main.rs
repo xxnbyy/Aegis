@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_kw::Kek;
+use base64::Engine as _;
 use common::config::{ConfigManager, load_yaml_file};
 use common::crypto;
 use common::detection::{RuleManager, RuleSet};
@@ -21,15 +22,27 @@ use common::protocol::{
 };
 use common::telemetry::{init_telemetry, sample_memory_usage_mb};
 use hmac::Mac;
+use libloading::Library;
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rsa::Oaep;
+use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
+use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaPkcs1v15VerifyingKey};
+use rsa::pkcs8::DecodePrivateKey;
 use rsa::pkcs8::DecodePublicKey;
+use rsa::signature::SignatureEncoding;
+use rsa::signature::Signer;
+use rsa::signature::Verifier;
+use serde::Deserialize;
 use sha2::Sha256;
+use std::collections::HashSet;
 use tokio::sync::mpsc as tokio_mpsc;
+use wasmtime::{Caller, Engine, Linker, Module, Store};
 #[cfg(windows)]
 use wmi::WMIConnection;
 
@@ -44,6 +57,466 @@ const USER_SLOT_LEN: usize = 40;
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 type EventBusTx = tokio_mpsc::UnboundedSender<EncryptorCommand>;
 type EventBusRx = tokio_mpsc::UnboundedReceiver<EncryptorCommand>;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct WasmManifest {
+    permissions: Vec<String>,
+}
+
+struct PluginManager {
+    wasm: Option<WasmRuntime>,
+    native: Vec<NativePlugin>,
+}
+
+struct WasmRuntime {
+    plugins: Vec<WasmPlugin>,
+}
+
+#[derive(Clone)]
+struct WasmHostState {
+    permissions: HashSet<String>,
+}
+
+struct WasmPlugin {
+    name: String,
+    module_path: PathBuf,
+    permissions: Vec<String>,
+}
+
+struct NativePlugin {
+    name: String,
+    path: PathBuf,
+    _library: Library,
+}
+
+impl PluginManager {
+    fn load(
+        base_dir: &Path,
+        security: &common::config::SecurityConfig,
+        org_public_key: &RsaPublicKey,
+    ) -> Result<Self, String> {
+        let wasm = if security.wasm_plugin_paths.is_empty() {
+            None
+        } else {
+            Some(load_wasm_runtime(base_dir, security)?)
+        };
+
+        let native = if security.native_plugin_paths.is_empty() {
+            Vec::new()
+        } else {
+            if !security.enable_native_plugins {
+                return Err(
+                    "security.enable_native_plugins=false 时不允许加载 native_plugin_paths"
+                        .to_string(),
+                );
+            }
+            load_native_plugins(base_dir, security, org_public_key)?
+        };
+
+        Ok(Self { wasm, native })
+    }
+
+    fn wasm_count(&self) -> usize {
+        self.wasm.as_ref().map_or(0, |r| r.plugins.len())
+    }
+
+    fn native_count(&self) -> usize {
+        self.native.len()
+    }
+
+    fn wasm_plugin_names(&self) -> Vec<String> {
+        self.wasm.as_ref().map_or_else(Vec::new, |r| {
+            r.plugins.iter().map(|p| p.name.clone()).collect()
+        })
+    }
+
+    fn native_plugin_names(&self) -> Vec<String> {
+        self.native.iter().map(|p| p.name.clone()).collect()
+    }
+
+    fn wasm_plugin_entries(&self) -> Vec<(String, String, usize)> {
+        self.wasm.as_ref().map_or_else(Vec::new, |r| {
+            r.plugins
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.module_path.display().to_string(),
+                        p.permissions.len(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn native_plugin_entries(&self) -> Vec<(String, String)> {
+        self.native
+            .iter()
+            .map(|p| (p.name.clone(), p.path.display().to_string()))
+            .collect()
+    }
+}
+
+fn resolve_config_relative_path(base_dir: &Path, raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return p;
+    }
+    base_dir.join(p)
+}
+
+fn load_wasm_runtime(
+    base_dir: &Path,
+    security: &common::config::SecurityConfig,
+) -> Result<WasmRuntime, String> {
+    let cfg = wasmtime::Config::new();
+    let engine = Engine::new(&cfg).map_err(|e| format!("初始化 Wasm engine 失败: {e}"))?;
+
+    let allow: HashSet<&str> = security
+        .wasm_permissions_allow
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut plugins: Vec<WasmPlugin> = Vec::new();
+    for raw_path in &security.wasm_plugin_paths {
+        let module_path = resolve_config_relative_path(base_dir, raw_path.as_str());
+        let manifest_path = module_path
+            .parent()
+            .ok_or_else(|| format!("Wasm 插件路径缺少 parent: {}", module_path.display()))?
+            .join("manifest.json");
+        let manifest_text = std::fs::read_to_string(manifest_path.as_path()).map_err(|e| {
+            format!(
+                "读取 Wasm manifest 失败（{}）: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: WasmManifest = serde_json::from_str(manifest_text.as_str()).map_err(|e| {
+            format!(
+                "解析 Wasm manifest 失败（{}）: {e}",
+                manifest_path.display()
+            )
+        })?;
+
+        if allow.is_empty() && !manifest.permissions.is_empty() {
+            return Err(format!(
+                "Wasm 插件权限未配置 allowlist，但插件声明了 permissions: {}",
+                module_path.display()
+            ));
+        }
+
+        for perm in &manifest.permissions {
+            if !allow.contains(perm.as_str()) {
+                return Err(format!(
+                    "Wasm 插件权限不被允许: perm={perm}, plugin={}",
+                    module_path.display()
+                ));
+            }
+        }
+
+        let module = Module::from_file(&engine, module_path.as_path())
+            .map_err(|e| format!("加载 Wasm module 失败（{}）: {e}", module_path.display()))?;
+
+        let perms: HashSet<String> = manifest.permissions.iter().cloned().collect();
+        let linker = build_wasm_linker(&engine, &perms)?;
+        let mut store = Store::new(
+            &engine,
+            WasmHostState {
+                permissions: perms.clone(),
+            },
+        );
+        linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| format!("Wasm instantiate 失败（{}）: {e}", module_path.display()))?;
+
+        let name = module_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .or_else(|| module_path.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("wasm_plugin")
+            .to_string();
+
+        plugins.push(WasmPlugin {
+            name,
+            module_path,
+            permissions: manifest.permissions,
+        });
+    }
+
+    Ok(WasmRuntime { plugins })
+}
+
+fn build_wasm_linker(
+    engine: &Engine,
+    permissions: &HashSet<String>,
+) -> Result<Linker<WasmHostState>, String> {
+    let mut linker = Linker::<WasmHostState>::new(engine);
+
+    add_wasm_host_now_ms(&mut linker)?;
+
+    if permissions.contains("fs_read_logs") {
+        add_wasm_host_fs_read_logs(&mut linker)?;
+    }
+
+    if permissions.contains("net_connect_virustotal") {
+        add_wasm_host_net_connect_virustotal(&mut linker)?;
+    }
+
+    Ok(linker)
+}
+
+fn add_wasm_host_now_ms(linker: &mut Linker<WasmHostState>) -> Result<(), String> {
+    linker
+        .func_wrap("aegis", "now_ms", |_: Caller<'_, WasmHostState>| -> i64 {
+            let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+                return 0;
+            };
+            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+        })
+        .map_err(|e| format!("注册 host function aegis.now_ms 失败: {e}"))?;
+    Ok(())
+}
+
+fn add_wasm_host_fs_read_logs(linker: &mut Linker<WasmHostState>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "aegis",
+            "fs_read_logs",
+            |mut caller: Caller<'_, WasmHostState>,
+             path_ptr: i32,
+             path_len: i32,
+             out_ptr: i32,
+             out_len: i32|
+             -> i32 {
+                if !caller.data().permissions.contains("fs_read_logs") {
+                    return -3;
+                }
+
+                let Some(mem) = caller
+                    .get_export("memory")
+                    .and_then(wasmtime::Extern::into_memory)
+                else {
+                    return -1;
+                };
+
+                let Ok(path_usize) = usize::try_from(path_ptr) else {
+                    return -2;
+                };
+                let Ok(path_len_usize) = usize::try_from(path_len) else {
+                    return -2;
+                };
+                let Ok(out_usize) = usize::try_from(out_ptr) else {
+                    return -2;
+                };
+                let Ok(out_len_usize) = usize::try_from(out_len) else {
+                    return -2;
+                };
+
+                let mut path_bytes = vec![0u8; path_len_usize];
+                if mem
+                    .read(&caller, path_usize, path_bytes.as_mut_slice())
+                    .is_err()
+                {
+                    return -1;
+                }
+                let Ok(path) = String::from_utf8(path_bytes) else {
+                    return -2;
+                };
+                let path = path.trim_matches(char::from(0)).trim().to_string();
+                if path.is_empty() {
+                    return -2;
+                }
+
+                if !is_allowed_log_path(path.as_str()) {
+                    return -5;
+                }
+
+                let Ok(bytes) = std::fs::read(path.as_str()) else {
+                    return -4;
+                };
+
+                let n = bytes.len().min(out_len_usize);
+                if mem.write(&mut caller, out_usize, &bytes[..n]).is_err() {
+                    return -1;
+                }
+                i32::try_from(n).unwrap_or(i32::MAX)
+            },
+        )
+        .map_err(|e| format!("注册 host function aegis.fs_read_logs 失败: {e}"))?;
+    Ok(())
+}
+
+fn add_wasm_host_net_connect_virustotal(linker: &mut Linker<WasmHostState>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "aegis",
+            "net_connect_virustotal",
+            |mut caller: Caller<'_, WasmHostState>, host_ptr: i32, host_len: i32| -> i32 {
+                if !caller.data().permissions.contains("net_connect_virustotal") {
+                    return -3;
+                }
+
+                let Some(mem) = caller
+                    .get_export("memory")
+                    .and_then(wasmtime::Extern::into_memory)
+                else {
+                    return -1;
+                };
+                let Ok(host_usize) = usize::try_from(host_ptr) else {
+                    return -2;
+                };
+                let Ok(host_len_usize) = usize::try_from(host_len) else {
+                    return -2;
+                };
+                let mut host_bytes = vec![0u8; host_len_usize];
+                if mem
+                    .read(&caller, host_usize, host_bytes.as_mut_slice())
+                    .is_err()
+                {
+                    return -1;
+                }
+                let Ok(host) = String::from_utf8(host_bytes) else {
+                    return -2;
+                };
+                let host = host.trim_matches(char::from(0)).trim();
+                if host.eq_ignore_ascii_case("virustotal.com")
+                    || host.eq_ignore_ascii_case("www.virustotal.com")
+                {
+                    0
+                } else {
+                    -5
+                }
+            },
+        )
+        .map_err(|e| format!("注册 host function aegis.net_connect_virustotal 失败: {e}"))?;
+    Ok(())
+}
+
+fn is_allowed_log_path(path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("ProgramData")
+            .map_or_else(|| PathBuf::from("C:\\ProgramData"), PathBuf::from);
+        let allowed = base.join("Aegis").join("logs");
+        let Ok(root) = std::fs::canonicalize(allowed.as_path()) else {
+            return false;
+        };
+        let Ok(resolved) = std::fs::canonicalize(PathBuf::from(path).as_path()) else {
+            return false;
+        };
+        resolved.starts_with(root.as_path())
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(root) = std::fs::canonicalize(PathBuf::from("/var/log").as_path()) else {
+            return false;
+        };
+        let Ok(resolved) = std::fs::canonicalize(PathBuf::from(path).as_path()) else {
+            return false;
+        };
+        resolved.starts_with(root.as_path())
+    }
+}
+
+fn load_native_plugins(
+    base_dir: &Path,
+    security: &common::config::SecurityConfig,
+    org_public_key: &RsaPublicKey,
+) -> Result<Vec<NativePlugin>, String> {
+    let mut plugins: Vec<NativePlugin> = Vec::new();
+    for raw_path in &security.native_plugin_paths {
+        let path = resolve_config_relative_path(base_dir, raw_path.as_str());
+        verify_native_plugin_sig(org_public_key, path.as_path())?;
+
+        #[allow(unsafe_code)]
+        let lib = unsafe { Library::new(path.as_path()) }
+            .map_err(|e| format!("加载 native 插件失败（{}）: {e}", path.display()))?;
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("native_plugin")
+            .to_string();
+
+        plugins.push(NativePlugin {
+            name,
+            path,
+            _library: lib,
+        });
+    }
+    Ok(plugins)
+}
+
+fn verify_native_plugin_sig(org_public_key: &RsaPublicKey, path: &Path) -> Result<(), String> {
+    let sig_path = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| path.with_file_name(format!("{f}.sig")))
+        .ok_or_else(|| format!("native 插件路径缺少文件名: {}", path.display()))?;
+
+    let plugin_bytes = std::fs::read(path)
+        .map_err(|e| format!("读取 native 插件失败（{}）: {e}", path.display()))?;
+    let sig_bytes = std::fs::read(sig_path.as_path())
+        .map_err(|e| format!("读取 native 插件签名失败（{}）: {e}", sig_path.display()))?;
+
+    let signature = parse_sig_bytes(sig_bytes.as_slice())
+        .map_err(|e| format!("解析 native 插件签名失败（{}）: {e}", sig_path.display()))?;
+
+    let verifying_key = RsaPkcs1v15VerifyingKey::<Sha256>::new(org_public_key.clone());
+    verifying_key
+        .verify(plugin_bytes.as_slice(), &signature)
+        .map_err(|e| format!("native 插件签名验证失败（{}）: {e}", path.display()))
+}
+
+fn parse_sig_bytes(sig_bytes: &[u8]) -> Result<RsaPkcs1v15Signature, String> {
+    let text = String::from_utf8(sig_bytes.to_vec()).ok();
+    if let Some(text) = text {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(trimmed.as_bytes())
+                .map_err(|e| format!("base64 解码失败: {e}"))?;
+            return RsaPkcs1v15Signature::try_from(raw.as_slice())
+                .map_err(|e| format!("签名字节长度异常: {e}"));
+        }
+    }
+    RsaPkcs1v15Signature::try_from(sig_bytes).map_err(|e| format!("签名字节长度异常: {e}"))
+}
+
+fn sign_native_plugin_sig(
+    private_key_pem_path: &Path,
+    input_path: &Path,
+    out_path: &Path,
+) -> Result<(), String> {
+    let pem = std::fs::read_to_string(private_key_pem_path).map_err(|e| {
+        format!(
+            "读取签名私钥失败（{}）: {e}",
+            private_key_pem_path.display()
+        )
+    })?;
+    let private_key = RsaPrivateKey::from_pkcs8_pem(pem.as_str())
+        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem.as_str()))
+        .map_err(|e| {
+            format!(
+                "解析 RSA 私钥失败（{}）: {e}",
+                private_key_pem_path.display()
+            )
+        })?;
+
+    let plugin_bytes = std::fs::read(input_path)
+        .map_err(|e| format!("读取待签名插件失败（{}）: {e}", input_path.display()))?;
+
+    let signing_key = RsaPkcs1v15SigningKey::<Sha256>::new(private_key);
+    let signature: RsaPkcs1v15Signature = signing_key.sign(plugin_bytes.as_slice());
+
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_vec());
+    let out_text = format!("{sig_b64}\n");
+    std::fs::write(out_path, out_text.as_bytes())
+        .map_err(|e| format!("写入签名文件失败（{}）: {e}", out_path.display()))?;
+    Ok(())
+}
 
 #[derive(Debug)]
 enum EncryptorCommand {
@@ -75,8 +548,17 @@ async fn run_async() -> Result<(), String> {
     init_telemetry().map_err(|e| format!("初始化日志失败: {e}"))?;
 
     let args = parse_args(std::env::args().skip(1))?;
+    if let Some(sign) = args.sign_plugin.as_ref() {
+        sign_native_plugin_sig(
+            sign.key_pem.as_path(),
+            sign.input_file.as_path(),
+            sign.sig_out.as_path(),
+        )?;
+        return Ok(());
+    }
+
     let (bus_tx, bus_rx) = tokio_mpsc::unbounded_channel::<EncryptorCommand>();
-    let (mgr, rule_mgr, encryptor_tx) = init_runtime(args, &bus_tx)?;
+    let (mgr, rule_mgr, encryptor_tx, _plugins) = init_runtime(args, &bus_tx)?;
 
     tokio::spawn(forward_encryptor(bus_rx, encryptor_tx));
 
@@ -95,7 +577,15 @@ async fn forward_encryptor(mut bus_rx: EventBusRx, encryptor_tx: mpsc::Sender<En
 fn init_runtime(
     args: ProbeArgs,
     bus_tx: &EventBusTx,
-) -> Result<(ConfigManager, RuleManager, mpsc::Sender<EncryptorCommand>), String> {
+) -> Result<
+    (
+        ConfigManager,
+        RuleManager,
+        mpsc::Sender<EncryptorCommand>,
+        PluginManager,
+    ),
+    String,
+> {
     let Some(config_path) = args.config_path else {
         return Err("缺少必需参数: --config <FILE>".to_string());
     };
@@ -133,6 +623,18 @@ fn init_runtime(
     let out_dir = config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), ToOwned::to_owned);
+
+    let plugins = PluginManager::load(out_dir.as_path(), &cfg.security, &org_public_key)?;
+    tracing::info!(
+        wasm_plugins = plugins.wasm_count(),
+        wasm_plugin_names = ?plugins.wasm_plugin_names(),
+        wasm_plugin_entries = ?plugins.wasm_plugin_entries(),
+        native_plugins = plugins.native_count(),
+        native_plugin_names = ?plugins.native_plugin_names(),
+        native_plugin_entries = ?plugins.native_plugin_entries(),
+        "plugins loaded"
+    );
+
     let encryptor_tx = spawn_encryptor(
         out_dir,
         org_public_key,
@@ -158,7 +660,7 @@ fn init_runtime(
         .start_watching()
         .map_err(|e| format!("启动检测规则热加载失败: {e}"))?;
 
-    Ok((mgr, rule_mgr, encryptor_tx))
+    Ok((mgr, rule_mgr, encryptor_tx, plugins))
 }
 
 struct LoopState {
@@ -2254,6 +2756,14 @@ struct ProbeArgs {
     config_path: Option<PathBuf>,
     org_key_path: Option<PathBuf>,
     user_passphrase: Option<String>,
+    sign_plugin: Option<SignPluginArgs>,
+}
+
+#[derive(Debug)]
+struct SignPluginArgs {
+    key_pem: PathBuf,
+    input_file: PathBuf,
+    sig_out: PathBuf,
 }
 
 fn parse_args<I>(mut it: I) -> Result<ProbeArgs, String>
@@ -2263,6 +2773,10 @@ where
     let mut config_path: Option<PathBuf> = None;
     let mut org_key_path: Option<PathBuf> = None;
     let mut user_passphrase: Option<String> = None;
+    let mut sign_plugin = false;
+    let mut sign_key_path: Option<PathBuf> = None;
+    let mut sign_input_path: Option<PathBuf> = None;
+    let mut sign_out_path: Option<PathBuf> = None;
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2280,9 +2794,24 @@ where
                     .ok_or("--user-passphrase/--password 缺少参数".to_string())?;
                 user_passphrase = Some(val);
             }
+            "--sign-plugin" => {
+                sign_plugin = true;
+            }
+            "--key" => {
+                let val = it.next().ok_or("--key 缺少参数".to_string())?;
+                sign_key_path = Some(PathBuf::from(val));
+            }
+            "--input" => {
+                let val = it.next().ok_or("--input 缺少参数".to_string())?;
+                sign_input_path = Some(PathBuf::from(val));
+            }
+            "--out" => {
+                let val = it.next().ok_or("--out 缺少参数".to_string())?;
+                sign_out_path = Some(PathBuf::from(val));
+            }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: probe --config <FILE> [--org-key-path <FILE>] [--user-passphrase <TEXT>]\n"
+                    "Usage:\n  probe --config <FILE> [--org-key-path <FILE>] [--user-passphrase <TEXT>]\n  probe --sign-plugin --key <PEM> --input <DLL/SO> [--out <SIG>]\n"
                         .to_string(),
                 );
             }
@@ -2290,10 +2819,32 @@ where
         }
     }
 
+    let sign_plugin = if sign_plugin {
+        let key_pem = sign_key_path.ok_or("--sign-plugin 需要 --key <PEM>".to_string())?;
+        let input_file = sign_input_path.ok_or("--sign-plugin 需要 --input <FILE>".to_string())?;
+        let sig_out = if let Some(p) = sign_out_path {
+            p
+        } else {
+            let fname = input_file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .ok_or_else(|| format!("input 路径缺少文件名: {}", input_file.display()))?;
+            input_file.with_file_name(format!("{fname}.sig"))
+        };
+        Some(SignPluginArgs {
+            key_pem,
+            input_file,
+            sig_out,
+        })
+    } else {
+        None
+    };
+
     Ok(ProbeArgs {
         config_path,
         org_key_path,
         user_passphrase,
+        sign_plugin,
     })
 }
 

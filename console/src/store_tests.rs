@@ -58,6 +58,7 @@ fn upload_bytes_as_evidence(
             None => task_id = Some(out.task_id),
             Some(prev) => assert_eq!(prev, &out.task_id),
         }
+        assert_eq!(out.next_sequence_id, Some(sequence_id.saturating_add(1)));
         if is_last {
             assert_eq!(out.status, TaskStatus::Pending);
         } else {
@@ -291,8 +292,7 @@ fn analyze_evidence_rejects_chunks_after_finished_upload() -> Result<(), Box<dyn
 }
 
 #[test]
-fn analyze_evidence_rejects_duplicate_request_id_after_restart_failed_task()
--> Result<(), Box<dyn std::error::Error>> {
+fn analyze_evidence_rehydrates_restart_failed_task() -> Result<(), Box<dyn std::error::Error>> {
     let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_restart")?;
     let dir = tempfile::tempdir()?;
 
@@ -309,6 +309,7 @@ fn analyze_evidence_rejects_duplicate_request_id_after_restart_failed_task()
             }),
         })?;
         assert_eq!(out.status, TaskStatus::Uploading);
+        assert_eq!(out.next_sequence_id, Some(1));
         out.task_id
     };
 
@@ -317,6 +318,7 @@ fn analyze_evidence_rejects_duplicate_request_id_after_restart_failed_task()
         task_id: task_id.clone(),
     })?;
     assert_eq!(t.status, TaskStatus::Failed);
+    assert_eq!(t.next_sequence_id, Some(1));
 
     let err = c2
         .analyze_evidence(AnalyzeEvidenceChunkInput {
@@ -339,6 +341,18 @@ fn analyze_evidence_rejects_duplicate_request_id_after_restart_failed_task()
             ..
         }
     ));
+
+    let out = c2.analyze_evidence(AnalyzeEvidenceChunkInput {
+        request_id: 4000,
+        sequence_id: 1,
+        is_last: true,
+        bytes: artifact_bytes[64..].to_vec(),
+        meta: None,
+    })?;
+    assert_eq!(out.task_id, task_id);
+    assert_eq!(out.status, TaskStatus::Pending);
+    assert!(out.bytes_written.unwrap_or(0) > 64);
+    assert_eq!(out.next_sequence_id, Some(2));
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write as IoWrite};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -246,30 +246,50 @@ impl Console {
         Ok(())
     }
 
-    fn ensure_upload_session_started(
+    fn ensure_upload_session_ready(
         upload_sessions: &mut HashMap<u64, UploadSession>,
         state: &PersistenceState,
         input: &AnalyzeEvidenceChunkInput,
         now_ms: i64,
     ) -> Result<(), AegisError> {
-        if input.sequence_id != 0 {
+        let request_id = input.request_id;
+        if upload_sessions.contains_key(&request_id) {
             return Ok(());
         }
 
-        let request_id = input.request_id;
-        if state.request_id_exists(request_id)? || upload_sessions.contains_key(&request_id) {
-            return Err(AegisError::ProtocolError {
-                message: "request_id 已存在，不能重复开始上传".to_string(),
-                code: Some(ErrorCode::Console731),
-            });
-        }
-        if input.meta.is_none() {
-            return Err(AegisError::ProtocolError {
-                message: "sequence_id=0 必须携带 meta".to_string(),
-                code: Some(ErrorCode::Console731),
-            });
+        if input.sequence_id == 0 {
+            if state.request_id_exists(request_id)? {
+                return Err(AegisError::ProtocolError {
+                    message: "request_id 已存在，请从 next_sequence_id 续传或更换 request_id"
+                        .to_string(),
+                    code: Some(ErrorCode::Console731),
+                });
+            }
+            if input.meta.is_none() {
+                return Err(AegisError::ProtocolError {
+                    message: "sequence_id=0 必须携带 meta".to_string(),
+                    code: Some(ErrorCode::Console731),
+                });
+            }
+            Self::start_new_upload_session(upload_sessions, state, request_id, now_ms)?;
+            return Ok(());
         }
 
+        Self::try_rehydrate_upload_session(
+            upload_sessions,
+            state,
+            request_id,
+            input.sequence_id,
+            now_ms,
+        )
+    }
+
+    fn start_new_upload_session(
+        upload_sessions: &mut HashMap<u64, UploadSession>,
+        state: &PersistenceState,
+        request_id: u64,
+        now_ms: i64,
+    ) -> Result<(), AegisError> {
         let task_id = Uuid::new_v4().to_string();
         let case_path = state.cases_dir.join(format!("{task_id}.aes"));
         let case_path_str = case_path.display().to_string();
@@ -297,6 +317,94 @@ impl Console {
             },
         );
 
+        Ok(())
+    }
+
+    fn try_rehydrate_upload_session(
+        upload_sessions: &mut HashMap<u64, UploadSession>,
+        state: &PersistenceState,
+        request_id: u64,
+        sequence_id: u64,
+        now_ms: i64,
+    ) -> Result<(), AegisError> {
+        let Some(task) = state.get_task_row_by_request_id(request_id)? else {
+            return Err(AegisError::ProtocolError {
+                message: "upload session 不存在".to_string(),
+                code: Some(ErrorCode::Console731),
+            });
+        };
+
+        if task.status != TaskStatus::Failed {
+            return Err(AegisError::ProtocolError {
+                message: "upload session 不存在".to_string(),
+                code: Some(ErrorCode::Console731),
+            });
+        }
+
+        if task.error_message.as_deref() != Some("console restarted during upload") {
+            return Err(AegisError::ProtocolError {
+                message: "failed task 不支持续传".to_string(),
+                code: Some(ErrorCode::Console731),
+            });
+        }
+
+        if task.next_sequence_id != Some(sequence_id) {
+            return Err(AegisError::ProtocolError {
+                message: "续传 sequence_id 不匹配".to_string(),
+                code: Some(ErrorCode::Console731),
+            });
+        }
+
+        let next_sequence_id = task.next_sequence_id.unwrap_or(0);
+        let stored_bytes_written = task.bytes_written.unwrap_or(0);
+
+        let Some(case_path_str) = task.case_path else {
+            return Err(AegisError::ProtocolError {
+                message: "task 缺少 case_path".to_string(),
+                code: Some(ErrorCode::Console733),
+            });
+        };
+        let case_path = state.validate_case_path(case_path_str.as_str())?;
+        if !case_path.exists() {
+            return Err(AegisError::ProtocolError {
+                message: "续传文件不存在".to_string(),
+                code: Some(ErrorCode::Console731),
+            });
+        }
+        let file_len = case_path
+            .metadata()
+            .map_err(|e| map_console_733(AegisError::IoError(e), "读取续传文件元信息失败"))?
+            .len();
+        let bytes_written = u64::min(stored_bytes_written, file_len);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(case_path.as_path())
+            .map_err(|e| map_console_733(AegisError::IoError(e), "打开续传文件失败"))?;
+        file.set_len(bytes_written)
+            .map_err(|e| map_console_733(AegisError::IoError(e), "截断续传文件失败"))?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| map_console_733(AegisError::IoError(e), "定位续传文件失败"))?;
+        let writer = BufWriter::new(file);
+        let builder =
+            ArtifactBuilder::new_with_state(request_id, writer, next_sequence_id, bytes_written);
+
+        state.mark_task_uploading(
+            task.task_id.as_str(),
+            now_ms,
+            bytes_written,
+            next_sequence_id,
+        )?;
+
+        upload_sessions.insert(
+            request_id,
+            UploadSession {
+                task_id: task.task_id,
+                case_path,
+                builder,
+            },
+        );
         Ok(())
     }
 
@@ -361,7 +469,7 @@ impl Console {
         let now_ms = unix_timestamp_now_ms();
         let request_id = input.request_id;
 
-        Self::ensure_upload_session_started(&mut self.upload_sessions, state, &input, now_ms)?;
+        Self::ensure_upload_session_ready(&mut self.upload_sessions, state, &input, now_ms)?;
 
         let outcome = Self::push_upload_chunk(
             &mut self.upload_sessions,
@@ -379,11 +487,13 @@ impl Console {
         }
 
         let mut status = TaskStatus::Uploading;
+        let next_sequence_id = input.sequence_id.saturating_add(1);
         state.update_task_progress(
             outcome.task_id.as_str(),
             &status,
             now_ms,
             outcome.bytes_written,
+            next_sequence_id,
         )?;
 
         if outcome.finished {
@@ -397,6 +507,7 @@ impl Console {
                 &status,
                 now_ms,
                 outcome.bytes_written,
+                next_sequence_id,
             )?;
         }
 
@@ -404,6 +515,7 @@ impl Console {
             task_id: outcome.task_id,
             status,
             bytes_written: Some(outcome.bytes_written),
+            next_sequence_id: Some(next_sequence_id),
             case_path: Some(outcome.case_path.display().to_string()),
         })
     }
@@ -1656,12 +1768,23 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at_ms INTEGER NOT NULL,
   case_path TEXT,
   bytes_written INTEGER NOT NULL,
+  next_sequence_id INTEGER,
   error_message TEXT
 );
 ",
                 )
                 .execute(&self.pool)
                 .await?;
+
+                let alter = sqlx::query(r"ALTER TABLE tasks ADD COLUMN next_sequence_id INTEGER;")
+                    .execute(&self.pool)
+                    .await;
+                if let Err(e) = alter {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        return Err(e);
+                    }
+                }
 
                 sqlx::query(
                     r"
@@ -1681,7 +1804,8 @@ WHERE status = 'uploading';
             .map_err(|e| AegisError::ProtocolError {
                 message: format!("初始化 sqlite 失败: {e}"),
                 code: Some(ErrorCode::Console733),
-            })
+            })?;
+        Ok(())
     }
 
     fn request_id_exists(&self, request_id: u64) -> Result<bool, AegisError> {
@@ -1729,9 +1853,10 @@ INSERT INTO tasks (
   updated_at_ms,
   case_path,
   bytes_written,
+  next_sequence_id,
   error_message
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 ",
                 )
                 .bind(task_id)
@@ -1740,6 +1865,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 .bind(created_at_ms)
                 .bind(updated_at_ms)
                 .bind(case_path)
+                .bind(0i64)
                 .bind(0i64)
                 .bind(Option::<String>::None)
                 .execute(&self.pool)
@@ -1758,9 +1884,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         status: &TaskStatus,
         updated_at_ms: i64,
         bytes_written: u64,
+        next_sequence_id: u64,
     ) -> Result<(), AegisError> {
         let status_str = task_status_as_str(status);
         let bytes_written_i64 = i64::try_from(bytes_written).unwrap_or(i64::MAX);
+        let next_sequence_id_i64 = i64::try_from(next_sequence_id).unwrap_or(i64::MAX);
         self.rt
             .block_on(async {
                 sqlx::query(
@@ -1768,13 +1896,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 UPDATE tasks
 SET status = ?,
     updated_at_ms = ?,
-    bytes_written = ?
+    bytes_written = ?,
+    next_sequence_id = ?
 WHERE task_id = ?;
 ",
                 )
                 .bind(status_str)
                 .bind(updated_at_ms)
                 .bind(bytes_written_i64)
+                .bind(next_sequence_id_i64)
                 .bind(task_id)
                 .execute(&self.pool)
                 .await?;
@@ -1816,12 +1946,48 @@ WHERE task_id = ?;
             })
     }
 
+    fn mark_task_uploading(
+        &self,
+        task_id: &str,
+        updated_at_ms: i64,
+        bytes_written: u64,
+        next_sequence_id: u64,
+    ) -> Result<(), AegisError> {
+        let bytes_written_i64 = i64::try_from(bytes_written).unwrap_or(i64::MAX);
+        let next_sequence_id_i64 = i64::try_from(next_sequence_id).unwrap_or(i64::MAX);
+        self.rt
+            .block_on(async {
+                sqlx::query(
+                    r"
+UPDATE tasks
+SET status = 'uploading',
+    updated_at_ms = ?,
+    bytes_written = ?,
+    next_sequence_id = ?,
+    error_message = NULL
+WHERE task_id = ?;
+",
+                )
+                .bind(updated_at_ms)
+                .bind(bytes_written_i64)
+                .bind(next_sequence_id_i64)
+                .bind(task_id)
+                .execute(&self.pool)
+                .await?;
+                Ok::<(), sqlx::Error>(())
+            })
+            .map_err(|e| AegisError::ProtocolError {
+                message: format!("更新 tasks 失败: {e}"),
+                code: Some(ErrorCode::Console733),
+            })
+    }
+
     fn get_task_row(&self, task_id: &str) -> Result<Option<GetTaskOutput>, AegisError> {
         self.rt
             .block_on(async {
                 let row = sqlx::query(
                     r"
-SELECT task_id, status, created_at_ms, updated_at_ms, bytes_written, error_message, case_path
+SELECT task_id, status, created_at_ms, updated_at_ms, bytes_written, next_sequence_id, error_message, case_path
 FROM tasks
 WHERE task_id = ?;
 ",
@@ -1839,6 +2005,9 @@ WHERE task_id = ?;
                     task_status_from_str(status_str.as_str()).unwrap_or(TaskStatus::Failed);
                 let bytes_written: i64 = row.try_get("bytes_written")?;
                 let bytes_written_u64 = u64::try_from(bytes_written).ok();
+                let next_sequence_id: Option<i64> = row.try_get("next_sequence_id").ok();
+                let next_sequence_id =
+                    next_sequence_id.and_then(|v| u64::try_from(v).ok());
                 let error_message: Option<String> = row.try_get("error_message")?;
                 let case_path: Option<String> = row.try_get("case_path")?;
                 let created_at_ms: i64 = row.try_get("created_at_ms")?;
@@ -1850,6 +2019,7 @@ WHERE task_id = ?;
                     created_at_ms,
                     updated_at_ms,
                     bytes_written: bytes_written_u64,
+                    next_sequence_id,
                     error_message,
                     case_path,
                 }))
@@ -1858,6 +2028,58 @@ WHERE task_id = ?;
                 message: format!("读取 tasks 失败: {e}"),
                 code: Some(ErrorCode::Console733),
             })
+    }
+
+    fn get_task_row_by_request_id(
+        &self,
+        request_id: u64,
+    ) -> Result<Option<GetTaskOutput>, AegisError> {
+        let row = self
+            .rt
+            .block_on(async {
+                sqlx::query(
+                    r"
+SELECT task_id, status, created_at_ms, updated_at_ms, bytes_written, next_sequence_id, error_message, case_path
+FROM tasks
+WHERE request_id = ?
+ORDER BY created_at_ms DESC, task_id DESC
+LIMIT 1;
+",
+                )
+                .bind(i64::try_from(request_id).unwrap_or(i64::MAX))
+                .fetch_optional(&self.pool)
+                .await
+            })
+            .map_err(|e| AegisError::ProtocolError {
+                message: format!("读取 tasks 失败: {e}"),
+                code: Some(ErrorCode::Console733),
+            })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let task_id: String = row.try_get("task_id").unwrap_or_else(|_| String::new());
+        let status_str: String = row
+            .try_get("status")
+            .unwrap_or_else(|_| "failed".to_string());
+        let status = task_status_from_str(status_str.as_str()).unwrap_or(TaskStatus::Failed);
+        let bytes_written: i64 = row.try_get("bytes_written").unwrap_or(0);
+        let bytes_written_u64 = u64::try_from(bytes_written).ok();
+        let next_sequence_id: Option<i64> = row.try_get("next_sequence_id").ok();
+        let next_sequence_id = next_sequence_id.and_then(|v| u64::try_from(v).ok());
+        let error_message: Option<String> = row.try_get("error_message").unwrap_or(None);
+        let case_path: Option<String> = row.try_get("case_path").unwrap_or(None);
+        let created_at_ms: i64 = row.try_get("created_at_ms").unwrap_or(0);
+        let updated_at_ms: i64 = row.try_get("updated_at_ms").unwrap_or(0);
+        Ok(Some(GetTaskOutput {
+            task_id,
+            status,
+            created_at_ms,
+            updated_at_ms,
+            bytes_written: bytes_written_u64,
+            next_sequence_id,
+            error_message,
+            case_path,
+        }))
     }
 
     fn list_tasks(&self, page: Option<crate::model::Page>) -> Result<ListTasksOutput, AegisError> {

@@ -1,8 +1,10 @@
 #![allow(missing_docs)]
 
 use axum::body::Bytes;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::error::{AegisError, ErrorCode};
@@ -13,16 +15,25 @@ use console::{
     PersistenceConfig,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::signal;
+use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 #[derive(Clone)]
 struct AppState {
     console: Arc<Mutex<Console>>,
     expose_paths: bool,
+    events: broadcast::Sender<WsEvent>,
+}
+
+#[derive(Clone, Serialize)]
+struct WsEvent {
+    channel: String,
+    payload: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +255,27 @@ async fn analyze_evidence(
     })?
     .map_err(map_err)?;
 
+    let task_id = out.task_id.clone();
+    let status = out.status.clone();
+    let (percent, message) = if status == console::TaskStatus::Pending {
+        (100u32, "uploaded")
+    } else if status == console::TaskStatus::Failed {
+        (0u32, "failed")
+    } else {
+        (0u32, "uploading")
+    };
+    drop(st.events.send(WsEvent {
+        channel: "analysis:progress".to_string(),
+        payload: json!({
+            "task_id": task_id,
+            "percent": percent,
+            "message": message,
+            "status": status,
+            "bytes_written": out.bytes_written,
+            "next_sequence_id": out.next_sequence_id,
+        }),
+    }));
+
     if !st.expose_paths {
         out.case_path = None;
     }
@@ -296,6 +328,27 @@ async fn analyze_evidence_bin(
         })
     })?
     .map_err(map_err)?;
+
+    let task_id = out.task_id.clone();
+    let status = out.status.clone();
+    let (percent, message) = if status == console::TaskStatus::Pending {
+        (100u32, "uploaded")
+    } else if status == console::TaskStatus::Failed {
+        (0u32, "failed")
+    } else {
+        (0u32, "uploading")
+    };
+    drop(st.events.send(WsEvent {
+        channel: "analysis:progress".to_string(),
+        payload: json!({
+            "task_id": task_id,
+            "percent": percent,
+            "message": message,
+            "status": status,
+            "bytes_written": out.bytes_written,
+            "next_sequence_id": out.next_sequence_id,
+        }),
+    }));
 
     if !st.expose_paths {
         out.case_path = None;
@@ -353,6 +406,33 @@ async fn list_tasks(
     Ok(Json(out))
 }
 
+async fn ws_events(State(st): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    let mut rx = st.events.subscribe();
+    ws.on_upgrade(move |socket| async move {
+        handle_ws(socket, &mut rx).await;
+    })
+}
+
+async fn handle_ws(mut socket: WebSocket, rx: &mut broadcast::Receiver<WsEvent>) {
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    None | Some(Ok(WsMessage::Close(_)) | Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+            ev = rx.recv() => {
+                let Ok(ev) = ev else { continue; };
+                let Ok(text) = serde_json::to_string(&ev) else { continue; };
+                if socket.send(WsMessage::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| {
         matches!(
@@ -369,13 +449,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = cfg_from_env();
     let c = Console::new(cfg);
+    let (events, _events_rx) = broadcast::channel::<WsEvent>(1024);
     let st = AppState {
         console: Arc::new(Mutex::new(c)),
         expose_paths: env_flag("AEGIS_CONSOLE_EXPOSE_PATHS"),
+        events,
     };
 
     let mut app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/v1/ws", get(ws_events))
         .route("/api/v1/open_artifact", post(open_artifact))
         .route("/api/v1/get_graph_viewport", post(get_graph_viewport))
         .route("/api/v1/close_case/:case_id", post(close_case))

@@ -173,6 +173,9 @@ impl TokenBucketConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub enable_native_plugins: bool,
+    pub wasm_plugin_paths: Vec<String>,
+    pub wasm_permissions_allow: Vec<String>,
+    pub native_plugin_paths: Vec<String>,
     pub timestomp_threshold_ms: u64,
     pub scan_whitelist: Vec<String>,
     pub yara_rule_paths: Vec<String>,
@@ -182,6 +185,9 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             enable_native_plugins: false,
+            wasm_plugin_paths: Vec::new(),
+            wasm_permissions_allow: Vec::new(),
+            native_plugin_paths: Vec::new(),
             timestomp_threshold_ms: 1000,
             scan_whitelist: Vec::new(),
             yara_rule_paths: Vec::new(),
@@ -192,6 +198,25 @@ impl Default for SecurityConfig {
 impl SecurityConfig {
     #[allow(clippy::missing_errors_doc)]
     pub fn validate(&self) -> Result<(), AegisError> {
+        if self.wasm_plugin_paths.iter().any(|p| p.trim().is_empty()) {
+            return Err(AegisError::ConfigError {
+                message: "security.wasm_plugin_paths 不能包含空路径".to_string(),
+            });
+        }
+        if self
+            .wasm_permissions_allow
+            .iter()
+            .any(|p| p.trim().is_empty())
+        {
+            return Err(AegisError::ConfigError {
+                message: "security.wasm_permissions_allow 不能包含空权限".to_string(),
+            });
+        }
+        if self.native_plugin_paths.iter().any(|p| p.trim().is_empty()) {
+            return Err(AegisError::ConfigError {
+                message: "security.native_plugin_paths 不能包含空路径".to_string(),
+            });
+        }
         if self.yara_rule_paths.iter().any(|p| p.trim().is_empty()) {
             return Err(AegisError::ConfigError {
                 message: "security.yara_rule_paths 不能包含空路径".to_string(),

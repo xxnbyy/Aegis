@@ -204,6 +204,7 @@ pub struct AnalyzeEvidenceOutput {
     pub task_id: String,
     pub status: TaskStatus,
     pub bytes_written: Option<u64>,
+    pub next_sequence_id: Option<u64>,
     pub case_path: Option<String>,
 }
 
@@ -219,6 +220,7 @@ pub struct GetTaskOutput {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub bytes_written: Option<u64>,
+    pub next_sequence_id: Option<u64>,
     pub error_message: Option<String>,
     pub case_path: Option<String>,
 }
