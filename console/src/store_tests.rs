@@ -27,6 +27,12 @@ fn new_console_with_temp_persistence(dir: &tempfile::TempDir) -> Console {
     })
 }
 
+fn temp_console() -> Result<(tempfile::TempDir, Console), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let c = new_console_with_temp_persistence(&dir);
+    Ok((dir, c))
+}
+
 fn upload_bytes_as_evidence(
     c: &mut Console,
     request_id: u64,
@@ -177,10 +183,26 @@ fn build_test_artifact_bytes(
     Ok((bytes, priv_pem, host_uuid_str))
 }
 
+fn upload_three_tasks(
+    c: &mut Console,
+    request_ids: [u64; 3],
+    passphrases: [&str; 3],
+) -> Result<[String; 3], Box<dyn std::error::Error>> {
+    let (a1, _priv_pem, _host_uuid) = build_test_artifact_bytes(passphrases[0])?;
+    let (a2, _priv_pem2, _host_uuid2) = build_test_artifact_bytes(passphrases[1])?;
+    let (a3, _priv_pem3, _host_uuid3) = build_test_artifact_bytes(passphrases[2])?;
+
+    let t1 = upload_bytes_as_evidence(c, request_ids[0], a1.as_slice())?;
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let t2 = upload_bytes_as_evidence(c, request_ids[1], a2.as_slice())?;
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let t3 = upload_bytes_as_evidence(c, request_ids[2], a3.as_slice())?;
+    Ok([t1, t2, t3])
+}
+
 #[test]
 fn analyze_evidence_rejects_sequence0_without_meta() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
+    let (_dir, mut c) = temp_console()?;
 
     expect_err_code(
         c.analyze_evidence(AnalyzeEvidenceChunkInput {
@@ -197,8 +219,7 @@ fn analyze_evidence_rejects_sequence0_without_meta() -> Result<(), Box<dyn std::
 
 #[test]
 fn analyze_evidence_rejects_too_large_chunk() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
+    let (_dir, mut c) = temp_console()?;
 
     let bytes = vec![0u8; MAX_ARTIFACT_CHUNK_SIZE.saturating_add(1)];
     expect_err_code(
@@ -221,8 +242,7 @@ fn analyze_evidence_rejects_too_large_chunk() -> Result<(), Box<dyn std::error::
 fn analyze_evidence_out_of_order_marks_task_failed_and_deletes_file()
 -> Result<(), Box<dyn std::error::Error>> {
     let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_seq")?;
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
+    let (_dir, mut c) = temp_console()?;
 
     let out0 = c.analyze_evidence(AnalyzeEvidenceChunkInput {
         request_id: 2000,
@@ -261,8 +281,7 @@ fn analyze_evidence_out_of_order_marks_task_failed_and_deletes_file()
 fn analyze_evidence_rejects_chunks_after_finished_upload() -> Result<(), Box<dyn std::error::Error>>
 {
     let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_after")?;
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
+    let (_dir, mut c) = temp_console()?;
 
     let _task_id = upload_bytes_as_evidence(&mut c, 3000, artifact_bytes.as_slice())?;
 
@@ -340,8 +359,7 @@ fn analyze_evidence_rehydrates_restart_failed_task() -> Result<(), Box<dyn std::
 fn open_artifact_by_task_id_rejects_case_path_outside_cases_dir()
 -> Result<(), Box<dyn std::error::Error>> {
     let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_out")?;
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
+    let (dir, mut c) = temp_console()?;
 
     let _ = c.list_tasks(ListTasksInput { page: None })?;
 
@@ -402,17 +420,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 #[test]
 fn list_tasks_pagination_returns_distinct_tasks() -> Result<(), Box<dyn std::error::Error>> {
-    let (a1, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_p1")?;
-    let (a2, _priv_pem2, _host_uuid2) = build_test_artifact_bytes("pw_p2")?;
-    let (a3, _priv_pem3, _host_uuid3) = build_test_artifact_bytes("pw_p3")?;
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
-
-    let t1 = upload_bytes_as_evidence(&mut c, 5001, a1.as_slice())?;
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let t2 = upload_bytes_as_evidence(&mut c, 5002, a2.as_slice())?;
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let t3 = upload_bytes_as_evidence(&mut c, 5003, a3.as_slice())?;
+    let (_dir, mut c) = temp_console()?;
+    let [t1, t2, t3] = upload_three_tasks(&mut c, [5001, 5002, 5003], ["pw_p1", "pw_p2", "pw_p3"])?;
 
     let page1 = c.list_tasks(ListTasksInput {
         page: Some(Page {
@@ -446,17 +455,8 @@ fn list_tasks_pagination_returns_distinct_tasks() -> Result<(), Box<dyn std::err
 
 #[test]
 fn list_tasks_orders_by_created_at_desc() -> Result<(), Box<dyn std::error::Error>> {
-    let (a1, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_o1")?;
-    let (a2, _priv_pem2, _host_uuid2) = build_test_artifact_bytes("pw_o2")?;
-    let (a3, _priv_pem3, _host_uuid3) = build_test_artifact_bytes("pw_o3")?;
-    let dir = tempfile::tempdir()?;
-    let mut c = new_console_with_temp_persistence(&dir);
-
-    let t1 = upload_bytes_as_evidence(&mut c, 5101, a1.as_slice())?;
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let t2 = upload_bytes_as_evidence(&mut c, 5102, a2.as_slice())?;
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    let t3 = upload_bytes_as_evidence(&mut c, 5103, a3.as_slice())?;
+    let (_dir, mut c) = temp_console()?;
+    let [t1, t2, t3] = upload_three_tasks(&mut c, [5101, 5102, 5103], ["pw_o1", "pw_o2", "pw_o3"])?;
 
     let list = c.list_tasks(ListTasksInput { page: None })?;
     assert_eq!(list.tasks.len(), 3);

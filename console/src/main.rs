@@ -69,6 +69,32 @@ where
     .map_err(map_err)
 }
 
+fn post_analyze_evidence(st: &AppState, out: &mut AnalyzeEvidenceOutput) {
+    let task_id = out.task_id.clone();
+    let status = out.status.clone();
+    let (percent, message) = if status == console::TaskStatus::Pending {
+        (100u32, "uploaded")
+    } else if status == console::TaskStatus::Failed {
+        (0u32, "failed")
+    } else {
+        (0u32, "uploading")
+    };
+    drop(st.events.send(WsEvent {
+        channel: "analysis:progress".to_string(),
+        payload: json!({
+            "task_id": task_id,
+            "percent": percent,
+            "message": message,
+            "status": status,
+            "bytes_written": out.bytes_written,
+            "next_sequence_id": out.next_sequence_id,
+        }),
+    }));
+    if !st.expose_paths {
+        out.case_path = None;
+    }
+}
+
 fn map_err(e: AegisError) -> (StatusCode, Json<ErrorBody>) {
     match e {
         AegisError::ProtocolError { message, code } | AegisError::CryptoError { message, code } => {
@@ -219,31 +245,7 @@ async fn analyze_evidence(
     Json(input): Json<AnalyzeEvidenceChunkInput>,
 ) -> ApiResult<AnalyzeEvidenceOutput> {
     let mut out = run_console(st.console.clone(), move |c| c.analyze_evidence(input)).await?;
-
-    let task_id = out.task_id.clone();
-    let status = out.status.clone();
-    let (percent, message) = if status == console::TaskStatus::Pending {
-        (100u32, "uploaded")
-    } else if status == console::TaskStatus::Failed {
-        (0u32, "failed")
-    } else {
-        (0u32, "uploading")
-    };
-    drop(st.events.send(WsEvent {
-        channel: "analysis:progress".to_string(),
-        payload: json!({
-            "task_id": task_id,
-            "percent": percent,
-            "message": message,
-            "status": status,
-            "bytes_written": out.bytes_written,
-            "next_sequence_id": out.next_sequence_id,
-        }),
-    }));
-
-    if !st.expose_paths {
-        out.case_path = None;
-    }
+    post_analyze_evidence(&st, &mut out);
     Ok(Json(out))
 }
 
@@ -278,31 +280,7 @@ async fn analyze_evidence_bin(
     };
 
     let mut out = run_console(st.console.clone(), move |c| c.analyze_evidence(input)).await?;
-
-    let task_id = out.task_id.clone();
-    let status = out.status.clone();
-    let (percent, message) = if status == console::TaskStatus::Pending {
-        (100u32, "uploaded")
-    } else if status == console::TaskStatus::Failed {
-        (0u32, "failed")
-    } else {
-        (0u32, "uploading")
-    };
-    drop(st.events.send(WsEvent {
-        channel: "analysis:progress".to_string(),
-        payload: json!({
-            "task_id": task_id,
-            "percent": percent,
-            "message": message,
-            "status": status,
-            "bytes_written": out.bytes_written,
-            "next_sequence_id": out.next_sequence_id,
-        }),
-    }));
-
-    if !st.expose_paths {
-        out.case_path = None;
-    }
+    post_analyze_evidence(&st, &mut out);
     Ok(Json(out))
 }
 
