@@ -78,7 +78,7 @@ pub fn read_ringbuf_dropped_events_best_effort(
             {
                 return 0;
             }
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
 
@@ -184,12 +184,12 @@ pub fn load_and_attach_aegis_ebpf_best_effort(
                 has_ringbuf = true;
                 break;
             }
-            Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::ENOENT) => continue,
+            Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::ENOENT) => {}
             Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EPERM || code == libc::EACCES) =>
             {
                 return Ok(None);
             }
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
 
@@ -205,7 +205,7 @@ pub fn load_and_attach_aegis_ebpf_best_effort(
     let object_path = ebpf_object_path
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .or_else(|| try_compile_aegis_ebpf_object_best_effort(governor, bpftool_path))
         .unwrap_or_default();
 
@@ -222,7 +222,7 @@ pub fn load_and_attach_aegis_ebpf_best_effort(
         return Ok(None);
     }
 
-    let _ = std::fs::create_dir_all(pin_dir);
+    drop(std::fs::create_dir_all(pin_dir));
     let out = std::process::Command::new(bpftool_path)
         .args([
             "prog",
@@ -260,12 +260,12 @@ pub fn load_and_attach_aegis_ebpf_best_effort(
                 drop(owned);
                 return Ok(Some(EbpfProducer { _links: Vec::new() }));
             }
-            Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::ENOENT) => continue,
+            Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::ENOENT) => {}
             Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EPERM || code == libc::EACCES) =>
             {
                 return Ok(None);
             }
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
 
@@ -419,7 +419,7 @@ fn try_compile_aegis_ebpf_object_best_effort(
 
     let pid = std::process::id();
     let tmp_dir = std::env::temp_dir().join(format!("aegis_ebpf_{pid}"));
-    let _ = std::fs::create_dir_all(tmp_dir.as_path());
+    drop(std::fs::create_dir_all(tmp_dir.as_path()));
 
     let source_path = tmp_dir.join("aegis.bpf.c");
     let vmlinux_h_path = tmp_dir.join("vmlinux.h");
@@ -466,7 +466,7 @@ fn try_compile_aegis_ebpf_object_best_effort(
         .output()
         .ok()?;
     if !compile.status.success() {
-        let _ = std::fs::remove_file(object_path.as_path());
+        drop(std::fs::remove_file(object_path.as_path()));
         return None;
     }
 
@@ -492,7 +492,6 @@ pub fn load_and_attach_aegis_ebpf_best_effort(
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub struct RingbufReader {
-    fd: std::os::fd::OwnedFd,
     mmap_ptr: *mut libc::c_void,
     mmap_len: usize,
     page_size: usize,
@@ -587,7 +586,6 @@ pub fn open_aegis_ringbuf_best_effort(
         }
 
         let mut reader = RingbufReader {
-            fd: owned,
             mmap_ptr,
             mmap_len,
             page_size,
