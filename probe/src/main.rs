@@ -3,7 +3,6 @@
 #[cfg(windows)]
 use std::collections::BTreeMap;
 use std::fs::File;
-#[cfg(windows)]
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,14 +12,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_kw::Kek;
 use base64::Engine as _;
-use common::config::{ConfigManager, load_yaml_file};
+use common::config::{ArtifactConfig, ConfigManager, load_yaml_file};
 use common::crypto;
 use common::detection::{RuleManager, RuleSet};
 use common::governor::{Governor, IoLimiter};
+#[cfg(windows)]
+use common::protocol::EvidenceChunker;
 use common::protocol::{
-    AgentTelemetry, FileInfo, NetworkInterfaceUpdate, PayloadEnvelope, ProcessInfo, SystemInfo,
+    AgentTelemetry, FileInfo, NetworkInterfaceUpdate, PayloadEnvelope, ProcessInfo,
+    SmartReflexEvidence, SystemInfo, payload_envelope,
 };
+#[cfg(target_os = "linux")]
+use common::protocol::{EbpfEvent, EbpfEventBatch, LinuxKernelForensicsEvidence, LinuxVdsoHash};
 use common::telemetry::{init_telemetry, sample_memory_usage_mb};
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
 use hmac::Mac;
 use libloading::Library;
 use prost::Message;
@@ -39,10 +44,11 @@ use rsa::signature::SignatureEncoding;
 use rsa::signature::Signer;
 use rsa::signature::Verifier;
 use serde::Deserialize;
+use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::HashSet;
 use tokio::sync::mpsc as tokio_mpsc;
-use wasmtime::{Caller, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 #[cfg(windows)]
 use wmi::WMIConnection;
 
@@ -52,7 +58,13 @@ mod embedded_key {
     include!(concat!(env!("OUT_DIR"), "/embedded_org_pubkey.rs"));
 }
 
+mod embedded_self_ed25519 {
+    include!(concat!(env!("OUT_DIR"), "/embedded_self_ed25519_pubkey.rs"));
+}
+
 const USER_SLOT_LEN: usize = 40;
+const WASM_PLUGIN_ABI_VERSION: i32 = 1;
+const NATIVE_PLUGIN_ABI_VERSION: u32 = 1;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 type EventBusTx = tokio_mpsc::UnboundedSender<EncryptorCommand>;
@@ -66,28 +78,94 @@ struct WasmManifest {
 
 struct PluginManager {
     wasm: Option<WasmRuntime>,
-    native: Vec<NativePlugin>,
+    native: Vec<NativePluginHandle>,
 }
 
 struct WasmRuntime {
+    engine: Engine,
     plugins: Vec<WasmPlugin>,
 }
 
 #[derive(Clone)]
 struct WasmHostState {
     permissions: HashSet<String>,
+    limits: StoreLimits,
 }
 
 struct WasmPlugin {
     name: String,
     module_path: PathBuf,
     permissions: Vec<String>,
+    module: Module,
 }
+
+type NativeInit = unsafe extern "C" fn() -> i32;
+type NativeAbiVersion = unsafe extern "C" fn() -> u32;
+type NativeExecute = unsafe extern "C" fn(*const u8, usize, *mut *mut u8, *mut usize) -> i32;
+type NativeFree = unsafe extern "C" fn(*mut u8, usize);
+type NativeShutdown = unsafe extern "C" fn();
 
 struct NativePlugin {
     name: String,
     path: PathBuf,
+    execute: NativeExecute,
+    free: NativeFree,
+    shutdown: Option<NativeShutdown>,
     _library: Library,
+}
+
+enum NativePluginHandle {
+    InProcess(NativePlugin),
+    Subprocess(SubprocessNativePlugin),
+}
+
+struct SubprocessNativePlugin {
+    name: String,
+    path: PathBuf,
+    org_pubkey_der_b64: String,
+    timeout_ms: u64,
+    sig_mode: String,
+}
+
+fn run_native_plugin_worker(args: NativePluginWorkerArgs) -> Result<(), String> {
+    use std::io::Read;
+
+    let org_pubkey_der = base64::engine::general_purpose::STANDARD
+        .decode(args.org_pubkey_der_b64.as_bytes())
+        .map_err(|e| format!("org_pubkey_der_b64 base64 解码失败: {e}"))?;
+    let org_public_key = load_rsa_public_key(org_pubkey_der.as_slice())?;
+    verify_native_plugin_sig(
+        args.sig_mode.as_str(),
+        &org_public_key,
+        args.plugin_path.as_path(),
+    )?;
+
+    let name = args
+        .plugin_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("native_plugin")
+        .to_string();
+    let plugin = load_native_plugin_in_process(args.plugin_path, name)?;
+
+    let mut stdin_text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut stdin_text)
+        .map_err(|e| format!("读取 stdin 失败: {e}"))?;
+    let input_b64 = stdin_text.lines().find(|l| !l.trim().is_empty());
+    let Some(input_b64) = input_b64 else {
+        return Ok(());
+    };
+    let input = base64::engine::general_purpose::STANDARD
+        .decode(input_b64.trim().as_bytes())
+        .map_err(|e| format!("stdin base64 解码失败: {e}"))?;
+
+    let out = plugin.execute(input.as_slice())?;
+    if let Some(bytes) = out {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
+        println!("{b64}");
+    }
+    Ok(())
 }
 
 impl PluginManager {
@@ -95,6 +173,7 @@ impl PluginManager {
         base_dir: &Path,
         security: &common::config::SecurityConfig,
         org_public_key: &RsaPublicKey,
+        org_pubkey_der: &[u8],
     ) -> Result<Self, String> {
         let wasm = if security.wasm_plugin_paths.is_empty() {
             None
@@ -111,7 +190,7 @@ impl PluginManager {
                         .to_string(),
                 );
             }
-            load_native_plugins(base_dir, security, org_public_key)?
+            load_native_plugins(base_dir, security, org_public_key, org_pubkey_der)?
         };
 
         Ok(Self { wasm, native })
@@ -132,7 +211,13 @@ impl PluginManager {
     }
 
     fn native_plugin_names(&self) -> Vec<String> {
-        self.native.iter().map(|p| p.name.clone()).collect()
+        self.native
+            .iter()
+            .map(|p| match p {
+                NativePluginHandle::InProcess(p) => p.name.clone(),
+                NativePluginHandle::Subprocess(p) => p.name.clone(),
+            })
+            .collect()
     }
 
     fn wasm_plugin_entries(&self) -> Vec<(String, String, usize)> {
@@ -153,10 +238,274 @@ impl PluginManager {
     fn native_plugin_entries(&self) -> Vec<(String, String)> {
         self.native
             .iter()
-            .map(|p| (p.name.clone(), p.path.display().to_string()))
+            .map(|p| match p {
+                NativePluginHandle::InProcess(p) => (p.name.clone(), p.path.display().to_string()),
+                NativePluginHandle::Subprocess(p) => (p.name.clone(), p.path.display().to_string()),
+            })
             .collect()
     }
+
+    fn execute_governed(&self, governor: &mut Governor, input: &[u8]) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+
+        if let Some(wasm) = self.wasm.as_ref() {
+            match wasm.execute_governed(governor, input) {
+                Ok(mut v) => out.append(&mut v),
+                Err(e) => tracing::warn!(error = e, "wasm plugin execute failed"),
+            }
+        }
+
+        for p in &self.native {
+            if !governor.try_consume_budget(1) {
+                break;
+            }
+            match p.execute(input) {
+                Ok(Some(bytes)) => out.push(bytes),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = e, "native plugin execute failed"),
+            }
+        }
+
+        out
+    }
 }
+
+impl NativePluginHandle {
+    fn execute(&self, input: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Self::InProcess(p) => p.execute(input),
+            Self::Subprocess(p) => p.execute(input),
+        }
+    }
+}
+
+impl SubprocessNativePlugin {
+    #[allow(clippy::too_many_lines)]
+    fn execute(&self, input: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+        use std::io::Write;
+        use std::process::Command;
+        use std::process::Stdio;
+        use std::sync::mpsc;
+
+        const MAX_INPUT: usize = 1024 * 1024;
+        const MAX_OUTPUT: usize = 1024 * 1024;
+        if input.len() > MAX_INPUT {
+            return Err(format!(
+                "native input bytes 超限: {} > {}",
+                input.len(),
+                MAX_INPUT
+            ));
+        }
+
+        let exe = std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("--native-plugin-worker")
+            .arg("--plugin")
+            .arg(self.path.as_os_str())
+            .arg("--org-pubkey-der-b64")
+            .arg(self.org_pubkey_der_b64.as_str())
+            .arg("--sig-mode")
+            .arg(self.sig_mode.as_str())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        apply_native_plugin_worker_hardening(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("启动 native 插件子进程失败: {e}"))?;
+
+        #[cfg(windows)]
+        let _job_guard = apply_native_plugin_worker_sandbox_best_effort(&child)?;
+        #[cfg(not(windows))]
+        apply_native_plugin_worker_sandbox_best_effort(&child);
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "native 子进程 stdin 不可用".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "native 子进程 stdout 不可用".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "native 子进程 stderr 不可用".to_string())?;
+
+        let input_b64 = base64::engine::general_purpose::STANDARD.encode(input);
+        stdin
+            .write_all(format!("{input_b64}\n").as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(|e| format!("写入 native 子进程 stdin 失败: {e}"))?;
+        drop(stdin);
+
+        let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
+        let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            drop(std::io::BufReader::new(stdout).read_to_end(&mut buf));
+            drop(stdout_tx.send(buf));
+        });
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            drop(std::io::BufReader::new(stderr).read_to_end(&mut buf));
+            drop(stderr_tx.send(buf));
+        });
+
+        let timeout = Duration::from_millis(self.timeout_ms);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("等待 native 子进程失败: {e}"))?
+            {
+                break status;
+            }
+            if start.elapsed() > timeout {
+                drop(child.kill());
+                drop(child.wait());
+                return Err(format!(
+                    "native 子进程执行超时: {}ms (plugin={})",
+                    self.timeout_ms,
+                    self.path.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let stdout_bytes = stdout_rx.recv().unwrap_or_default();
+        let stderr_bytes = stderr_rx.recv().unwrap_or_default();
+
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(stderr_bytes.as_slice()).to_string();
+            return Err(format!(
+                "native 子进程执行失败: status={status} stderr={stderr}"
+            ));
+        }
+
+        let stdout_text = String::from_utf8_lossy(stdout_bytes.as_slice());
+        let trimmed = stdout_text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let out = base64::engine::general_purpose::STANDARD
+            .decode(trimmed.as_bytes())
+            .map_err(|e| format!("native 子进程 stdout base64 解码失败: {e}"))?;
+        if out.len() > MAX_OUTPUT {
+            return Err(format!(
+                "native output bytes 超限: {} > {}",
+                out.len(),
+                MAX_OUTPUT
+            ));
+        }
+        Ok(Some(out))
+    }
+}
+
+fn apply_native_plugin_worker_hardening(cmd: &mut std::process::Command) {
+    cmd.current_dir(std::env::temp_dir());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let self_key = std::env::var_os("AEGIS_SELF_ED25519_PUBKEY_PATH");
+        cmd.env_clear();
+        if let Some(v) = self_key {
+            cmd.env("AEGIS_SELF_ED25519_PUBKEY_PATH", v);
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_CORE, &raw const core);
+                let nofile = libc::rlimit {
+                    rlim_cur: 128,
+                    rlim_max: 128,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const nofile);
+                Ok(())
+            });
+        }
+    }
+}
+
+#[cfg(windows)]
+struct NativePluginJobGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for NativePluginJobGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn apply_native_plugin_worker_sandbox_best_effort(
+    child: &std::process::Child,
+) -> Result<NativePluginJobGuard, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let job: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job == 0 {
+        return Err(format!(
+            "CreateJobObjectW 失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .unwrap_or(u32::MAX),
+        )
+    };
+    if ok == 0 {
+        unsafe {
+            let _ = CloseHandle(job);
+        }
+        return Err(format!(
+            "SetInformationJobObject 失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let child_handle = child.as_raw_handle() as HANDLE;
+    let ok = unsafe { AssignProcessToJobObject(job, child_handle) };
+    if ok == 0 {
+        unsafe {
+            let _ = CloseHandle(job);
+        }
+        return Err(format!(
+            "AssignProcessToJobObject 失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(NativePluginJobGuard(job))
+}
+
+#[cfg(not(windows))]
+fn apply_native_plugin_worker_sandbox_best_effort(_child: &std::process::Child) {}
 
 fn resolve_config_relative_path(base_dir: &Path, raw: &str) -> PathBuf {
     let p = PathBuf::from(raw);
@@ -170,7 +519,8 @@ fn load_wasm_runtime(
     base_dir: &Path,
     security: &common::config::SecurityConfig,
 ) -> Result<WasmRuntime, String> {
-    let cfg = wasmtime::Config::new();
+    let mut cfg = wasmtime::Config::new();
+    cfg.consume_fuel(true);
     let engine = Engine::new(&cfg).map_err(|e| format!("初始化 Wasm engine 失败: {e}"))?;
 
     let allow: HashSet<&str> = security
@@ -224,11 +574,17 @@ fn load_wasm_runtime(
             &engine,
             WasmHostState {
                 permissions: perms.clone(),
+                limits: default_wasm_store_limits(),
             },
         );
-        linker
+        store.limiter(|s| &mut s.limits);
+        store
+            .set_fuel(10_000_000)
+            .map_err(|e| format!("Wasm set_fuel 失败（{}）: {e}", module_path.display()))?;
+        let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| format!("Wasm instantiate 失败（{}）: {e}", module_path.display()))?;
+        validate_wasm_plugin_instance(&mut store, &instance, module_path.as_path())?;
 
         let name = module_path
             .parent()
@@ -242,10 +598,231 @@ fn load_wasm_runtime(
             name,
             module_path,
             permissions: manifest.permissions,
+            module,
         });
     }
 
-    Ok(WasmRuntime { plugins })
+    Ok(WasmRuntime { engine, plugins })
+}
+
+fn default_wasm_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(64 * 1024 * 1024)
+        .table_elements(20_000)
+        .build()
+}
+
+fn validate_wasm_plugin_instance(
+    store: &mut Store<WasmHostState>,
+    instance: &wasmtime::Instance,
+    module_path: &Path,
+) -> Result<(), String> {
+    if instance
+        .get_func(&mut *store, "aegis_abi_version")
+        .is_some()
+    {
+        let abi = instance
+            .get_typed_func::<(), i32>(&mut *store, "aegis_abi_version")
+            .map_err(|e| {
+                format!(
+                    "Wasm 插件导出 aegis_abi_version 签名不匹配（{}）: {e}",
+                    module_path.display()
+                )
+            })?;
+        let v = abi.call(&mut *store, ()).map_err(|e| {
+            format!(
+                "Wasm 调用 aegis_abi_version 失败（{}）: {e}",
+                module_path.display()
+            )
+        })?;
+        if v != WASM_PLUGIN_ABI_VERSION {
+            return Err(format!(
+                "Wasm 插件 ABI version 不匹配（{}）: plugin={v}, expected={WASM_PLUGIN_ABI_VERSION}",
+                module_path.display()
+            ));
+        }
+    }
+
+    instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| format!("Wasm 插件缺少导出 memory（{}）", module_path.display()))?;
+
+    instance
+        .get_typed_func::<i32, i32>(&mut *store, "aegis_alloc")
+        .map_err(|e| {
+            format!(
+                "Wasm 插件缺少导出 aegis_alloc（{}）: {e}",
+                module_path.display()
+            )
+        })?;
+
+    instance
+        .get_typed_func::<(i32, i32), i64>(&mut *store, "aegis_execute")
+        .map_err(|e| {
+            format!(
+                "Wasm 插件缺少导出 aegis_execute（{}）: {e}",
+                module_path.display()
+            )
+        })?;
+
+    Ok(())
+}
+
+impl WasmRuntime {
+    fn execute_governed(
+        &self,
+        governor: &mut Governor,
+        input: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        const MAX_INPUT: usize = 256 * 1024;
+        if input.len() > MAX_INPUT {
+            return Err(format!(
+                "wasm input bytes 超限: {} > {}",
+                input.len(),
+                MAX_INPUT
+            ));
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for p in &self.plugins {
+            if !governor.try_consume_budget(1) {
+                break;
+            }
+            if let Some(bytes) = execute_single_wasm_plugin(&self.engine, governor, p, input)? {
+                out.push(bytes);
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+fn execute_single_wasm_plugin(
+    engine: &Engine,
+    governor: &mut Governor,
+    plugin: &WasmPlugin,
+    input: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    const MAX_OUTPUT: usize = 256 * 1024;
+    const FUEL_PER_EXEC: u64 = 50_000_000;
+
+    if !governor.try_consume_budget(1) {
+        return Ok(None);
+    }
+
+    let perms: HashSet<String> = plugin.permissions.iter().cloned().collect();
+    let linker = build_wasm_linker(engine, &perms)?;
+    let mut store = Store::new(
+        engine,
+        WasmHostState {
+            permissions: perms,
+            limits: default_wasm_store_limits(),
+        },
+    );
+    store.limiter(|s| &mut s.limits);
+    store.set_fuel(FUEL_PER_EXEC).map_err(|e| {
+        format!(
+            "Wasm set_fuel 失败（{}）: {e}",
+            plugin.module_path.display()
+        )
+    })?;
+    let instance = linker
+        .instantiate(&mut store, &plugin.module)
+        .map_err(|e| {
+            format!(
+                "Wasm instantiate 失败（{}）: {e}",
+                plugin.module_path.display()
+            )
+        })?;
+    validate_wasm_plugin_instance(&mut store, &instance, plugin.module_path.as_path())?;
+
+    let mem = instance
+        .get_memory(&mut store, "memory")
+        .ok_or_else(|| format!("Wasm 插件缺少 memory（{}）", plugin.module_path.display()))?;
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, "aegis_alloc")
+        .map_err(|e| {
+            format!(
+                "Wasm 获取 aegis_alloc 失败（{}）: {e}",
+                plugin.module_path.display()
+            )
+        })?;
+    let exec = instance
+        .get_typed_func::<(i32, i32), i64>(&mut store, "aegis_execute")
+        .map_err(|e| {
+            format!(
+                "Wasm 获取 aegis_execute 失败（{}）: {e}",
+                plugin.module_path.display()
+            )
+        })?;
+    let free = instance
+        .get_typed_func::<(i32, i32), ()>(&mut store, "aegis_free")
+        .ok();
+
+    let input_len = i32::try_from(input.len()).unwrap_or(i32::MAX);
+    let ptr = alloc.call(&mut store, input_len).map_err(|e| {
+        format!(
+            "Wasm aegis_alloc call 失败（{}）: {e}",
+            plugin.module_path.display()
+        )
+    })?;
+    let ptr_usize = usize::try_from(ptr).map_err(|_| "Wasm 返回 ptr 非法".to_string())?;
+    mem.write(&mut store, ptr_usize, input).map_err(|e| {
+        format!(
+            "Wasm 写入 input 失败（{}）: {e}",
+            plugin.module_path.display()
+        )
+    })?;
+
+    let raw = exec.call(&mut store, (ptr, input_len)).map_err(|e| {
+        format!(
+            "Wasm aegis_execute call 失败（{}）: {e}",
+            plugin.module_path.display()
+        )
+    })?;
+    let (out_ptr, out_len) = decode_wasm_ptr_len(raw)
+        .ok_or_else(|| format!("Wasm 返回值无效（{}）: {raw}", plugin.module_path.display()))?;
+    if out_ptr == 0 || out_len == 0 {
+        return Ok(None);
+    }
+
+    let out_len_usize = usize::try_from(out_len).map_err(|_| "Wasm out_len 非法".to_string())?;
+    if out_len_usize > MAX_OUTPUT {
+        return Err(format!(
+            "wasm output bytes 超限: {out_len_usize} > {MAX_OUTPUT}"
+        ));
+    }
+
+    let out_ptr_usize = usize::try_from(out_ptr).map_err(|_| "Wasm out_ptr 非法".to_string())?;
+    let mut buf = vec![0u8; out_len_usize];
+    mem.read(&store, out_ptr_usize, buf.as_mut_slice())
+        .map_err(|e| {
+            format!(
+                "Wasm 读取 output 失败（{}）: {e}",
+                plugin.module_path.display()
+            )
+        })?;
+
+    if let Some(free) = free
+        && let Err(e) = free.call(&mut store, (out_ptr, out_len))
+    {
+        tracing::warn!(error = %e, "Wasm aegis_free failed");
+    }
+
+    Ok(Some(buf))
+}
+
+fn decode_wasm_ptr_len(v: i64) -> Option<(i32, i32)> {
+    if v == 0 {
+        return Some((0, 0));
+    }
+    if v < 0 {
+        return None;
+    }
+    let raw = u64::try_from(v).ok()?;
+    let ptr = (raw & 0xffff_ffff) as u32;
+    let len = (raw >> 32) as u32;
+    Some((i32::try_from(ptr).ok()?, i32::try_from(len).ok()?))
 }
 
 fn build_wasm_linker(
@@ -424,15 +1001,17 @@ fn load_native_plugins(
     base_dir: &Path,
     security: &common::config::SecurityConfig,
     org_public_key: &RsaPublicKey,
-) -> Result<Vec<NativePlugin>, String> {
-    let mut plugins: Vec<NativePlugin> = Vec::new();
+    org_pubkey_der: &[u8],
+) -> Result<Vec<NativePluginHandle>, String> {
+    let isolation = security.native_plugin_isolation.trim();
+    let mut plugins: Vec<NativePluginHandle> = Vec::new();
     for raw_path in &security.native_plugin_paths {
         let path = resolve_config_relative_path(base_dir, raw_path.as_str());
-        verify_native_plugin_sig(org_public_key, path.as_path())?;
-
-        #[allow(unsafe_code)]
-        let lib = unsafe { Library::new(path.as_path()) }
-            .map_err(|e| format!("加载 native 插件失败（{}）: {e}", path.display()))?;
+        verify_native_plugin_sig(
+            security.native_plugin_sig_mode.as_str(),
+            org_public_key,
+            path.as_path(),
+        )?;
 
         let name = path
             .file_stem()
@@ -440,16 +1019,174 @@ fn load_native_plugins(
             .unwrap_or("native_plugin")
             .to_string();
 
-        plugins.push(NativePlugin {
-            name,
-            path,
-            _library: lib,
-        });
+        match isolation {
+            "in_process" => {
+                let p = load_native_plugin_in_process(path, name)?;
+                plugins.push(NativePluginHandle::InProcess(p));
+            }
+            "subprocess" => {
+                let org_pubkey_der_b64 =
+                    base64::engine::general_purpose::STANDARD.encode(org_pubkey_der);
+                plugins.push(NativePluginHandle::Subprocess(SubprocessNativePlugin {
+                    name,
+                    path,
+                    org_pubkey_der_b64,
+                    timeout_ms: security.native_plugin_timeout_ms,
+                    sig_mode: security.native_plugin_sig_mode.clone(),
+                }));
+            }
+            other => {
+                return Err(format!(
+                    "未知 native_plugin_isolation: {other}（仅允许 in_process/subprocess）"
+                ));
+            }
+        }
     }
     Ok(plugins)
 }
 
-fn verify_native_plugin_sig(org_public_key: &RsaPublicKey, path: &Path) -> Result<(), String> {
+#[allow(unsafe_code)]
+fn load_native_symbol<T: Copy>(lib: &Library, name: &'static [u8]) -> Result<T, libloading::Error> {
+    unsafe { lib.get::<T>(name).map(|s| *s) }
+}
+
+fn load_native_plugin_in_process(path: PathBuf, name: String) -> Result<NativePlugin, String> {
+    #[allow(unsafe_code)]
+    let lib = unsafe { Library::new(path.as_path()) }
+        .map_err(|e| format!("加载 native 插件失败（{}）: {e}", path.display()))?;
+
+    let abi_version =
+        load_native_symbol::<NativeAbiVersion>(&lib, b"aegis_plugin_abi_version\0")
+            .map_err(|e| format!("native 插件缺少 abi_version（{}）: {e}", path.display()))?;
+    #[allow(unsafe_code)]
+    let abi_version = unsafe { abi_version() };
+    if abi_version != NATIVE_PLUGIN_ABI_VERSION {
+        return Err(format!(
+            "native 插件 ABI version 不匹配（{}）: plugin={abi_version}, expected={NATIVE_PLUGIN_ABI_VERSION}",
+            path.display()
+        ));
+    }
+
+    let init = load_native_symbol::<NativeInit>(&lib, b"aegis_plugin_init\0")
+        .map_err(|e| format!("native 插件缺少 init（{}）: {e}", path.display()))?;
+    let execute = load_native_symbol::<NativeExecute>(&lib, b"aegis_plugin_execute\0")
+        .map_err(|e| format!("native 插件缺少 execute（{}）: {e}", path.display()))?;
+    let free = load_native_symbol::<NativeFree>(&lib, b"aegis_plugin_free\0")
+        .map_err(|e| format!("native 插件缺少 free（{}）: {e}", path.display()))?;
+    let shutdown = load_native_symbol::<NativeShutdown>(&lib, b"aegis_plugin_shutdown\0").ok();
+
+    #[allow(unsafe_code)]
+    let init_code = unsafe { init() };
+    if init_code != 0 {
+        return Err(format!(
+            "native 插件 init 失败（{}）: code={init_code}",
+            path.display()
+        ));
+    }
+
+    Ok(NativePlugin {
+        name,
+        path,
+        execute,
+        free,
+        shutdown,
+        _library: lib,
+    })
+}
+
+impl NativePlugin {
+    fn execute(&self, input: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        const MAX_INPUT: usize = 1024 * 1024;
+        const MAX_OUTPUT: usize = 1024 * 1024;
+        if input.len() > MAX_INPUT {
+            return Err(format!(
+                "native input bytes 超限: {} > {}",
+                input.len(),
+                MAX_INPUT
+            ));
+        }
+
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        #[allow(unsafe_code)]
+        let code = unsafe {
+            (self.execute)(
+                input.as_ptr(),
+                input.len(),
+                std::ptr::from_mut(&mut out_ptr),
+                std::ptr::from_mut(&mut out_len),
+            )
+        };
+        if code != 0 {
+            return Err(format!("native execute 返回失败 code={code}"));
+        }
+        if out_ptr.is_null() || out_len == 0 {
+            return Ok(None);
+        }
+        if out_len > MAX_OUTPUT {
+            #[allow(unsafe_code)]
+            unsafe {
+                (self.free)(out_ptr, out_len);
+            }
+            return Err(format!(
+                "native output bytes 超限: {out_len} > {MAX_OUTPUT}"
+            ));
+        }
+
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec();
+        #[allow(unsafe_code)]
+        unsafe {
+            (self.free)(out_ptr, out_len);
+        }
+        Ok(Some(bytes))
+    }
+}
+
+impl Drop for NativePlugin {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown {
+            #[allow(unsafe_code)]
+            unsafe {
+                shutdown();
+            }
+        }
+    }
+}
+
+fn verify_native_plugin_sig(
+    sig_mode: &str,
+    org_public_key: &RsaPublicKey,
+    path: &Path,
+) -> Result<(), String> {
+    let ed25519_sig_path = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| path.with_file_name(format!("{f}.ed25519.sig")))
+        .ok_or_else(|| format!("native 插件路径缺少文件名: {}", path.display()))?;
+    let sig_mode = sig_mode.trim();
+    if !matches!(sig_mode, "ed25519" | "rsa_pkcs1v15" | "hybrid") {
+        return Err(format!("未知 native_plugin_sig_mode: {sig_mode}"));
+    }
+    if sig_mode == "ed25519" || (sig_mode == "hybrid" && ed25519_sig_path.exists()) {
+        let key_bytes = std::env::var_os("AEGIS_SELF_ED25519_PUBKEY_PATH")
+            .map(PathBuf::from)
+            .and_then(|p| std::fs::read(p.as_path()).ok())
+            .or_else(|| embedded_self_ed25519::EMBEDDED_SELF_ED25519_PUBKEY.map(<[u8]>::to_vec))
+            .ok_or_else(|| {
+                "native_plugin_sig_mode=ed25519/hybrid 但未提供 Self Ed25519 公钥（AEGIS_SELF_ED25519_PUBKEY_PATH 或构建期内嵌）".to_string()
+            })?;
+        let verifying_key = load_ed25519_verifying_key(key_bytes.as_slice())?;
+        return verify_ed25519_file_signature(&verifying_key, path, false, false);
+    }
+
+    if sig_mode == "ed25519" {
+        return Err(format!(
+            "native_plugin_sig_mode=ed25519 需要签名文件: {}",
+            ed25519_sig_path.display()
+        ));
+    }
+
     let sig_path = path
         .file_name()
         .and_then(|f| f.to_str())
@@ -523,6 +1260,7 @@ enum EncryptorCommand {
     Payload(Vec<u8>),
     Flush,
     UpdateIoLimitMb(u32),
+    UpdateArtifactConfig(ArtifactConfig),
 }
 
 fn main() {
@@ -545,9 +1283,13 @@ fn try_main() -> Result<(), String> {
 }
 
 async fn run_async() -> Result<(), String> {
-    init_telemetry().map_err(|e| format!("初始化日志失败: {e}"))?;
-
     let args = parse_args(std::env::args().skip(1))?;
+    if let Some(worker) = args.native_plugin_worker {
+        run_native_plugin_worker(worker)?;
+        return Ok(());
+    }
+
+    init_telemetry().map_err(|e| format!("初始化日志失败: {e}"))?;
     if let Some(sign) = args.sign_plugin.as_ref() {
         sign_native_plugin_sig(
             sign.key_pem.as_path(),
@@ -558,11 +1300,11 @@ async fn run_async() -> Result<(), String> {
     }
 
     let (bus_tx, bus_rx) = tokio_mpsc::unbounded_channel::<EncryptorCommand>();
-    let (mgr, rule_mgr, encryptor_tx, _plugins) = init_runtime(args, &bus_tx)?;
+    let (mgr, rule_mgr, encryptor_tx, plugins, base_dir) = init_runtime(args, &bus_tx)?;
 
     tokio::spawn(forward_encryptor(bus_rx, encryptor_tx));
 
-    run_forever_async(&mgr, &rule_mgr, &bus_tx).await;
+    run_forever_async(&mgr, &rule_mgr, &plugins, base_dir.as_path(), &bus_tx).await;
     Ok(())
 }
 
@@ -583,6 +1325,7 @@ fn init_runtime(
         RuleManager,
         mpsc::Sender<EncryptorCommand>,
         PluginManager,
+        PathBuf,
     ),
     String,
 > {
@@ -624,7 +1367,19 @@ fn init_runtime(
         .parent()
         .map_or_else(|| PathBuf::from("."), ToOwned::to_owned);
 
-    let plugins = PluginManager::load(out_dir.as_path(), &cfg.security, &org_public_key)?;
+    maybe_self_validate_best_effort(
+        is_unsigned_build(),
+        out_dir.as_path(),
+        config_path.as_path(),
+        &cfg.security,
+    )?;
+
+    let plugins = PluginManager::load(
+        out_dir.as_path(),
+        &cfg.security,
+        &org_public_key,
+        org_pubkey_der.as_slice(),
+    )?;
     tracing::info!(
         wasm_plugins = plugins.wasm_count(),
         wasm_plugin_names = ?plugins.wasm_plugin_names(),
@@ -636,15 +1391,17 @@ fn init_runtime(
     );
 
     let encryptor_tx = spawn_encryptor(
-        out_dir,
+        out_dir.clone(),
         org_public_key,
         org_key_fp,
         uuid_mode,
         user_passphrase,
-        cfg.governor.io_limit_mb,
+        cfg.governor.effective_profile_applied().io_limit_mb,
+        cfg.artifact.clone(),
     );
     enqueue_payload(
         bus_tx,
+        None,
         PayloadEnvelope::system_info(build_system_info()).encode_to_vec(),
     );
 
@@ -660,7 +1417,523 @@ fn init_runtime(
         .start_watching()
         .map_err(|e| format!("启动检测规则热加载失败: {e}"))?;
 
-    Ok((mgr, rule_mgr, encryptor_tx, plugins))
+    Ok((mgr, rule_mgr, encryptor_tx, plugins, out_dir))
+}
+
+struct BloomFilter {
+    bits: Vec<u8>,
+    k: u8,
+}
+
+impl BloomFilter {
+    fn from_bytes_best_effort(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() >= 10 && bytes.get(0..4) == Some(b"AEBF") {
+            let version = *bytes.get(4)?;
+            if version != 1 {
+                return None;
+            }
+            let k = *bytes.get(5)?;
+            let bits_len = u32::from_le_bytes(bytes.get(6..10)?.try_into().ok()?) as usize;
+            let start = 10usize;
+            let end = start.saturating_add(bits_len);
+            let bits = bytes.get(start..end)?.to_vec();
+            if bits.is_empty() {
+                return None;
+            }
+            let k = k.clamp(1, 32);
+            return Some(Self { bits, k });
+        }
+
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            bits: bytes.to_vec(),
+            k: 7,
+        })
+    }
+
+    fn contains(&self, item: &str) -> bool {
+        let normalized = item.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        let m_bits = u64::try_from(self.bits.len()).unwrap_or(u64::MAX) * 8;
+        if m_bits == 0 {
+            return false;
+        }
+        let digest = Sha256::digest(normalized.as_bytes());
+        let digest_bytes = digest.as_slice();
+        let mut h1_bytes = [0u8; 8];
+        let mut h2_bytes = [0u8; 8];
+        h1_bytes.copy_from_slice(&digest_bytes[0..8]);
+        h2_bytes.copy_from_slice(&digest_bytes[8..16]);
+        let h1 = u64::from_le_bytes(h1_bytes);
+        let mut h2 = u64::from_le_bytes(h2_bytes);
+        if h2 == 0 {
+            h2 = 0x9e37_79b9_7f4a_7c15;
+        }
+        let hash_count = u64::from(self.k);
+        for i in 0..hash_count {
+            let idx = h1.wrapping_add(h2.wrapping_mul(i)).rem_euclid(m_bits);
+            if !bit_is_set(self.bits.as_slice(), idx) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn bit_is_set(bytes: &[u8], bit_index: u64) -> bool {
+    let byte = usize::try_from(bit_index / 8).unwrap_or(usize::MAX);
+    let bit = u8::try_from(bit_index % 8).unwrap_or(u8::MAX);
+    let Some(v) = bytes.get(byte) else {
+        return false;
+    };
+    (v & (1u8 << bit)) != 0
+}
+
+struct SmartReflexEngine {
+    bloom: Option<BloomFilter>,
+    bloom_path: PathBuf,
+    feed: HashSet<String>,
+    feed_path: PathBuf,
+    next_reload_at: Instant,
+    last_bloom_mtime: Option<SystemTime>,
+    last_feed_mtime: Option<SystemTime>,
+}
+
+#[derive(Clone, Copy)]
+enum SmartReflexSource {
+    Bloom,
+    Feed,
+}
+
+impl SmartReflexEngine {
+    fn load_best_effort(base_dir: &Path) -> Self {
+        let bloom_path = base_dir.join("c2_bloom.bin");
+        let (bloom, last_bloom_mtime) = Self::load_bloom_best_effort(bloom_path.as_path());
+        let feed_path = base_dir.join("community_feed.txt");
+        let (feed, last_feed_mtime) = Self::load_feed_best_effort(feed_path.as_path());
+        Self {
+            bloom,
+            bloom_path,
+            feed,
+            feed_path,
+            next_reload_at: Instant::now(),
+            last_bloom_mtime,
+            last_feed_mtime,
+        }
+    }
+
+    fn maybe_reload(&mut self) {
+        if self.next_reload_at > Instant::now() {
+            return;
+        }
+        self.next_reload_at = Instant::now() + Duration::from_secs(30);
+
+        if let Some(m) = std::fs::metadata(self.bloom_path.as_path())
+            .ok()
+            .and_then(|m| m.modified().ok())
+        {
+            if self.last_bloom_mtime.is_none_or(|v| v != m) {
+                let (bloom, mtime) = Self::load_bloom_best_effort(self.bloom_path.as_path());
+                if bloom.is_some() {
+                    self.bloom = bloom;
+                    self.last_bloom_mtime = mtime;
+                }
+            }
+        } else if self.bloom.is_none() {
+            let (bloom, mtime) = Self::load_bloom_best_effort(self.bloom_path.as_path());
+            if bloom.is_some() {
+                self.bloom = bloom;
+                self.last_bloom_mtime = mtime;
+            }
+        }
+
+        if let Some(m) = std::fs::metadata(self.feed_path.as_path())
+            .ok()
+            .and_then(|m| m.modified().ok())
+        {
+            if self.last_feed_mtime.is_none_or(|v| v != m) {
+                let (feed, mtime) = Self::load_feed_best_effort(self.feed_path.as_path());
+                if !feed.is_empty() {
+                    self.feed = feed;
+                    self.last_feed_mtime = mtime;
+                }
+            }
+        } else if self.feed.is_empty() {
+            let (feed, mtime) = Self::load_feed_best_effort(self.feed_path.as_path());
+            if !feed.is_empty() {
+                self.feed = feed;
+                self.last_feed_mtime = mtime;
+            }
+        }
+    }
+
+    fn has_indicators(&self) -> bool {
+        self.bloom.is_some() || !self.feed.is_empty()
+    }
+
+    fn matches_text(&mut self, text: &str) -> Vec<(String, SmartReflexSource)> {
+        self.maybe_reload();
+
+        let mut out: Vec<(String, SmartReflexSource)> = Vec::new();
+        for tok in tokenize_indicators(text) {
+            if tok.len() > 253 {
+                continue;
+            }
+            let indicator = normalize_indicator(tok.as_str());
+            if indicator.is_empty() {
+                continue;
+            }
+            if out.iter().any(|(s, _)| s == &indicator) {
+                continue;
+            }
+            let in_feed = self.feed.contains(indicator.as_str());
+            let in_bloom = self
+                .bloom
+                .as_ref()
+                .is_some_and(|b| b.contains(indicator.as_str()));
+            if in_feed || in_bloom {
+                let source = if in_feed {
+                    SmartReflexSource::Feed
+                } else {
+                    SmartReflexSource::Bloom
+                };
+                out.push((indicator, source));
+                if out.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn load_bloom_best_effort(path: &Path) -> (Option<BloomFilter>, Option<SystemTime>) {
+        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let bloom = std::fs::read(path)
+            .ok()
+            .and_then(|b| BloomFilter::from_bytes_best_effort(b.as_slice()));
+        (bloom, mtime)
+    }
+
+    fn load_feed_best_effort(path: &Path) -> (HashSet<String>, Option<SystemTime>) {
+        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let Ok(bytes) = std::fs::read(path) else {
+            return (HashSet::new(), mtime);
+        };
+        let text = String::from_utf8_lossy(bytes.as_slice());
+        let mut out: HashSet<String> = HashSet::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let indicator = normalize_indicator(line);
+            if indicator.is_empty() {
+                continue;
+            }
+            out.insert(indicator);
+        }
+        (out, mtime)
+    }
+}
+
+fn tokenize_indicators(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/' | '\\'))
+    })
+    .filter(|s| !s.is_empty())
+    .map(ToString::to_string)
+}
+
+fn normalize_indicator(raw: &str) -> String {
+    let s = raw
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut s = s.to_ascii_lowercase();
+    if let Some(pos) = s.find("://") {
+        s = s[pos + 3..].to_string();
+    }
+    if let Some(pos) = s.find('/') {
+        s = s[..pos].to_string();
+    }
+    if let Some(pos) = s.find('\\') {
+        s = s[..pos].to_string();
+    }
+    if let Some(pos) = s.rfind(':') {
+        let (host, port) = s.split_at(pos);
+        if port.len() > 1 && port[1..].chars().all(|c| c.is_ascii_digit()) {
+            s = host.to_string();
+        }
+    }
+    if !s.contains('.') {
+        return String::new();
+    }
+    if s.starts_with('.') || s.ends_with('.') || s.contains("..") {
+        return String::new();
+    }
+    s
+}
+
+fn emit_smart_reflex_from_process_payload_best_effort(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    bus_tx: &EventBusTx,
+    payload: &[u8],
+) {
+    if !state.smart_reflex.has_indicators() {
+        state.smart_reflex.maybe_reload();
+        if !state.smart_reflex.has_indicators() {
+            return;
+        }
+    }
+    if !governor.try_consume_budget(1) {
+        return;
+    }
+    let Ok(env) = PayloadEnvelope::decode(payload) else {
+        return;
+    };
+    let Some(payload_envelope::Payload::ProcessInfo(p)) = env.payload else {
+        return;
+    };
+
+    let mut indicators: Vec<(String, SmartReflexSource)> = Vec::new();
+    indicators.extend(state.smart_reflex.matches_text(p.cmdline.as_str()));
+    indicators.extend(state.smart_reflex.matches_text(p.exe_path.as_str()));
+
+    for (indicator, source) in indicators {
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+        let ev = SmartReflexEvidence {
+            matched_at: unix_timestamp_now(),
+            score: 80,
+            kind: match source {
+                SmartReflexSource::Bloom => "c2_bloom",
+                SmartReflexSource::Feed => "community_feed",
+            }
+            .to_string(),
+            indicator,
+            pid: p.pid,
+            exec_id: p.exec_id,
+        };
+        enqueue_payload(
+            bus_tx,
+            Some(&state.dropped_counter),
+            PayloadEnvelope::smart_reflex_evidence(ev).encode_to_vec(),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_smart_reflex_from_ebpf_events_best_effort(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    bus_tx: &EventBusTx,
+    events: &[EbpfEvent],
+) {
+    if !state.smart_reflex.has_indicators() {
+        state.smart_reflex.maybe_reload();
+        if !state.smart_reflex.has_indicators() {
+            return;
+        }
+    }
+    if !governor.try_consume_budget(1) {
+        return;
+    }
+
+    let mut emitted: u32 = 0;
+    for ev in events {
+        if emitted >= 8 {
+            break;
+        }
+        if ev.detail.trim().is_empty() {
+            continue;
+        }
+        let indicators = state.smart_reflex.matches_text(ev.detail.as_str());
+        for (indicator, source) in indicators {
+            if emitted >= 8 {
+                break;
+            }
+            if !governor.try_consume_budget(1) {
+                return;
+            }
+            let prefix = match source {
+                SmartReflexSource::Bloom => "c2_bloom",
+                SmartReflexSource::Feed => "community_feed",
+            };
+            let out = SmartReflexEvidence {
+                matched_at: unix_timestamp_now(),
+                score: 70,
+                kind: format!("{prefix}_{}", ev.kind),
+                indicator,
+                pid: ev.pid,
+                exec_id: ev.exec_id,
+            };
+            enqueue_payload(
+                bus_tx,
+                Some(&state.dropped_counter),
+                PayloadEnvelope::smart_reflex_evidence(out).encode_to_vec(),
+            );
+            emitted = emitted.saturating_add(1);
+        }
+    }
+}
+
+fn emit_plugin_outputs_governed(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    plugins: &PluginManager,
+    bus_tx: &EventBusTx,
+    input: &[u8],
+) {
+    let outputs = plugins.execute_governed(governor, input);
+    if outputs.is_empty() {
+        return;
+    }
+
+    let mut any = false;
+    for bytes in outputs {
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+        let Ok(env) = PayloadEnvelope::decode(bytes.as_slice()) else {
+            state.dropped_counter.add(1);
+            continue;
+        };
+        if env.payload.is_none() {
+            continue;
+        }
+        any = true;
+        enqueue_payload(bus_tx, Some(&state.dropped_counter), env.encode_to_vec());
+    }
+
+    if any && bus_tx.send(EncryptorCommand::Flush).is_err() {
+        state.dropped_counter.add(1);
+        tracing::warn!("encryptor channel closed");
+    }
+}
+
+fn maybe_self_validate_best_effort(
+    is_unsigned_build: bool,
+    base_dir: &Path,
+    config_path: &Path,
+    security: &common::config::SecurityConfig,
+) -> Result<(), String> {
+    let key_bytes = std::env::var_os("AEGIS_SELF_ED25519_PUBKEY_PATH")
+        .map(PathBuf::from)
+        .and_then(|p| std::fs::read(p.as_path()).ok())
+        .or_else(|| embedded_self_ed25519::EMBEDDED_SELF_ED25519_PUBKEY.map(<[u8]>::to_vec));
+
+    let Some(key_bytes) = key_bytes else {
+        return Ok(());
+    };
+
+    let verifying_key = load_ed25519_verifying_key(key_bytes.as_slice())?;
+    let exe = std::env::current_exe().map_err(|e| format!("获取当前可执行文件路径失败: {e}"))?;
+    verify_ed25519_file_signature(&verifying_key, exe.as_path(), true, is_unsigned_build)?;
+
+    verify_ed25519_file_signature(&verifying_key, config_path, false, false)?;
+    for raw in &security.yara_rule_paths {
+        let p = resolve_config_relative_path(base_dir, raw.as_str());
+        verify_ed25519_file_signature(&verifying_key, p.as_path(), false, false)?;
+    }
+    Ok(())
+}
+
+fn load_ed25519_verifying_key(bytes: &[u8]) -> Result<Ed25519VerifyingKey, String> {
+    let raw = parse_ed25519_pubkey_bytes(bytes)?;
+    let key: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Ed25519 public key 长度必须为 32 bytes".to_string())?;
+    Ed25519VerifyingKey::from_bytes(&key).map_err(|e| format!("解析 Ed25519 public key 失败: {e}"))
+}
+
+fn parse_ed25519_pubkey_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8(bytes.to_vec()).ok();
+    if let Some(text) = text {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(trimmed.as_bytes())
+                .map_err(|e| format!("base64 解码失败: {e}"))?;
+            if raw.len() == 32 {
+                return Ok(raw);
+            }
+        }
+    }
+    if bytes.len() == 32 {
+        return Ok(bytes.to_vec());
+    }
+    Err("Ed25519 public key 格式无效".to_string())
+}
+
+fn parse_ed25519_sig_bytes(sig_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8(sig_bytes.to_vec()).ok();
+    if let Some(text) = text {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(trimmed.as_bytes())
+                .map_err(|e| format!("base64 解码失败: {e}"))?;
+            if raw.len() == 64 {
+                return Ok(raw);
+            }
+        }
+    }
+    if sig_bytes.len() == 64 {
+        return Ok(sig_bytes.to_vec());
+    }
+    Err("Ed25519 signature 格式无效".to_string())
+}
+
+fn verify_ed25519_file_signature(
+    verifying_key: &Ed25519VerifyingKey,
+    file_path: &Path,
+    is_self_exe: bool,
+    allow_missing_sig: bool,
+) -> Result<(), String> {
+    let sig_path = file_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| file_path.with_file_name(format!("{f}.ed25519.sig")))
+        .ok_or_else(|| format!("路径缺少文件名: {}", file_path.display()))?;
+
+    if !sig_path.exists() {
+        if allow_missing_sig {
+            return Ok(());
+        }
+        if is_self_exe {
+            return Err(format!("缺少自校验签名文件: {}", sig_path.display()));
+        }
+        return Err(format!("缺少签名文件: {}", sig_path.display()));
+    }
+
+    let file_bytes = std::fs::read(file_path)
+        .map_err(|e| format!("读取文件失败（{}）: {e}", file_path.display()))?;
+    let sig_bytes = std::fs::read(sig_path.as_path())
+        .map_err(|e| format!("读取签名失败（{}）: {e}", sig_path.display()))?;
+    let raw = parse_ed25519_sig_bytes(sig_bytes.as_slice())
+        .map_err(|e| format!("解析签名失败（{}）: {e}", sig_path.display()))?;
+    let sig: [u8; 64] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Ed25519 signature 长度必须为 64 bytes".to_string())?;
+    let sig = Ed25519Signature::from_bytes(&sig);
+    verifying_key
+        .verify_strict(file_bytes.as_slice(), &sig)
+        .map_err(|e| format!("Ed25519 签名验证失败（{}）: {e}", file_path.display()))?;
+    Ok(())
 }
 
 struct LoopState {
@@ -674,12 +1947,30 @@ struct LoopState {
     last_network_update_ts: i64,
     process_exec_id_counter: std::sync::atomic::AtomicU64,
     dropped_counter: DroppedEventCounter,
+    smart_reflex: SmartReflexEngine,
     #[cfg(target_os = "linux")]
     last_bpf_snapshot: Instant,
+    #[cfg(target_os = "linux")]
+    last_linux_kernel_forensics: Instant,
+    #[cfg(target_os = "linux")]
+    last_ebpf_poll: Instant,
+    #[cfg(target_os = "linux")]
+    last_ebpf_open_attempt: Instant,
+    #[cfg(target_os = "linux")]
+    last_ebpf_attach_attempt: Instant,
+    #[cfg(target_os = "linux")]
+    last_ebpf_exec_id_open_attempt: Instant,
+    #[cfg(target_os = "linux")]
+    ebpf_ringbuf: Option<common::collectors::linux::RingbufReader>,
+    #[cfg(target_os = "linux")]
+    ebpf_producer: Option<common::collectors::linux::EbpfProducer>,
+    #[cfg(target_os = "linux")]
+    ebpf_exec_id_map: Option<std::os::fd::OwnedFd>,
 }
 
 impl LoopState {
-    fn new() -> Self {
+    fn new(base_dir: &Path) -> Self {
+        let smart_reflex = SmartReflexEngine::load_best_effort(base_dir);
         Self {
             last_telemetry: Instant::now(),
             last_dropped_total: 0,
@@ -691,38 +1982,82 @@ impl LoopState {
             last_network_update_ts: 0,
             process_exec_id_counter: std::sync::atomic::AtomicU64::new(0),
             dropped_counter: DroppedEventCounter::default(),
+            smart_reflex,
             #[cfg(target_os = "linux")]
             last_bpf_snapshot: Instant::now(),
+            #[cfg(target_os = "linux")]
+            last_linux_kernel_forensics: Instant::now(),
+            #[cfg(target_os = "linux")]
+            last_ebpf_poll: Instant::now(),
+            #[cfg(target_os = "linux")]
+            last_ebpf_open_attempt: Instant::now(),
+            #[cfg(target_os = "linux")]
+            last_ebpf_attach_attempt: Instant::now(),
+            #[cfg(target_os = "linux")]
+            last_ebpf_exec_id_open_attempt: Instant::now(),
+            #[cfg(target_os = "linux")]
+            ebpf_ringbuf: None,
+            #[cfg(target_os = "linux")]
+            ebpf_producer: None,
+            #[cfg(target_os = "linux")]
+            ebpf_exec_id_map: None,
         }
     }
 }
 
-async fn run_forever_async(mgr: &ConfigManager, rule_mgr: &RuleManager, bus_tx: &EventBusTx) {
+async fn run_forever_async(
+    mgr: &ConfigManager,
+    rule_mgr: &RuleManager,
+    plugins: &PluginManager,
+    base_dir: &Path,
+    bus_tx: &EventBusTx,
+) {
     tracing::info!("probe started");
-    let mut governor = Governor::new(mgr.current().governor.clone());
-    let mut state = LoopState::new();
+    let initial_cfg = mgr.current();
+    let mut governor = Governor::new(&initial_cfg.governor);
+    let mut state = LoopState::new(base_dir);
+    tokio::spawn(community_feed_autopull_loop(base_dir.to_path_buf()));
     let mut last_encryptor_io_limit_mb: Option<u32> = None;
+    let mut last_artifact_cfg: Option<ArtifactConfig> = None;
 
     loop {
         let cfg = mgr.current();
         let rules = rule_mgr.current();
-        governor.apply_config(cfg.governor.clone());
+        let governor_cfg = cfg.governor.effective_profile_applied();
+        governor.apply_config(&governor_cfg);
         let (cpu_usage_percent, sleep) = governor.tick_with_usage();
 
-        if last_encryptor_io_limit_mb != Some(cfg.governor.io_limit_mb) {
+        if last_encryptor_io_limit_mb != Some(governor_cfg.io_limit_mb) {
             if bus_tx
-                .send(EncryptorCommand::UpdateIoLimitMb(cfg.governor.io_limit_mb))
+                .send(EncryptorCommand::UpdateIoLimitMb(governor_cfg.io_limit_mb))
                 .is_err()
             {
                 tracing::warn!("encryptor channel closed");
             }
-            last_encryptor_io_limit_mb = Some(cfg.governor.io_limit_mb);
+            last_encryptor_io_limit_mb = Some(governor_cfg.io_limit_mb);
         }
 
-        maybe_emit_process_snapshot(&mut state, &mut governor, bus_tx);
+        if last_artifact_cfg.as_ref() != Some(&cfg.artifact) {
+            if bus_tx
+                .send(EncryptorCommand::UpdateArtifactConfig(cfg.artifact.clone()))
+                .is_err()
+            {
+                tracing::warn!("encryptor channel closed");
+            }
+            last_artifact_cfg = Some(cfg.artifact.clone());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            maybe_attach_aegis_ebpf_best_effort(&mut state, &mut governor, &cfg.security);
+        }
+
+        maybe_emit_process_snapshot(&mut state, &mut governor, cfg.as_ref(), plugins, bus_tx);
         maybe_emit_file_snapshot(&mut state, &mut governor, rules.as_ref(), bus_tx);
         maybe_emit_network_update(&mut state, &mut governor, bus_tx);
         maybe_emit_linux_bpf_snapshot(&mut state, &mut governor);
+        maybe_emit_linux_kernel_forensics_evidence(&mut state, &mut governor, bus_tx);
+        maybe_emit_linux_ebpf_events(&mut state, &mut governor, &cfg.security, bus_tx);
         maybe_emit_telemetry(
             &mut state,
             cfg.as_ref(),
@@ -738,6 +2073,8 @@ async fn run_forever_async(mgr: &ConfigManager, rule_mgr: &RuleManager, bus_tx: 
 fn maybe_emit_process_snapshot(
     state: &mut LoopState,
     governor: &mut Governor,
+    cfg: &common::config::AegisConfig,
+    plugins: &PluginManager,
     bus_tx: &EventBusTx,
 ) {
     if state.last_process_snapshot.elapsed() < Duration::from_secs(60) {
@@ -747,17 +2084,75 @@ fn maybe_emit_process_snapshot(
         return;
     }
 
-    let processes = collect_process_snapshot(governor, &state.process_exec_id_counter, 64);
+    let processes = collect_process_snapshot(
+        governor,
+        &state.process_exec_id_counter,
+        cfg.security.ebpf_pin_dir.as_deref(),
+        64,
+    );
     let total = processes.len();
     let mut sent: usize = 0;
     for p in processes {
+        let is_ghost = p.is_ghost;
+        #[cfg(windows)]
+        let pid = p.pid;
+        #[cfg(windows)]
+        let exec_id = p.exec_id;
+        #[cfg(windows)]
+        let exe_path = p.exe_path.clone();
+
         if !governor.try_consume_budget(1) {
             let dropped = u64::try_from(total.saturating_sub(sent)).unwrap_or(u64::MAX);
             state.dropped_counter.add(dropped);
             break;
         }
-        enqueue_payload(bus_tx, PayloadEnvelope::process_info(p).encode_to_vec());
+        let encoded = PayloadEnvelope::process_info(p).encode_to_vec();
+        enqueue_payload(bus_tx, Some(&state.dropped_counter), encoded.clone());
         sent = sent.saturating_add(1);
+
+        emit_smart_reflex_from_process_payload_best_effort(
+            state,
+            governor,
+            bus_tx,
+            encoded.as_slice(),
+        );
+        emit_plugin_outputs_governed(state, governor, plugins, bus_tx, encoded.as_slice());
+
+        if is_ghost {
+            #[cfg(windows)]
+            {
+                if let Some(ev) =
+                    common::collectors::windows::collect_process_ghosting_evidence_governed(
+                        governor,
+                        pid,
+                        exe_path.as_str(),
+                    )
+                    && governor.try_consume_budget(1)
+                {
+                    enqueue_payload(
+                        bus_tx,
+                        Some(&state.dropped_counter),
+                        PayloadEnvelope::process_ghosting_evidence(ev).encode_to_vec(),
+                    );
+                }
+
+                if let Some(ev) =
+                    common::collectors::windows::collect_windows_memory_forensics_evidence_governed_with_depth(
+                        governor,
+                        pid,
+                        exec_id,
+                        cfg.forensics.windows_memory_scan_depth,
+                    )
+                    && governor.try_consume_budget(1)
+                {
+                    enqueue_payload(
+                        bus_tx,
+                        Some(&state.dropped_counter),
+                        PayloadEnvelope::windows_memory_forensics_evidence(ev).encode_to_vec(),
+                    );
+                }
+            }
+        }
     }
     state.last_process_snapshot = Instant::now();
 }
@@ -779,7 +2174,10 @@ fn maybe_emit_file_snapshot(
         return;
     }
 
-    let files = collect_file_snapshot(rules);
+    #[cfg(windows)]
+    emit_windows_usn_journal_best_effort(state, governor, rules, bus_tx);
+
+    let files = collect_file_snapshot(governor, rules);
     let total = files.len();
     let mut sent: usize = 0;
     for f in files {
@@ -788,10 +2186,68 @@ fn maybe_emit_file_snapshot(
             state.dropped_counter.add(dropped);
             break;
         }
-        enqueue_payload(bus_tx, PayloadEnvelope::file_info(f).encode_to_vec());
+        enqueue_payload(
+            bus_tx,
+            Some(&state.dropped_counter),
+            PayloadEnvelope::file_info(f).encode_to_vec(),
+        );
         sent = sent.saturating_add(1);
     }
     state.last_file_snapshot = Instant::now();
+}
+
+#[cfg(windows)]
+fn emit_windows_usn_journal_best_effort(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    rules: &RuleSet,
+    bus_tx: &EventBusTx,
+) {
+    if !governor.try_consume_budget(1) {
+        return;
+    }
+
+    let mut drives: Vec<char> = rules
+        .scan_whitelist()
+        .iter()
+        .filter_map(|p| common::collectors::windows::drive_letter(Path::new(p)))
+        .map(|d| d.to_ascii_uppercase())
+        .collect();
+    drives.sort_unstable();
+    drives.dedup();
+
+    for d in drives {
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+
+        let Some(bytes) = common::collectors::windows::collect_usn_journal_tsv_best_effort(
+            governor, d, 2000, 2_000_000,
+        ) else {
+            continue;
+        };
+
+        let drive_u8 = u8::try_from(d as u32).unwrap_or(0);
+        let now = u64::try_from(unix_timestamp_now()).unwrap_or(0);
+        let evidence_id = (now << 8) | u64::from(drive_u8);
+        let Ok(chunker) = EvidenceChunker::new(
+            bytes.as_slice(),
+            512 * 1024,
+            evidence_id,
+            format!("windows_usn_journal:{d}"),
+            "text/tab-separated-values",
+        ) else {
+            continue;
+        };
+
+        for env in chunker {
+            if !governor.try_consume_budget(1) {
+                state.dropped_counter.add(1);
+                break;
+            }
+            enqueue_payload(bus_tx, Some(&state.dropped_counter), env.encode_to_vec());
+        }
+    }
 }
 
 fn maybe_emit_network_update(state: &mut LoopState, governor: &mut Governor, bus_tx: &EventBusTx) {
@@ -810,6 +2266,7 @@ fn maybe_emit_network_update(state: &mut LoopState, governor: &mut Governor, bus
         }
         enqueue_payload(
             bus_tx,
+            Some(&state.dropped_counter),
             PayloadEnvelope::network_interface_update(NetworkInterfaceUpdate {
                 timestamp: ts,
                 new_ip_addresses: ip_addresses.clone(),
@@ -822,7 +2279,7 @@ fn maybe_emit_network_update(state: &mut LoopState, governor: &mut Governor, bus
     state.last_network_snapshot = Instant::now();
 }
 
-fn collect_file_snapshot(rules: &RuleSet) -> Vec<FileInfo> {
+fn collect_file_snapshot(governor: &mut Governor, rules: &RuleSet) -> Vec<FileInfo> {
     #[cfg(windows)]
     {
         let mut by_drive: BTreeMap<Option<char>, Vec<String>> = BTreeMap::new();
@@ -850,7 +2307,8 @@ fn collect_file_snapshot(rules: &RuleSet) -> Vec<FileInfo> {
                 (Some(s.drive_letter), Some(s.device_path.as_str()))
             });
 
-            let mut infos = common::collectors::windows::collect_file_infos(
+            let mut infos = common::collectors::windows::collect_file_infos_governed(
+                Some(governor),
                 paths.as_slice(),
                 rules.timestomp_threshold_ms(),
                 vss_drive,
@@ -862,7 +2320,7 @@ fn collect_file_snapshot(rules: &RuleSet) -> Vec<FileInfo> {
     }
     #[cfg(not(windows))]
     {
-        let _ = rules;
+        let _ = (governor, rules);
         Vec::new()
     }
 }
@@ -872,6 +2330,182 @@ fn truthy_env(key: &str) -> bool {
         let v = v.trim().to_ascii_lowercase();
         v == "1" || v == "true" || v == "yes"
     })
+}
+
+fn read_env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn read_env_u64(name: &str) -> Option<u64> {
+    read_env_string(name).and_then(|s| s.parse::<u64>().ok())
+}
+
+fn read_env_usize(name: &str) -> Option<usize> {
+    read_env_string(name).and_then(|s| s.parse::<usize>().ok())
+}
+
+fn parse_community_feed_text(text: &str) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let indicator = normalize_indicator(line);
+        if indicator.is_empty() {
+            continue;
+        }
+        out.insert(indicator);
+    }
+    out
+}
+
+fn write_atomic_best_effort(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::other("target path has no parent dir"));
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| std::io::Error::other("target path has no filename"))?;
+    let tmp = parent.join(format!("{file_name}.tmp"));
+    let backup = parent.join(format!("{file_name}.bak"));
+
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(tmp.as_path())?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    let _sync_all_ignored = f.sync_all();
+    drop(f);
+
+    let _remove_backup_ignored = std::fs::remove_file(backup.as_path());
+    if path.exists() && std::fs::rename(path, backup.as_path()).is_err() {
+        let _remove_tmp_ignored = std::fs::remove_file(tmp.as_path());
+        return Err(std::io::Error::other(
+            "backup existing community feed failed",
+        ));
+    }
+
+    match std::fs::rename(tmp.as_path(), path) {
+        Ok(()) => {
+            let _remove_backup_ignored = std::fs::remove_file(backup.as_path());
+            Ok(())
+        }
+        Err(e) => {
+            if backup.exists() {
+                let _restore_backup_ignored = std::fs::rename(backup.as_path(), path);
+            }
+            let _remove_tmp_ignored = std::fs::remove_file(tmp.as_path());
+            Err(e)
+        }
+    }
+}
+
+async fn community_feed_autopull_loop(base_dir: PathBuf) {
+    let Some(url) = read_env_string("AEGIS_COMMUNITY_FEED_URL") else {
+        return;
+    };
+
+    let interval_secs = read_env_u64("AEGIS_COMMUNITY_FEED_PULL_INTERVAL_SECS")
+        .unwrap_or(3600)
+        .clamp(60, 86400 * 30);
+    let timeout_secs = read_env_u64("AEGIS_COMMUNITY_FEED_TIMEOUT_SECS")
+        .unwrap_or(10)
+        .clamp(2, 60);
+    let max_bytes = read_env_usize("AEGIS_COMMUNITY_FEED_MAX_BYTES")
+        .unwrap_or(2_000_000)
+        .clamp(1024, 20_000_000);
+
+    let client = match reqwest::Client::builder()
+        .user_agent("AegisProbe/0.0.1")
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "init community feed http client failed");
+            return;
+        }
+    };
+
+    let feed_path = base_dir.join("community_feed.txt");
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let _ = ticker.tick().await;
+
+        let should_fetch = match std::fs::metadata(feed_path.as_path())
+            .ok()
+            .and_then(|m| m.modified().ok())
+        {
+            None => true,
+            Some(mtime) => match SystemTime::now().duration_since(mtime) {
+                Ok(age) => age >= Duration::from_secs(interval_secs),
+                Err(_) => true,
+            },
+        };
+        if !should_fetch {
+            continue;
+        }
+
+        let resp = match client.get(url.as_str()).send().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "pull community feed failed");
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            tracing::warn!(status = %resp.status(), "pull community feed non-success status");
+            continue;
+        }
+
+        if let Some(len) = resp.content_length()
+            && usize::try_from(len).ok().is_some_and(|v| v > max_bytes)
+        {
+            tracing::warn!(content_length = len, max_bytes, "community feed too large");
+            continue;
+        }
+
+        let bytes = match resp.bytes().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "read community feed body failed");
+                continue;
+            }
+        };
+        if bytes.len() > max_bytes {
+            tracing::warn!(bytes = bytes.len(), max_bytes, "community feed too large");
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(bytes.as_ref());
+        let parsed = parse_community_feed_text(text.as_ref());
+        if parsed.is_empty() {
+            tracing::warn!("pulled community feed has no valid indicators");
+            continue;
+        }
+
+        if let Err(e) = write_atomic_best_effort(feed_path.as_path(), bytes.as_ref()) {
+            tracing::warn!(error = %e, "write community feed failed");
+            continue;
+        }
+
+        tracing::info!(indicators = parsed.len(), "community feed updated");
+    }
 }
 
 fn vss_fast_mode() -> bool {
@@ -1916,23 +3550,35 @@ fn maybe_emit_telemetry(
     }
 
     let interval = state.last_telemetry.elapsed();
-    let dropped_events_count = {
-        let base = governor.dropped_events();
-        base.saturating_add(state.dropped_counter.total())
-    };
+    let governor_dropped = governor.dropped_events();
+    let loop_dropped = state.dropped_counter.total();
+    #[cfg(target_os = "linux")]
+    let ringbuf_dropped = common::collectors::linux::read_ringbuf_dropped_events_best_effort(
+        governor,
+        cfg.security.ebpf_pin_dir.as_deref(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let ringbuf_dropped = 0u64;
+    let dropped_events_count = governor_dropped
+        .saturating_add(loop_dropped)
+        .saturating_add(ringbuf_dropped);
 
     let dropped_delta = dropped_events_count.saturating_sub(state.last_dropped_total);
+    let mut dropped_rate_percent: u32 = 0;
+    let mut overloaded: bool = false;
     if let Some(drop_rate_percent) = compute_drop_rate_percent(
         dropped_delta,
         interval,
         cfg.governor.effective_tokens_per_sec(),
     ) {
+        dropped_rate_percent = drop_rate_percent;
         if drop_rate_percent > 1 {
             state.overload_streak = state.overload_streak.saturating_add(1);
         } else {
             state.overload_streak = 0;
         }
         if state.overload_streak >= 2 {
+            overloaded = true;
             tracing::warn!(
                 status = "Overloaded",
                 drop_rate_percent,
@@ -1948,19 +3594,29 @@ fn maybe_emit_telemetry(
         cpu_usage_percent,
         memory_usage_mb: sample_memory_usage_mb(),
         dropped_events_count,
+        dropped_governor: governor_dropped,
+        dropped_loop: loop_dropped,
+        dropped_ringbuf: ringbuf_dropped,
+        dropped_rate_percent,
+        overloaded,
     };
     tracing::info!(
         telemetry_timestamp = telemetry.timestamp,
         cpu_usage_percent = telemetry.cpu_usage_percent,
         memory_usage_mb = telemetry.memory_usage_mb,
+        dropped_governor = governor_dropped,
+        dropped_loop = loop_dropped,
+        dropped_ringbuf = ringbuf_dropped,
         dropped_events_count = telemetry.dropped_events_count,
         "agent telemetry"
     );
     enqueue_payload(
         bus_tx,
+        Some(&state.dropped_counter),
         PayloadEnvelope::agent_telemetry(telemetry).encode_to_vec(),
     );
     if bus_tx.send(EncryptorCommand::Flush).is_err() {
+        state.dropped_counter.add(1);
         tracing::warn!("encryptor channel closed");
     }
 
@@ -2327,23 +3983,100 @@ fn maybe_emit_linux_bpf_snapshot(state: &mut LoopState, governor: &mut Governor)
     }
 }
 
+fn maybe_emit_linux_kernel_forensics_evidence(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    bus_tx: &EventBusTx,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        if state.last_linux_kernel_forensics.elapsed() < Duration::from_secs(300) {
+            return;
+        }
+        if !governor.try_consume_budget(1) {
+            return;
+        }
+
+        let core_pattern =
+            common::collectors::linux::read_core_pattern_best_effort(governor).unwrap_or_default();
+        let core_pattern_suspicious =
+            common::collectors::linux::is_core_pattern_suspicious(core_pattern.as_str());
+        let hidden_kernel_modules =
+            common::collectors::linux::list_hidden_kernel_modules_best_effort(governor, 64);
+        let ftrace_enabled_functions =
+            common::collectors::linux::read_ftrace_enabled_functions_best_effort(governor, 64);
+
+        let mut vdso_hashes: Vec<LinuxVdsoHash> = Vec::new();
+        let pids = common::collectors::linux::list_proc_pids(128);
+        for pid in pids.into_iter().take(16) {
+            if !governor.try_consume_budget(1) {
+                break;
+            }
+            let exec_id = common::collectors::linux::collect_process_info_for_pid(
+                pid,
+                &state.process_exec_id_counter,
+            )
+            .exec_id;
+            let Some(sha256) =
+                common::collectors::linux::read_vdso_sha256_best_effort(governor, pid)
+            else {
+                continue;
+            };
+            vdso_hashes.push(LinuxVdsoHash {
+                pid,
+                exec_id,
+                sha256: sha256.to_vec(),
+            });
+        }
+
+        let evidence = LinuxKernelForensicsEvidence {
+            collected_at: unix_timestamp_now(),
+            core_pattern,
+            core_pattern_suspicious,
+            hidden_kernel_modules,
+            ftrace_enabled_functions,
+            vdso_hashes,
+        };
+        enqueue_payload(
+            bus_tx,
+            Some(&state.dropped_counter),
+            PayloadEnvelope::linux_kernel_forensics_evidence(evidence).encode_to_vec(),
+        );
+        if bus_tx.send(EncryptorCommand::Flush).is_err() {
+            state.dropped_counter.add(1);
+            tracing::warn!("encryptor channel closed");
+        }
+
+        state.last_linux_kernel_forensics = Instant::now();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, governor, bus_tx);
+    }
+}
+
 fn collect_process_snapshot(
     governor: &mut Governor,
     exec_id_counter: &std::sync::atomic::AtomicU64,
+    ebpf_pin_dir: Option<&str>,
     limit: usize,
 ) -> Vec<ProcessInfo> {
     #[cfg(windows)]
     {
-        let _ = governor;
-        common::collectors::windows::collect_process_infos(limit, exec_id_counter)
+        let _ = ebpf_pin_dir;
+        common::collectors::windows::collect_process_infos_governed(
+            Some(governor),
+            limit,
+            exec_id_counter,
+        )
     }
     #[cfg(target_os = "linux")]
     {
-        collect_process_snapshot_linux_multiview(governor, exec_id_counter, limit)
+        collect_process_snapshot_linux_multiview(governor, exec_id_counter, ebpf_pin_dir, limit)
     }
     #[cfg(all(not(windows), not(target_os = "linux")))]
     {
-        let _ = (governor, exec_id_counter, limit);
+        let _ = (governor, exec_id_counter, ebpf_pin_dir, limit);
         Vec::new()
     }
 }
@@ -2352,6 +4085,7 @@ fn collect_process_snapshot(
 fn collect_process_snapshot_linux_multiview(
     governor: &mut Governor,
     exec_id_counter: &std::sync::atomic::AtomicU64,
+    ebpf_pin_dir: Option<&str>,
     limit: usize,
 ) -> Vec<ProcessInfo> {
     if limit == 0 {
@@ -2385,6 +4119,31 @@ fn collect_process_snapshot_linux_multiview(
         out.push(info);
     }
 
+    match common::collectors::linux::open_aegis_exec_id_map_best_effort(governor, ebpf_pin_dir) {
+        Ok(Some(map_fd)) => {
+            for info in &mut out {
+                if !governor.try_consume_budget(1) {
+                    break;
+                }
+                match common::collectors::linux::lookup_aegis_exec_id_best_effort(
+                    governor, &map_fd, info.pid,
+                ) {
+                    Ok(Some(v)) => {
+                        info.exec_id = v;
+                        info.exec_id_quality = "linux:ebpf_exec_id_map".to_string();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "lookup exec_id map failed");
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "open exec_id map failed"),
+    }
+
     out
 }
 
@@ -2412,7 +4171,8 @@ fn encrypt_session_key_user_slot(
 
 #[derive(Debug)]
 struct OpenArtifactSegment {
-    path: PathBuf,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
     file: File,
     mac: Option<HmacSha256>,
     session_key: [u8; 32],
@@ -2451,9 +4211,10 @@ impl OpenArtifactSegment {
             .map_err(|e| format!("RSA-OAEP 加密 SessionKey 失败: {e}"))?;
 
         let ts = unix_timestamp_now();
-        let path = out_dir.join(format!("probe_{ts}_{segment_id}.aes"));
-        let mut file = File::create(path.as_path())
-            .map_err(|e| format!("创建 artifact 文件失败（{}）: {e}", path.display()))?;
+        let final_path = out_dir.join(format!("probe_{ts}_{segment_id}.aes"));
+        let tmp_path = out_dir.join(format!("probe_{ts}_{segment_id}.aes.part"));
+        let mut file = File::create(tmp_path.as_path())
+            .map_err(|e| format!("创建 artifact 文件失败（{}）: {e}", tmp_path.display()))?;
 
         let mut mac = HmacSha256::new_from_slice(&session_key)
             .map_err(|_| "初始化 HMAC 失败（SessionKey 长度必须为 32 bytes）".to_string())?;
@@ -2479,7 +4240,8 @@ impl OpenArtifactSegment {
         mac.update(rsa_ct.as_slice());
 
         Ok(Self {
-            path,
+            tmp_path,
+            final_path,
             file,
             mac: Some(mac),
             session_key,
@@ -2523,7 +4285,18 @@ impl OpenArtifactSegment {
             .map_err(|e| format!("写入 HMAC Trailer 失败: {e}"))?;
         throttle_io_sleep(io, u64::try_from(trailer.len()).unwrap_or(u64::MAX));
 
-        Ok(self.path)
+        let _sync_err = self.file.sync_all();
+        drop(self.file);
+
+        std::fs::rename(self.tmp_path.as_path(), self.final_path.as_path()).map_err(|e| {
+            format!(
+                "落盘 artifact 失败（rename {} -> {}）: {e}",
+                self.tmp_path.display(),
+                self.final_path.display()
+            )
+        })?;
+
+        Ok(self.final_path)
     }
 }
 
@@ -2540,6 +4313,7 @@ fn spawn_encryptor(
     uuid_mode: String,
     user_passphrase: Option<String>,
     io_limit_mb: u32,
+    artifact_cfg: ArtifactConfig,
 ) -> mpsc::Sender<EncryptorCommand> {
     let (tx, rx) = mpsc::channel::<EncryptorCommand>();
     thread::spawn(move || {
@@ -2551,11 +4325,13 @@ fn spawn_encryptor(
             uuid_mode.as_str(),
             user_passphrase.as_deref(),
             io_limit_mb,
+            artifact_cfg,
         );
     });
     tx
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encryptor_loop(
     rx: &mpsc::Receiver<EncryptorCommand>,
     out_dir: &Path,
@@ -2564,6 +4340,7 @@ fn encryptor_loop(
     uuid_mode: &str,
     user_passphrase: Option<&str>,
     io_limit_mb: u32,
+    mut artifact_cfg: ArtifactConfig,
 ) {
     let mut segment_id: u64 = 0;
     let mut segment: Option<OpenArtifactSegment> = None;
@@ -2571,7 +4348,13 @@ fn encryptor_loop(
 
     loop {
         let Ok(cmd) = rx.recv() else {
-            flush_segment(&mut segment_id, &mut segment, &mut io);
+            flush_segment(
+                &mut segment_id,
+                &mut segment,
+                &mut io,
+                out_dir,
+                &artifact_cfg,
+            );
             break;
         };
 
@@ -2625,19 +4408,36 @@ fn encryptor_loop(
                 }
             }
             EncryptorCommand::Flush => {
-                flush_segment(&mut segment_id, &mut segment, &mut io);
+                flush_segment(
+                    &mut segment_id,
+                    &mut segment,
+                    &mut io,
+                    out_dir,
+                    &artifact_cfg,
+                );
             }
             EncryptorCommand::UpdateIoLimitMb(mb) => {
                 io.update_limit(mb);
             }
+            EncryptorCommand::UpdateArtifactConfig(cfg) => {
+                artifact_cfg = cfg;
+            }
         }
     }
+}
+
+struct ArtifactEntry {
+    path: PathBuf,
+    modified: SystemTime,
+    size: u64,
 }
 
 fn flush_segment(
     segment_id: &mut u64,
     segment: &mut Option<OpenArtifactSegment>,
     io: &mut IoLimiter,
+    out_dir: &Path,
+    artifact_cfg: &ArtifactConfig,
 ) {
     let Some(s) = segment.take() else {
         return;
@@ -2647,13 +4447,266 @@ fn flush_segment(
         Ok(path) => {
             tracing::info!(path = %path.display(), "artifact segment flushed");
             *segment_id = segment_id.saturating_add(1);
+            cleanup_artifacts_best_effort(out_dir, artifact_cfg);
         }
         Err(e) => tracing::warn!(error = %e, "finalize artifact segment failed"),
     }
 }
 
-fn enqueue_payload(tx: &EventBusTx, bytes: Vec<u8>) {
+fn cleanup_artifacts_best_effort(out_dir: &Path, cfg: &ArtifactConfig) {
+    let max_files = usize::try_from(cfg.max_files).unwrap_or(usize::MAX);
+    let max_total_bytes = cfg.max_total_mb.saturating_mul(1024).saturating_mul(1024);
+
+    if max_total_bytes == 0 && max_files == usize::MAX {
+        return;
+    }
+
+    let Ok(rd) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+
+    let mut entries: Vec<ArtifactEntry> = Vec::new();
+    for e in rd.flatten() {
+        let path = e.path();
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("probe_") {
+            continue;
+        }
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("aes"))
+        {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        entries.push(ArtifactEntry {
+            path,
+            modified,
+            size: meta.len(),
+        });
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    entries.sort_by_key(|e| e.modified);
+    let mut total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+    let mut deleted_files: u64 = 0;
+    let mut deleted_bytes: u64 = 0;
+
+    while (max_total_bytes != 0 && total_bytes > max_total_bytes) || entries.len() > max_files {
+        let Some(e) = entries.first() else {
+            break;
+        };
+        let path = e.path.clone();
+        let size = e.size;
+        entries.remove(0);
+        if std::fs::remove_file(path.as_path()).is_ok() {
+            deleted_files = deleted_files.saturating_add(1);
+            deleted_bytes = deleted_bytes.saturating_add(size);
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+
+    if deleted_files != 0 {
+        tracing::info!(
+            deleted_files,
+            deleted_bytes,
+            remaining_files = entries.len(),
+            remaining_bytes = total_bytes,
+            "artifact retention applied"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_attach_aegis_ebpf_best_effort(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    security: &common::config::SecurityConfig,
+) {
+    if state.ebpf_producer.is_some() {
+        return;
+    }
+    if state.last_ebpf_attach_attempt.elapsed() < Duration::from_secs(30) {
+        return;
+    }
+    state.last_ebpf_attach_attempt = Instant::now();
+    match common::collectors::linux::load_and_attach_aegis_ebpf_best_effort(
+        governor,
+        security.ebpf_object_path.as_deref(),
+        security.ebpf_bpftool_path.as_deref(),
+        security.ebpf_pin_dir.as_deref(),
+    ) {
+        Ok(Some(p)) => {
+            state.ebpf_producer = Some(p);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "attach eBPF failed");
+            state.dropped_counter.add(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+fn maybe_attach_aegis_ebpf_best_effort(
+    _state: &mut LoopState,
+    _governor: &mut Governor,
+    _security: &common::config::SecurityConfig,
+) {
+}
+
+#[allow(clippy::too_many_lines)]
+fn maybe_emit_linux_ebpf_events(
+    state: &mut LoopState,
+    governor: &mut Governor,
+    security: &common::config::SecurityConfig,
+    bus_tx: &EventBusTx,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        if state.last_ebpf_poll.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+
+        if state.ebpf_ringbuf.is_none() {
+            if state.last_ebpf_open_attempt.elapsed() < Duration::from_secs(30) {
+                state.last_ebpf_poll = Instant::now();
+                return;
+            }
+            state.last_ebpf_open_attempt = Instant::now();
+            match common::collectors::linux::open_aegis_ringbuf_best_effort(
+                governor,
+                security.ebpf_pin_dir.as_deref(),
+            ) {
+                Ok(Some(rb)) => state.ebpf_ringbuf = Some(rb),
+                Ok(None) => {
+                    state.last_ebpf_poll = Instant::now();
+                    return;
+                }
+                Err(e) => {
+                    match &e {
+                        common::AegisError::ProtocolError {
+                            code: Some(code), ..
+                        }
+                        | common::AegisError::CryptoError {
+                            code: Some(code), ..
+                        } => {
+                            tracing::warn!(error = %e, code = %code, "open ringbuf failed");
+                        }
+                        _ => {
+                            tracing::warn!(error = %e, "open ringbuf failed");
+                        }
+                    }
+                    state.dropped_counter.add(1);
+                    state.last_ebpf_poll = Instant::now();
+                    return;
+                }
+            }
+        }
+
+        let Some(rb) = state.ebpf_ringbuf.as_mut() else {
+            state.last_ebpf_poll = Instant::now();
+            return;
+        };
+
+        let drained = match rb.drain_events_best_effort(governor, 256, 512 * 1024) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "drain ringbuf failed");
+                state.last_ebpf_poll = Instant::now();
+                return;
+            }
+        };
+
+        if !drained.events.is_empty() {
+            if state.ebpf_exec_id_map.is_none()
+                && state.last_ebpf_exec_id_open_attempt.elapsed() >= Duration::from_secs(30)
+            {
+                state.last_ebpf_exec_id_open_attempt = Instant::now();
+                match common::collectors::linux::open_aegis_exec_id_map_best_effort(
+                    governor,
+                    security.ebpf_pin_dir.as_deref(),
+                ) {
+                    Ok(Some(fd)) => state.ebpf_exec_id_map = Some(fd),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "open exec_id map failed"),
+                }
+            }
+
+            let mut events = drained.events;
+            if let Some(map_fd) = state.ebpf_exec_id_map.as_ref() {
+                for ev in &mut events {
+                    if ev.exec_id != 0 {
+                        continue;
+                    }
+                    if !governor.try_consume_budget(1) {
+                        break;
+                    }
+                    match common::collectors::linux::lookup_aegis_exec_id_best_effort(
+                        governor, map_fd, ev.tgid,
+                    ) {
+                        Ok(Some(v)) => ev.exec_id = v,
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "lookup exec_id map failed");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            emit_smart_reflex_from_ebpf_events_best_effort(
+                state,
+                governor,
+                bus_tx,
+                events.as_slice(),
+            );
+            let dropped_total = common::collectors::linux::read_ringbuf_dropped_events_best_effort(
+                governor,
+                security.ebpf_pin_dir.as_deref(),
+            );
+            let batch = EbpfEventBatch {
+                collected_at: unix_timestamp_now(),
+                dropped_total,
+                events,
+            };
+            enqueue_payload(
+                bus_tx,
+                Some(&state.dropped_counter),
+                PayloadEnvelope::ebpf_event_batch(batch).encode_to_vec(),
+            );
+            if bus_tx.send(EncryptorCommand::Flush).is_err() {
+                state.dropped_counter.add(1);
+                tracing::warn!("encryptor channel closed");
+            }
+        }
+
+        state.last_ebpf_poll = Instant::now();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, governor, security, bus_tx);
+    }
+}
+
+fn enqueue_payload(tx: &EventBusTx, dropped: Option<&DroppedEventCounter>, bytes: Vec<u8>) {
     if tx.send(EncryptorCommand::Payload(bytes)).is_err() {
+        if let Some(c) = dropped {
+            c.add(1);
+        }
         tracing::warn!("encryptor channel closed");
     }
 }
@@ -2757,6 +4810,7 @@ struct ProbeArgs {
     org_key_path: Option<PathBuf>,
     user_passphrase: Option<String>,
     sign_plugin: Option<SignPluginArgs>,
+    native_plugin_worker: Option<NativePluginWorkerArgs>,
 }
 
 #[derive(Debug)]
@@ -2766,6 +4820,14 @@ struct SignPluginArgs {
     sig_out: PathBuf,
 }
 
+#[derive(Debug)]
+struct NativePluginWorkerArgs {
+    plugin_path: PathBuf,
+    org_pubkey_der_b64: String,
+    sig_mode: String,
+}
+
+#[allow(clippy::too_many_lines)]
 fn parse_args<I>(mut it: I) -> Result<ProbeArgs, String>
 where
     I: Iterator<Item = String>,
@@ -2777,6 +4839,10 @@ where
     let mut sign_key_path: Option<PathBuf> = None;
     let mut sign_input_path: Option<PathBuf> = None;
     let mut sign_out_path: Option<PathBuf> = None;
+    let mut native_plugin_worker = false;
+    let mut worker_plugin_path: Option<PathBuf> = None;
+    let mut worker_org_pubkey_der_b64: Option<String> = None;
+    let mut worker_sig_mode: Option<String> = None;
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2809,6 +4875,23 @@ where
                 let val = it.next().ok_or("--out 缺少参数".to_string())?;
                 sign_out_path = Some(PathBuf::from(val));
             }
+            "--native-plugin-worker" => {
+                native_plugin_worker = true;
+            }
+            "--plugin" => {
+                let val = it.next().ok_or("--plugin 缺少参数".to_string())?;
+                worker_plugin_path = Some(PathBuf::from(val));
+            }
+            "--org-pubkey-der-b64" => {
+                let val = it
+                    .next()
+                    .ok_or("--org-pubkey-der-b64 缺少参数".to_string())?;
+                worker_org_pubkey_der_b64 = Some(val);
+            }
+            "--sig-mode" => {
+                let val = it.next().ok_or("--sig-mode 缺少参数".to_string())?;
+                worker_sig_mode = Some(val);
+            }
             "--help" | "-h" => {
                 return Err(
                     "Usage:\n  probe --config <FILE> [--org-key-path <FILE>] [--user-passphrase <TEXT>]\n  probe --sign-plugin --key <PEM> --input <DLL/SO> [--out <SIG>]\n"
@@ -2840,11 +4923,28 @@ where
         None
     };
 
+    let native_plugin_worker = if native_plugin_worker {
+        let plugin_path =
+            worker_plugin_path.ok_or("--native-plugin-worker 需要 --plugin <FILE>".to_string())?;
+        let org_pubkey_der_b64 = worker_org_pubkey_der_b64
+            .ok_or("--native-plugin-worker 需要 --org-pubkey-der-b64 <B64>".to_string())?;
+        let sig_mode =
+            worker_sig_mode.ok_or("--native-plugin-worker 需要 --sig-mode <MODE>".to_string())?;
+        Some(NativePluginWorkerArgs {
+            plugin_path,
+            org_pubkey_der_b64,
+            sig_mode,
+        })
+    } else {
+        None
+    };
+
     Ok(ProbeArgs {
         config_path,
         org_key_path,
         user_passphrase,
         sign_plugin,
+        native_plugin_worker,
     })
 }
 
@@ -2853,10 +4953,12 @@ mod tests {
     #[cfg(windows)]
     use super::cim_datetime_to_unix_seconds;
     use super::{
-        EncryptorCommand, LoopState, OpenArtifactSegment, USER_SLOT_LEN, compute_drop_rate_percent,
-        effective_telemetry_interval_sec, encryptor_loop, parse_args, validate_key_requirements,
+        EncryptorCommand, LoopState, OpenArtifactSegment, PluginManager, USER_SLOT_LEN,
+        compute_drop_rate_percent, effective_telemetry_interval_sec, encryptor_loop, parse_args,
+        validate_key_requirements,
     };
-    use common::config::{GovernorConfig, PidConfig, TokenBucketConfig};
+    use common::config::ArtifactConfig;
+    use common::config::{GovernorConfig, TokenBucketConfig};
     use common::crypto;
     use common::governor::Governor;
     use common::governor::IoLimiter;
@@ -2972,8 +5074,7 @@ mod tests {
     fn process_snapshot_does_not_reset_timestamp_when_budget_insufficient() {
         let (bus_tx, _bus_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut governor = Governor::new(GovernorConfig {
-            pid: PidConfig::default(),
+        let governor_cfg = GovernorConfig {
             token_bucket: TokenBucketConfig {
                 capacity: 1,
                 refill_per_sec: 1,
@@ -2981,27 +5082,34 @@ mod tests {
             max_single_core_usage: 100,
             net_packet_limit_per_sec: 0,
             io_limit_mb: 0,
-        });
+            ..GovernorConfig::default()
+        };
+        let mut governor = Governor::new(&governor_cfg);
         assert!(governor.try_consume_budget(1));
         assert!(!governor.try_consume_budget(1));
 
-        let mut state = LoopState::new();
+        let base_dir = PathBuf::from(".");
+        let mut state = LoopState::new(base_dir.as_path());
         let now = Instant::now();
         let old = now.checked_sub(Duration::from_secs(61)).unwrap_or(now);
         state.last_process_snapshot = old;
 
-        super::maybe_emit_process_snapshot(&mut state, &mut governor, &bus_tx);
+        let plugins = PluginManager {
+            wasm: None,
+            native: Vec::new(),
+        };
+        let cfg = common::config::AegisConfig::default();
+        super::maybe_emit_process_snapshot(&mut state, &mut governor, &cfg, &plugins, &bus_tx);
 
         assert_eq!(state.last_process_snapshot, old);
-        assert_eq!(governor.dropped_events(), 0);
+        assert_eq!(governor.dropped_events(), 2);
     }
 
     #[test]
     fn network_update_does_not_reset_timestamp_when_budget_insufficient() {
         let (bus_tx, _bus_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut governor = Governor::new(GovernorConfig {
-            pid: PidConfig::default(),
+        let governor_cfg = GovernorConfig {
             token_bucket: TokenBucketConfig {
                 capacity: 1,
                 refill_per_sec: 1,
@@ -3009,11 +5117,14 @@ mod tests {
             max_single_core_usage: 100,
             net_packet_limit_per_sec: 0,
             io_limit_mb: 0,
-        });
+            ..GovernorConfig::default()
+        };
+        let mut governor = Governor::new(&governor_cfg);
         assert!(governor.try_consume_budget(1));
         assert!(!governor.try_consume_budget(1));
 
-        let mut state = LoopState::new();
+        let base_dir = PathBuf::from(".");
+        let mut state = LoopState::new(base_dir.as_path());
         let now = Instant::now();
         let old = now.checked_sub(Duration::from_secs(61)).unwrap_or(now);
         state.last_network_snapshot = old;
@@ -3021,7 +5132,7 @@ mod tests {
         super::maybe_emit_network_update(&mut state, &mut governor, &bus_tx);
 
         assert_eq!(state.last_network_snapshot, old);
-        assert_eq!(governor.dropped_events(), 0);
+        assert_eq!(governor.dropped_events(), 2);
     }
 
     #[cfg(windows)]
@@ -3104,6 +5215,7 @@ mod tests {
                 "dev",
                 Some("aegis-dev"),
                 0,
+                ArtifactConfig::default(),
             );
         });
 

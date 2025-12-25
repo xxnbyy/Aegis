@@ -9,6 +9,12 @@ message PayloadEnvelope {
     FileInfo file_info = 3;
     NetworkInterfaceUpdate network_interface_update = 4;
     AgentTelemetry agent_telemetry = 5;
+    ProcessGhostingEvidence process_ghosting_evidence = 6;
+    WindowsMemoryForensicsEvidence windows_memory_forensics_evidence = 7;
+    EbpfEventBatch ebpf_event_batch = 8;
+    SmartReflexEvidence smart_reflex_evidence = 9;
+    EvidenceChunk evidence_chunk = 10;
+    LinuxKernelForensicsEvidence linux_kernel_forensics_evidence = 11;
   }
 }
 
@@ -56,4 +62,112 @@ message AgentTelemetry {
   uint32 cpu_usage_percent = 2;
   uint32 memory_usage_mb = 3;
   uint64 dropped_events_count = 4;
+  uint64 dropped_governor = 5;
+  uint64 dropped_loop = 6;
+  uint64 dropped_ringbuf = 7;
+  uint32 dropped_rate_percent = 8;
+  bool overloaded = 9;
+}
+
+message PeFingerprint {
+  uint32 time_date_stamp = 1;
+  uint32 size_of_image = 2;
+  uint32 number_of_sections = 3;
+  repeated bytes section_names = 4;
+}
+
+message ProcessGhostingEvidence {
+  uint32 pid = 1;
+  string exe_path = 2;
+  bool delete_pending = 3;
+  bool suspected = 4;
+  PeFingerprint mem = 5;
+  PeFingerprint disk = 6;
+  bytes mem_header = 7;
+  bytes disk_header = 8;
+}
+
+message ModuleIntegrityFinding {
+  string module_path = 1;
+  uint64 base_address = 2;
+  uint32 module_size = 3;
+  string finding = 4;
+  uint32 confidence = 5;
+  uint32 mem_time_date_stamp = 6;
+  uint32 disk_time_date_stamp = 7;
+}
+
+message WindowsPrivateExecRegionSample {
+  uint64 base_address = 1;
+  uint64 region_size = 2;
+  uint32 protect = 3;
+  uint32 state = 4;
+  uint32 ty = 5;
+  bytes sample = 6;
+}
+
+message WindowsCallStackSample {
+  uint32 tid = 1;
+  uint64 rip = 2;
+  uint64 rsp = 3;
+  repeated uint64 return_addresses = 4;
+}
+
+message WindowsMemoryForensicsEvidence {
+  uint32 pid = 1;
+  uint64 exec_id = 2;
+  int64 collected_at = 3;
+  uint32 private_exec_region_count = 4;
+  repeated ModuleIntegrityFinding module_findings = 5;
+  repeated WindowsPrivateExecRegionSample private_exec_region_samples = 6;
+  repeated WindowsCallStackSample call_stack_samples = 7;
+}
+
+message EbpfEvent {
+  uint64 timestamp_ns = 1;
+  uint32 pid = 2;
+  uint32 tgid = 3;
+  uint64 exec_id = 4;
+  string kind = 5;
+  string comm = 6;
+  string detail = 7;
+}
+
+message EbpfEventBatch {
+  int64 collected_at = 1;
+  uint64 dropped_total = 2;
+  repeated EbpfEvent events = 3;
+}
+
+message SmartReflexEvidence {
+  int64 matched_at = 1;
+  uint32 score = 2;
+  string kind = 3;
+  string indicator = 4;
+  uint32 pid = 5;
+  uint64 exec_id = 6;
+}
+
+message EvidenceChunk {
+  uint64 evidence_id = 1;
+  uint32 sequence_id = 2;
+  bool is_last = 3;
+  string kind = 4;
+  string content_type = 5;
+  bytes bytes = 6;
+}
+
+message LinuxVdsoHash {
+  uint32 pid = 1;
+  uint64 exec_id = 2;
+  bytes sha256 = 3;
+}
+
+message LinuxKernelForensicsEvidence {
+  int64 collected_at = 1;
+  string core_pattern = 2;
+  bool core_pattern_suspicious = 3;
+  repeated string hidden_kernel_modules = 4;
+  repeated string ftrace_enabled_functions = 5;
+  repeated LinuxVdsoHash vdso_hashes = 6;
 }

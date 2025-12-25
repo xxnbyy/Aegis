@@ -232,8 +232,9 @@ pub struct Governor {
 }
 
 impl Governor {
-    pub fn new(cfg: GovernorConfig) -> Self {
+    pub fn new(cfg: &GovernorConfig) -> Self {
         let now = Instant::now();
+        let cfg = cfg.effective_profile_applied();
         let pid = PidController::new(&cfg.pid);
         let token_bucket_cfg = cfg.effective_token_bucket();
         let bucket = TokenBucket::new(&token_bucket_cfg, now);
@@ -249,7 +250,8 @@ impl Governor {
         }
     }
 
-    pub fn apply_config(&mut self, cfg: GovernorConfig) {
+    pub fn apply_config(&mut self, cfg: &GovernorConfig) {
+        let cfg = cfg.effective_profile_applied();
         self.pid.update_params(&cfg.pid);
         let token_bucket_cfg = cfg.effective_token_bucket();
         self.bucket.update_params(&token_bucket_cfg);
@@ -270,7 +272,7 @@ impl Governor {
     }
 
     pub fn try_consume_budget(&mut self, cost: u32) -> bool {
-        self.bucket.try_consume(cost)
+        self.bucket.check_budget(cost)
     }
 
     pub fn dropped_events(&self) -> u64 {

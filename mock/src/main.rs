@@ -424,6 +424,11 @@ fn event_to_payload_bytes(
                 cpu_usage_percent: cpu_usage_percent.unwrap_or(12),
                 memory_usage_mb: memory_usage_mb.unwrap_or(128),
                 dropped_events_count: *dropped_events,
+                dropped_governor: 0,
+                dropped_loop: 0,
+                dropped_ringbuf: 0,
+                dropped_rate_percent: 0,
+                overloaded: false,
             })
         }
         EventSpec::NetworkChange {

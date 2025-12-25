@@ -5,6 +5,10 @@ use std::fs::File;
 use std::fs::OpenOptions;
 #[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -15,9 +19,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{AegisError, ErrorCode};
-use crate::protocol::{FileInfo, ProcessInfo};
+use crate::governor::Governor;
+use crate::protocol::{
+    FileInfo, ModuleIntegrityFinding, PeFingerprint, ProcessGhostingEvidence, ProcessInfo,
+    WindowsCallStackSample, WindowsMemoryForensicsEvidence, WindowsPrivateExecRegionSample,
+};
 #[cfg(windows)]
 use sysinfo::System;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND,
+    GetLastError, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo,
+    GetFileInformationByHandleEx,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CONTEXT, GetThreadContext, ReadProcessMemory,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
+    TH32CS_SNAPMODULE32, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::DeviceIoControl;
+#[cfg(windows)]
+use windows_sys::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL};
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, VirtualQueryEx,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_VM_READ, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+    THREAD_SUSPEND_RESUME,
+};
 #[cfg(windows)]
 use wmi::{Variant, WMIConnection};
 
@@ -27,6 +69,21 @@ pub struct PeStaticFingerprint {
     pub size_of_image: u32,
     pub number_of_sections: u16,
     pub section_names: Vec<[u8; 8]>,
+}
+
+fn pe_fingerprint_to_proto(fp: &PeStaticFingerprint) -> PeFingerprint {
+    PeFingerprint {
+        time_date_stamp: fp.time_date_stamp,
+        size_of_image: fp.size_of_image,
+        number_of_sections: u32::from(fp.number_of_sections),
+        section_names: fp.section_names.iter().map(|n| n.to_vec()).collect(),
+    }
+}
+
+#[cfg(windows)]
+fn utf16_nul_terminated_to_string(words: &[u16]) -> String {
+    let end = words.iter().position(|c| *c == 0).unwrap_or(words.len());
+    String::from_utf16_lossy(&words[..end])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,11 +171,28 @@ pub fn collect_file_infos(
     vss_snapshot_drive_letter: Option<char>,
     vss_snapshot_device_path: Option<&str>,
 ) -> Vec<FileInfo> {
+    collect_file_infos_governed(
+        None,
+        scan_whitelist,
+        timestomp_threshold_ms,
+        vss_snapshot_drive_letter,
+        vss_snapshot_device_path,
+    )
+}
+
+pub fn collect_file_infos_governed(
+    governor: Option<&mut Governor>,
+    scan_whitelist: &[String],
+    timestomp_threshold_ms: u64,
+    vss_snapshot_drive_letter: Option<char>,
+    vss_snapshot_device_path: Option<&str>,
+) -> Vec<FileInfo> {
     if scan_whitelist.is_empty() {
         return Vec::new();
     }
 
     let mut out: Vec<FileInfo> = Vec::new();
+    let mut governor = governor;
     for path_str in scan_whitelist {
         let path = Path::new(path_str);
         #[cfg(windows)]
@@ -161,6 +235,7 @@ pub fn collect_file_infos(
                 FileAccessPlan::VssSnapshot => {
                     if let (Some(file_path), Some(device_path)) =
                         (vss_path.as_deref(), vss_snapshot_device_path)
+                        && governor.as_deref_mut().is_none_or(|g| g.check_budget(1))
                         && let Some(ev) = mft_evidence_for_path_best_effort(
                             file_path,
                             VolumeSource::DevicePath(device_path),
@@ -173,6 +248,7 @@ pub fn collect_file_infos(
                 }
                 FileAccessPlan::RawVolume => {
                     if let Some(d) = drive
+                        && governor.as_deref_mut().is_none_or(|g| g.check_budget(1))
                         && let Some(ev) =
                             mft_evidence_for_path_best_effort(path, VolumeSource::Drive(d))
                     {
@@ -204,7 +280,392 @@ pub fn collect_file_infos(
 }
 
 #[cfg(windows)]
-pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<ProcessInfo> {
+#[repr(C)]
+struct UsnJournalDataV0 {
+    usn_journal_id: u64,
+    first_usn: i64,
+    next_usn: i64,
+    lowest_valid_usn: i64,
+    max_usn: i64,
+    maximum_size: u64,
+    allocation_delta: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MftEnumDataV0 {
+    start_file_reference_number: u64,
+    low_usn: i64,
+    high_usn: i64,
+}
+
+#[cfg(windows)]
+fn read_u16_le_opt(bytes: &[u8], off: usize) -> Option<u16> {
+    let b = bytes.get(off..off + 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+#[cfg(windows)]
+fn read_u32_le_opt(bytes: &[u8], off: usize) -> Option<u32> {
+    let b = bytes.get(off..off + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[cfg(windows)]
+fn read_u64_le_opt(bytes: &[u8], off: usize) -> Option<u64> {
+    let b = bytes.get(off..off + 8)?;
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
+}
+
+#[cfg(windows)]
+fn read_i64_le_opt(bytes: &[u8], off: usize) -> Option<i64> {
+    let b = bytes.get(off..off + 8)?;
+    Some(i64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
+}
+
+#[cfg(windows)]
+fn sanitize_tsv_field(s: &str) -> String {
+    s.replace(['\t', '\r', '\n'], " ")
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn query_usn_journal_best_effort(handle: isize) -> Option<UsnJournalDataV0> {
+    let mut out: UsnJournalDataV0 = unsafe { std::mem::zeroed() };
+    let mut bytes_returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_QUERY_USN_JOURNAL,
+            std::ptr::null(),
+            0,
+            std::ptr::from_mut(&mut out).cast(),
+            u32::try_from(std::mem::size_of::<UsnJournalDataV0>()).unwrap_or(u32::MAX),
+            std::ptr::from_mut(&mut bytes_returned),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 { None } else { Some(out) }
+}
+
+#[cfg(windows)]
+fn parse_usn_record_v2_line_best_effort(record: &[u8]) -> Option<String> {
+    let major = read_u16_le_opt(record, 4)?;
+    if major != 2 {
+        return None;
+    }
+
+    let frn = read_u64_le_opt(record, 8)?;
+    let parent_frn = read_u64_le_opt(record, 16)?;
+    let usn = read_i64_le_opt(record, 24)?;
+    let ts_100ns = read_i64_le_opt(record, 32)?;
+    let reason = read_u32_le_opt(record, 40)?;
+    let source_info = read_u32_le_opt(record, 44)?;
+    let security_id = read_u32_le_opt(record, 48)?;
+    let file_attributes = read_u32_le_opt(record, 52)?;
+    let name_len = read_u16_le_opt(record, 56)? as usize;
+    let name_off = read_u16_le_opt(record, 58)? as usize;
+    let name_bytes = record.get(name_off..name_off.saturating_add(name_len))?;
+    if name_bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut words: Vec<u16> = Vec::with_capacity(name_bytes.len() / 2);
+    for chunk in name_bytes.chunks_exact(2) {
+        words.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    let name = sanitize_tsv_field(String::from_utf16_lossy(words.as_slice()).as_str());
+
+    Some(format!(
+        "{frn}\t{parent_frn}\t{usn}\t{ts_100ns}\t{reason}\t{source_info}\t{security_id}\t{file_attributes}\t{name}\n"
+    ))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn collect_usn_journal_tsv_best_effort(
+    governor: &mut Governor,
+    drive_letter: char,
+    max_records: usize,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    if max_records == 0 || max_bytes == 0 {
+        return None;
+    }
+    if !governor.try_consume_budget(1) {
+        return None;
+    }
+
+    let path = format!(r"\\.\{drive_letter}:");
+    let volume = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path.as_str())
+        .ok()?;
+    let handle = volume.as_raw_handle() as isize;
+    if handle == 0 {
+        return None;
+    }
+
+    let journal = query_usn_journal_best_effort(handle)?;
+    let mut input = MftEnumDataV0 {
+        start_file_reference_number: 0,
+        low_usn: journal.first_usn.min(0),
+        high_usn: journal.next_usn,
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(
+        b"frn\tparent_frn\tusn\ttimestamp_100ns\treason\tsource_info\tsecurity_id\tfile_attributes\tname\n",
+    );
+
+    let mut records: usize = 0;
+    let mut buf: Vec<u8> = vec![0u8; 64 * 1024];
+
+    loop {
+        if records >= max_records || out.len() >= max_bytes {
+            break;
+        }
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+
+        let mut bytes_returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_ENUM_USN_DATA,
+                std::ptr::from_mut(&mut input).cast(),
+                u32::try_from(std::mem::size_of::<MftEnumDataV0>()).unwrap_or(u32::MAX),
+                buf.as_mut_ptr().cast(),
+                u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                std::ptr::from_mut(&mut bytes_returned),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_HANDLE_EOF {
+                break;
+            }
+            if err == ERROR_MORE_DATA {
+                continue;
+            }
+            break;
+        }
+
+        let got = usize::try_from(bytes_returned).unwrap_or(0);
+        if got < 8 {
+            break;
+        }
+
+        let next_frn = read_u64_le_opt(buf.as_slice(), 0).unwrap_or(0);
+        input.start_file_reference_number = next_frn;
+
+        let mut off = 8usize;
+        while off < got {
+            if records >= max_records || out.len() >= max_bytes {
+                break;
+            }
+            let record_len = read_u32_le_opt(buf.as_slice(), off).unwrap_or(0) as usize;
+            if record_len < 60 {
+                break;
+            }
+            let end = off.saturating_add(record_len);
+            let slice = buf.get(off..end).unwrap_or_default();
+            if slice.len() != record_len {
+                break;
+            }
+
+            if let Some(line) = parse_usn_record_v2_line_best_effort(slice) {
+                let remaining = max_bytes.saturating_sub(out.len());
+                let bytes = line.as_bytes();
+                if bytes.len() <= remaining {
+                    out.extend_from_slice(bytes);
+                } else {
+                    out.extend_from_slice(&bytes[..remaining]);
+                }
+                records = records.saturating_add(1);
+            }
+
+            if end <= off {
+                break;
+            }
+            off = end;
+        }
+
+        if input.start_file_reference_number == 0 {
+            break;
+        }
+    }
+
+    Some(out)
+}
+
+#[cfg(not(windows))]
+pub fn collect_usn_journal_tsv_best_effort(
+    _governor: &mut Governor,
+    _drive_letter: char,
+    _max_records: usize,
+    _max_bytes: usize,
+) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn file_delete_pending_best_effort(file: &File) -> Option<bool> {
+    let h = file.as_raw_handle() as isize;
+    if h == 0 {
+        return None;
+    }
+
+    let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileStandardInfo,
+            std::ptr::from_mut(&mut standard).cast(),
+            u32::try_from(std::mem::size_of::<FILE_STANDARD_INFO>()).unwrap_or(u32::MAX),
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some(standard.DeletePending != 0)
+    }
+}
+
+#[cfg(windows)]
+fn read_disk_fingerprint_and_delete_pending(
+    exe_path: &str,
+) -> Result<(Option<PeStaticFingerprint>, bool, Vec<u8>), u32> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(exe_path)
+        .map_err(|e| {
+            e.raw_os_error()
+                .and_then(|c| u32::try_from(c).ok())
+                .unwrap_or(0)
+        })?;
+
+    let delete_pending = file_delete_pending_best_effort(&file).unwrap_or(false);
+
+    let mut bytes = vec![0u8; 0x1000];
+    let read = file.read(bytes.as_mut_slice()).map_err(|e| {
+        e.raw_os_error()
+            .and_then(|c| u32::try_from(c).ok())
+            .unwrap_or(0)
+    })?;
+    bytes.truncate(read);
+    let fp = parse_pe_static_fingerprint(bytes.as_slice()).ok();
+    Ok((fp, delete_pending, bytes))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn read_process_memory_fingerprint(pid: u32) -> Option<(Option<PeStaticFingerprint>, Vec<u8>)> {
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if process == 0 {
+        return None;
+    }
+
+    let snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        unsafe {
+            CloseHandle(process);
+        }
+        return None;
+    }
+
+    let mut me32: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    me32.dwSize = u32::try_from(std::mem::size_of::<MODULEENTRY32W>()).unwrap_or(u32::MAX);
+
+    let ok = unsafe { Module32FirstW(snapshot, std::ptr::from_mut(&mut me32)) };
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    if ok == 0 {
+        unsafe {
+            CloseHandle(process);
+        }
+        return None;
+    }
+
+    let base = me32.modBaseAddr as usize;
+    if base == 0 {
+        unsafe {
+            CloseHandle(process);
+        }
+        return None;
+    }
+
+    let mut buf = vec![0u8; 0x1000];
+    let mut read: usize = 0;
+    let ok = unsafe {
+        ReadProcessMemory(
+            process,
+            base as _,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            std::ptr::from_mut(&mut read),
+        )
+    };
+    unsafe {
+        CloseHandle(process);
+    }
+    if ok == 0 {
+        return Some((None, Vec::new()));
+    }
+    buf.truncate(read);
+    let fp = parse_pe_static_fingerprint(buf.as_slice()).ok();
+    Some((fp, buf))
+}
+
+#[cfg(windows)]
+fn ghosting_suspected_for_process_governed(
+    pid: u32,
+    exe_path: &str,
+    mut governor: Option<&mut Governor>,
+) -> Option<bool> {
+    if exe_path.is_empty() {
+        return Some(false);
+    }
+
+    if governor.as_mut().is_some_and(|g| !g.try_consume_budget(1)) {
+        return Some(false);
+    }
+    let disk = match read_disk_fingerprint_and_delete_pending(exe_path) {
+        Ok(v) => v,
+        Err(code) if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => {
+            return Some(true);
+        }
+        Err(_) => return None,
+    };
+    let (disk_fp, delete_pending, _) = disk;
+    if governor.as_mut().is_some_and(|g| !g.try_consume_budget(1)) {
+        return Some(false);
+    }
+    let (mem_fp, _) = read_process_memory_fingerprint(pid)?;
+    if let (Some(mem), Some(disk)) = (mem_fp.as_ref(), disk_fp.as_ref()) {
+        return Some(ghosting_suspected(mem, disk, delete_pending));
+    }
+    Some(false)
+}
+
+#[cfg(windows)]
+pub fn collect_process_infos_governed(
+    governor: Option<&mut Governor>,
+    limit: usize,
+    exec_id_counter: &AtomicU64,
+) -> Vec<ProcessInfo> {
     if limit == 0 {
         return Vec::new();
     }
@@ -215,6 +676,7 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
     let psn_by_pid = query_process_sequence_numbers_wmi();
     let now = crate::telemetry::unix_timestamp_now();
     let mut out: Vec<ProcessInfo> = Vec::new();
+    let mut governor = governor;
     for (pid, proc_) in sys.processes() {
         if out.len() >= limit {
             break;
@@ -231,6 +693,12 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
             .exe()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
+        let is_ghost = ghosting_suspected_for_process_governed(
+            pid_num,
+            exe_path.as_str(),
+            governor.as_deref_mut(),
+        )
+        .unwrap_or(false);
 
         let (exec_id, exec_id_quality) =
             if let Some(psn) = psn_by_pid.as_ref().and_then(|m| m.get(&pid_num).copied()) {
@@ -255,7 +723,7 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
             exe_path,
             uid: 0,
             start_time,
-            is_ghost: false,
+            is_ghost,
             is_mismatched: false,
             has_floating_code: false,
             exec_id,
@@ -263,6 +731,20 @@ pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<P
         });
     }
     out
+}
+
+#[cfg(not(windows))]
+pub fn collect_process_infos_governed(
+    _governor: Option<&mut Governor>,
+    _limit: usize,
+    _exec_id_counter: &AtomicU64,
+) -> Vec<ProcessInfo> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub fn collect_process_infos(limit: usize, exec_id_counter: &AtomicU64) -> Vec<ProcessInfo> {
+    collect_process_infos_governed(None, limit, exec_id_counter)
 }
 
 #[cfg(not(windows))]
@@ -294,6 +776,964 @@ pub fn ghosting_suspected(
         return true;
     }
     mem.section_names != disk.section_names
+}
+
+#[cfg(windows)]
+pub fn collect_process_ghosting_evidence_governed(
+    governor: &mut Governor,
+    pid: u32,
+    exe_path: &str,
+) -> Option<ProcessGhostingEvidence> {
+    if exe_path.is_empty() {
+        return None;
+    }
+    if !governor.try_consume_budget(1) {
+        return None;
+    }
+
+    let (disk_fp, delete_pending, disk_missing, disk_header) =
+        match read_disk_fingerprint_and_delete_pending(exe_path) {
+            Ok((fp, delete_pending, header)) => (fp, delete_pending, false, header),
+            Err(code) if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => {
+                (None, false, true, Vec::new())
+            }
+            Err(_) => return None,
+        };
+
+    if !governor.try_consume_budget(1) {
+        return None;
+    }
+    let (mem_fp, mem_header) = read_process_memory_fingerprint(pid).unwrap_or((None, Vec::new()));
+
+    let suspected = if disk_missing {
+        true
+    } else if let (Some(mem), Some(disk)) = (mem_fp.as_ref(), disk_fp.as_ref()) {
+        ghosting_suspected(mem, disk, delete_pending)
+    } else {
+        false
+    };
+
+    Some(ProcessGhostingEvidence {
+        pid,
+        exe_path: exe_path.to_string(),
+        delete_pending,
+        suspected,
+        mem: mem_fp.as_ref().map(pe_fingerprint_to_proto),
+        disk: disk_fp.as_ref().map(pe_fingerprint_to_proto),
+        mem_header,
+        disk_header,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn collect_process_ghosting_evidence_governed(
+    _governor: &mut Governor,
+    _pid: u32,
+    _exe_path: &str,
+) -> Option<ProcessGhostingEvidence> {
+    None
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn count_private_exec_regions(governor: &mut Governor, process: isize) -> u32 {
+    let mut private_exec_region_count: u32 = 0;
+    let mut addr: usize = 0;
+    loop {
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQueryEx(
+                process,
+                addr as _,
+                std::ptr::from_mut(&mut mbi),
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            break;
+        }
+
+        let protect = mbi.Protect;
+        let exec = protect
+            & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+            != 0;
+        let guard = protect & PAGE_GUARD != 0;
+        if mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && exec && !guard {
+            private_exec_region_count = private_exec_region_count.saturating_add(1);
+        }
+
+        let base = mbi.BaseAddress as usize;
+        let size = mbi.RegionSize;
+        let next = base.saturating_add(size);
+        if next <= addr {
+            break;
+        }
+        addr = next;
+    }
+    private_exec_region_count
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn collect_private_exec_region_samples(
+    governor: &mut Governor,
+    process: isize,
+    max_samples: usize,
+    sample_size: usize,
+) -> Vec<WindowsPrivateExecRegionSample> {
+    let mut samples: Vec<WindowsPrivateExecRegionSample> = Vec::new();
+    if max_samples == 0 || sample_size == 0 {
+        return samples;
+    }
+
+    let mut addr: usize = 0;
+    loop {
+        if samples.len() >= max_samples {
+            break;
+        }
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQueryEx(
+                process,
+                addr as _,
+                std::ptr::from_mut(&mut mbi),
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            break;
+        }
+
+        let protect = mbi.Protect;
+        let exec = protect
+            & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+            != 0;
+        let guard = protect & PAGE_GUARD != 0;
+        if mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && exec && !guard {
+            let base = mbi.BaseAddress as usize;
+            let region_size = mbi.RegionSize;
+            if base != 0 && region_size > 0 && governor.try_consume_budget(1) {
+                let max_len = region_size.min(sample_size);
+                let max_len = max_len.min(4096);
+                let mut buf: Vec<u8> = vec![0u8; max_len];
+                let mut read: usize = 0;
+                let ok_read = unsafe {
+                    ReadProcessMemory(
+                        process,
+                        base as _,
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        std::ptr::from_mut(&mut read),
+                    )
+                };
+                if ok_read != 0 {
+                    buf.truncate(read);
+                } else {
+                    buf.clear();
+                }
+                samples.push(WindowsPrivateExecRegionSample {
+                    base_address: u64::try_from(base).unwrap_or(u64::MAX),
+                    region_size: u64::try_from(region_size).unwrap_or(u64::MAX),
+                    protect,
+                    state: mbi.State,
+                    ty: mbi.Type,
+                    sample: buf,
+                });
+            }
+        }
+
+        let base = mbi.BaseAddress as usize;
+        let size = mbi.RegionSize;
+        let next = base.saturating_add(size);
+        if next <= addr {
+            break;
+        }
+        addr = next;
+    }
+
+    samples
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn collect_module_integrity_findings(
+    governor: &mut Governor,
+    process: isize,
+    pid: u32,
+    max_modules: usize,
+) -> Vec<ModuleIntegrityFinding> {
+    let mut module_findings: Vec<ModuleIntegrityFinding> = Vec::new();
+    if !governor.try_consume_budget(1) {
+        return module_findings;
+    }
+
+    let snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return module_findings;
+    }
+
+    let mut me32: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    me32.dwSize = u32::try_from(std::mem::size_of::<MODULEENTRY32W>()).unwrap_or(u32::MAX);
+    let mut ok = unsafe { Module32FirstW(snapshot, std::ptr::from_mut(&mut me32)) };
+    let mut seen: usize = 0;
+
+    while ok != 0 {
+        if seen >= max_modules {
+            break;
+        }
+        seen = seen.saturating_add(1);
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+
+        let module_path = utf16_nul_terminated_to_string(&me32.szExePath);
+        let base_address = me32.modBaseAddr as usize;
+        let module_size = me32.modBaseSize;
+
+        let mem_fp = if base_address != 0 && governor.try_consume_budget(1) {
+            let mut buf = vec![0u8; 0x1000];
+            let mut read: usize = 0;
+            let ok_read = unsafe {
+                ReadProcessMemory(
+                    process,
+                    base_address as _,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    std::ptr::from_mut(&mut read),
+                )
+            };
+            if ok_read != 0 {
+                buf.truncate(read);
+                parse_pe_static_fingerprint(buf.as_slice()).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let disk_fp = if !module_path.is_empty() && governor.try_consume_budget(1) {
+            read_disk_fingerprint_and_delete_pending(module_path.as_str())
+                .ok()
+                .and_then(|v| v.0)
+        } else {
+            None
+        };
+
+        if let (Some(mem), Some(disk)) = (mem_fp.as_ref(), disk_fp.as_ref())
+            && (mem.time_date_stamp != disk.time_date_stamp
+                || mem.size_of_image != disk.size_of_image
+                || mem.number_of_sections != disk.number_of_sections
+                || mem.section_names != disk.section_names)
+        {
+            module_findings.push(ModuleIntegrityFinding {
+                module_path: module_path.clone(),
+                base_address: u64::try_from(base_address).unwrap_or(u64::MAX),
+                module_size,
+                finding: "pe_header_mismatch".to_string(),
+                confidence: 80,
+                mem_time_date_stamp: mem.time_date_stamp,
+                disk_time_date_stamp: disk.time_date_stamp,
+            });
+        }
+
+        ok = unsafe { Module32NextW(snapshot, std::ptr::from_mut(&mut me32)) };
+    }
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    module_findings
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn collect_windows_memory_forensics_evidence_governed(
+    governor: &mut Governor,
+    pid: u32,
+    exec_id: u64,
+    max_modules: usize,
+) -> Option<WindowsMemoryForensicsEvidence> {
+    collect_windows_memory_forensics_evidence_governed_with_params(
+        governor,
+        pid,
+        exec_id,
+        max_modules,
+        5,
+        128,
+        4,
+        24,
+    )
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn collect_windows_memory_forensics_evidence_governed_with_depth(
+    governor: &mut Governor,
+    pid: u32,
+    exec_id: u64,
+    depth: crate::config::WindowsMemoryScanDepth,
+) -> Option<WindowsMemoryForensicsEvidence> {
+    let (max_modules, max_samples, sample_size, max_threads, max_frames) = match depth {
+        crate::config::WindowsMemoryScanDepth::Fast => (32, 5, 128, 4, 24),
+        crate::config::WindowsMemoryScanDepth::Full => (256, 20, 512, 16, 64),
+    };
+    collect_windows_memory_forensics_evidence_governed_with_params(
+        governor,
+        pid,
+        exec_id,
+        max_modules,
+        max_samples,
+        sample_size,
+        max_threads,
+        max_frames,
+    )
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn collect_windows_memory_forensics_evidence_governed_with_params(
+    governor: &mut Governor,
+    pid: u32,
+    exec_id: u64,
+    max_modules: usize,
+    max_samples: usize,
+    sample_size: usize,
+    max_threads: usize,
+    max_frames: usize,
+) -> Option<WindowsMemoryForensicsEvidence> {
+    if !governor.try_consume_budget(1) {
+        return None;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if process == 0 {
+        return None;
+    }
+
+    let private_exec_region_count = count_private_exec_regions(governor, process);
+    let private_exec_region_samples =
+        collect_private_exec_region_samples(governor, process, max_samples, sample_size);
+    let mut module_findings =
+        collect_module_integrity_findings(governor, process, pid, max_modules);
+    module_findings.extend(collect_etw_amsi_patch_findings_best_effort(
+        governor,
+        process,
+        pid,
+        max_modules,
+    ));
+    let call_stack_samples = collect_process_call_stack_samples_best_effort(
+        governor,
+        process,
+        pid,
+        max_threads,
+        max_frames,
+    );
+
+    unsafe {
+        CloseHandle(process);
+    }
+
+    Some(WindowsMemoryForensicsEvidence {
+        pid,
+        exec_id,
+        collected_at: crate::telemetry::unix_timestamp_now(),
+        private_exec_region_count,
+        module_findings,
+        private_exec_region_samples,
+        call_stack_samples,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn collect_windows_memory_forensics_evidence_governed(
+    _governor: &mut Governor,
+    _pid: u32,
+    _exec_id: u64,
+    _max_modules: usize,
+) -> Option<WindowsMemoryForensicsEvidence> {
+    None
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn collect_process_call_stack_samples_best_effort(
+    governor: &mut Governor,
+    process: isize,
+    pid: u32,
+    max_threads: usize,
+    max_frames: usize,
+) -> Vec<WindowsCallStackSample> {
+    let mut out: Vec<WindowsCallStackSample> = Vec::new();
+    if max_threads == 0 || max_frames == 0 {
+        return out;
+    }
+    if !governor.try_consume_budget(1) {
+        return out;
+    }
+
+    let ok = unsafe { sym_initialize_best_effort(process) };
+    if !ok {
+        return out;
+    }
+
+    let tids = list_process_threads_best_effort(governor, pid, max_threads);
+    for tid in tids {
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+        if let Some(sample) =
+            collect_thread_call_stack_best_effort(governor, process, tid, max_frames)
+        {
+            out.push(sample);
+        }
+    }
+
+    unsafe {
+        sym_cleanup_best_effort(process);
+    }
+    out
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn list_process_threads_best_effort(governor: &mut Governor, pid: u32, limit: usize) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    if !governor.try_consume_budget(1) {
+        return out;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return out;
+    }
+
+    let mut te32 = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(u32::MAX),
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut ok = unsafe { Thread32First(snapshot, std::ptr::from_mut(&mut te32)) };
+    while ok != 0 {
+        if out.len() >= limit {
+            break;
+        }
+        if te32.th32OwnerProcessID == pid {
+            out.push(te32.th32ThreadID);
+        }
+        ok = unsafe { Thread32Next(snapshot, std::ptr::from_mut(&mut te32)) };
+    }
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    out
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn collect_thread_call_stack_best_effort(
+    governor: &mut Governor,
+    process: isize,
+    tid: u32,
+    max_frames: usize,
+) -> Option<WindowsCallStackSample> {
+    if max_frames == 0 {
+        return None;
+    }
+    let thread = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+            0,
+            tid,
+        )
+    };
+    if thread == 0 {
+        return None;
+    }
+
+    let mut suspended = false;
+    let suspend_rc = unsafe { SuspendThread(thread) };
+    if suspend_rc != u32::MAX {
+        suspended = true;
+    }
+
+    let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+    ctx.ContextFlags = windows_context_control_flags();
+    let ctx_ok = unsafe { GetThreadContext(thread, std::ptr::from_mut(&mut ctx)) };
+    if ctx_ok == 0 {
+        if suspended {
+            unsafe {
+                ResumeThread(thread);
+            }
+        }
+        unsafe {
+            CloseHandle(thread);
+        }
+        return None;
+    }
+
+    let mut out: Vec<u64> = Vec::new();
+    let (rip, rsp) = thread_rip_rsp(&ctx);
+    if rip != 0 {
+        out.push(rip);
+    }
+
+    if out.len() < max_frames {
+        let frames = stackwalk_collect_best_effort(governor, process, thread, &mut ctx, max_frames);
+        for a in frames {
+            if out.len() >= max_frames {
+                break;
+            }
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+
+    if suspended {
+        unsafe {
+            ResumeThread(thread);
+        }
+    }
+    unsafe {
+        CloseHandle(thread);
+    }
+
+    Some(WindowsCallStackSample {
+        tid,
+        rip,
+        rsp,
+        return_addresses: out,
+    })
+}
+
+#[cfg(windows)]
+fn windows_context_control_flags() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        0x0010_0001
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        0x0001_0001
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        0x0040_0001
+    }
+    #[cfg(all(
+        not(target_arch = "x86_64"),
+        not(target_arch = "x86"),
+        not(target_arch = "aarch64")
+    ))]
+    {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn thread_rip_rsp(ctx: &CONTEXT) -> (u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (ctx.Rip, ctx.Rsp)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (0, 0)
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn stackwalk_collect_best_effort(
+    governor: &mut Governor,
+    process: isize,
+    thread: isize,
+    ctx: &mut CONTEXT,
+    max_frames: usize,
+) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if max_frames == 0 {
+        return out;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (governor, process, thread, ctx);
+        return out;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
+        const ADDR_MODE_FLAT: i32 = 3;
+
+        let mut frame: windows_sys::Win32::System::Diagnostics::Debug::STACKFRAME64 =
+            unsafe { std::mem::zeroed() };
+        frame.AddrPC.Offset = ctx.Rip;
+        frame.AddrPC.Mode = ADDR_MODE_FLAT;
+        frame.AddrFrame.Offset = ctx.Rbp;
+        frame.AddrFrame.Mode = ADDR_MODE_FLAT;
+        frame.AddrStack.Offset = ctx.Rsp;
+        frame.AddrStack.Mode = ADDR_MODE_FLAT;
+
+        for _ in 0..max_frames {
+            if !governor.try_consume_budget(1) {
+                break;
+            }
+            let ok = unsafe {
+                let ctx_ptr = std::ptr::from_mut(ctx).cast();
+                windows_sys::Win32::System::Diagnostics::Debug::StackWalk64(
+                    IMAGE_FILE_MACHINE_AMD64,
+                    process,
+                    thread,
+                    std::ptr::from_mut(&mut frame),
+                    ctx_ptr,
+                    None,
+                    Some(windows_sys::Win32::System::Diagnostics::Debug::SymFunctionTableAccess64),
+                    Some(windows_sys::Win32::System::Diagnostics::Debug::SymGetModuleBase64),
+                    None,
+                )
+            };
+            if ok == 0 {
+                break;
+            }
+            let pc = frame.AddrPC.Offset;
+            if pc == 0 {
+                break;
+            }
+            out.push(pc);
+        }
+        out
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe fn sym_initialize_best_effort(process: isize) -> bool {
+    unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::SymInitialize(process, std::ptr::null(), 1)
+            != 0
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe fn sym_cleanup_best_effort(process: isize) {
+    unsafe {
+        let _ = windows_sys::Win32::System::Diagnostics::Debug::SymCleanup(process);
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct ModuleEntry {
+    name_lower: String,
+    path: String,
+    base_address: u64,
+    size: u32,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn collect_process_module_entries_best_effort(
+    governor: &mut Governor,
+    pid: u32,
+    max_modules: usize,
+) -> Vec<ModuleEntry> {
+    let mut out: Vec<ModuleEntry> = Vec::new();
+    if max_modules == 0 {
+        return out;
+    }
+    if !governor.try_consume_budget(1) {
+        return out;
+    }
+
+    let snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return out;
+    }
+
+    let mut me32 = MODULEENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<MODULEENTRY32W>()).unwrap_or(u32::MAX),
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut ok = unsafe { Module32FirstW(snapshot, std::ptr::from_mut(&mut me32)) };
+    while ok != 0 {
+        if out.len() >= max_modules {
+            break;
+        }
+        let name = utf16_nul_terminated_to_string(me32.szModule.as_slice());
+        let path = utf16_nul_terminated_to_string(me32.szExePath.as_slice());
+        out.push(ModuleEntry {
+            name_lower: name.to_ascii_lowercase(),
+            path,
+            base_address: me32.modBaseAddr as usize as u64,
+            size: me32.modBaseSize,
+        });
+        ok = unsafe { Module32NextW(snapshot, std::ptr::from_mut(&mut me32)) };
+    }
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn resolve_export_rva_from_disk_best_effort(module_path: &str, func_name: &str) -> Option<u32> {
+    let meta = std::fs::metadata(module_path).ok()?;
+    let len = usize::try_from(meta.len()).ok()?;
+    if len == 0 || len > 16 * 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(module_path).ok()?;
+    resolve_export_rva_from_pe_best_effort(bytes.as_slice(), func_name)
+}
+
+#[cfg(windows)]
+fn resolve_export_rva_from_pe_best_effort(pe: &[u8], func_name: &str) -> Option<u32> {
+    let pe_off = read_u32_le(pe, 0x3c).ok()? as usize;
+    let sig = pe.get(pe_off..pe_off + 4)?;
+    if sig != b"PE\0\0" {
+        return None;
+    }
+    let coff_off = pe_off + 4;
+    let section_count = read_u16_le(pe, coff_off + 2).ok()? as usize;
+    let size_of_optional_header = read_u16_le(pe, coff_off + 16).ok()? as usize;
+    let opt_off = coff_off + 20;
+    let opt = pe.get(opt_off..opt_off + size_of_optional_header)?;
+    if opt.len() < 2 {
+        return None;
+    }
+    let magic = u16::from_le_bytes([opt[0], opt[1]]);
+    let data_dir_off = match magic {
+        0x20b => 0x70usize,
+        0x10b => 0x60usize,
+        _ => return None,
+    };
+    if opt.len() < data_dir_off + 8 {
+        return None;
+    }
+    let export_rva = u32::from_le_bytes(opt[data_dir_off..data_dir_off + 4].try_into().ok()?);
+    let export_size = u32::from_le_bytes(opt[data_dir_off + 4..data_dir_off + 8].try_into().ok()?);
+    if export_rva == 0 || export_size == 0 {
+        return None;
+    }
+
+    let sections_off = opt_off + size_of_optional_header;
+    let section_table_len = section_count.saturating_mul(40);
+    let section_table = pe.get(sections_off..sections_off + section_table_len)?;
+
+    let export_off = rva_to_file_offset_best_effort(section_table, export_rva)?;
+    let export_dir = pe.get(export_off..export_off + 40)?;
+
+    let number_of_functions = u32::from_le_bytes(export_dir[20..24].try_into().ok()?);
+    let number_of_names = u32::from_le_bytes(export_dir[24..28].try_into().ok()?);
+    let address_of_functions = u32::from_le_bytes(export_dir[28..32].try_into().ok()?);
+    let address_of_names = u32::from_le_bytes(export_dir[32..36].try_into().ok()?);
+    let address_of_name_ordinals = u32::from_le_bytes(export_dir[36..40].try_into().ok()?);
+    if number_of_functions == 0 || number_of_names == 0 {
+        return None;
+    }
+
+    let names_off = rva_to_file_offset_best_effort(section_table, address_of_names)?;
+    let ords_off = rva_to_file_offset_best_effort(section_table, address_of_name_ordinals)?;
+    let funcs_off = rva_to_file_offset_best_effort(section_table, address_of_functions)?;
+
+    let target = func_name.as_bytes();
+    for i in 0..number_of_names {
+        let idx = usize::try_from(i).ok()?;
+        let name_rva_off = names_off.saturating_add(idx.saturating_mul(4));
+        let name_rva_bytes = pe.get(name_rva_off..name_rva_off + 4)?;
+        let name_rva = u32::from_le_bytes(name_rva_bytes.try_into().ok()?);
+        let export_name_off = rva_to_file_offset_best_effort(section_table, name_rva)?;
+        let name = read_c_string_best_effort(pe, export_name_off)?;
+        if name.as_bytes() != target {
+            continue;
+        }
+        let ordinal_off = ords_off.saturating_add(idx.saturating_mul(2));
+        let ord_bytes = pe.get(ordinal_off..ordinal_off + 2)?;
+        let ordinal = u32::from(u16::from_le_bytes(ord_bytes.try_into().ok()?));
+        if ordinal >= number_of_functions {
+            return None;
+        }
+        let func_rva_off =
+            funcs_off.saturating_add(usize::try_from(ordinal).ok()?.saturating_mul(4));
+        let func_rva_bytes = pe.get(func_rva_off..func_rva_off + 4)?;
+        let func_rva = u32::from_le_bytes(func_rva_bytes.try_into().ok()?);
+        if func_rva >= export_rva && func_rva < export_rva.saturating_add(export_size) {
+            return None;
+        }
+        return Some(func_rva);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn rva_to_file_offset_best_effort(section_table: &[u8], rva: u32) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut best_end: u32 = 0;
+    for i in 0..(section_table.len() / 40) {
+        let base = i.saturating_mul(40);
+        let sec = section_table.get(base..base + 40)?;
+        let virtual_size = u32::from_le_bytes(sec[8..12].try_into().ok()?);
+        let virtual_address = u32::from_le_bytes(sec[12..16].try_into().ok()?);
+        let size_of_raw_data = u32::from_le_bytes(sec[16..20].try_into().ok()?);
+        let pointer_to_raw_data = u32::from_le_bytes(sec[20..24].try_into().ok()?);
+        let span = u32::max(virtual_size, size_of_raw_data);
+        if span == 0 {
+            continue;
+        }
+        let end = virtual_address.saturating_add(span);
+        if rva >= virtual_address && rva < end && (best.is_none() || end > best_end) {
+            let off = pointer_to_raw_data.saturating_add(rva.saturating_sub(virtual_address));
+            best = Some(usize::try_from(off).ok()?);
+            best_end = end;
+        }
+    }
+    best
+}
+
+#[cfg(windows)]
+fn read_c_string_best_effort(bytes: &[u8], start: usize) -> Option<String> {
+    let mut end = start;
+    while end < bytes.len() {
+        if bytes[end] == 0 {
+            break;
+        }
+        end = end.saturating_add(1);
+        if end.saturating_sub(start) > 512 {
+            return None;
+        }
+    }
+    let slice = bytes.get(start..end)?;
+    Some(String::from_utf8_lossy(slice).to_string())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn read_remote_bytes_best_effort(
+    governor: &mut Governor,
+    process: isize,
+    address: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if len == 0 || len > 256 {
+        return None;
+    }
+    if !governor.try_consume_budget(1) {
+        return None;
+    }
+    let mut buf: Vec<u8> = vec![0u8; len];
+    let mut read: usize = 0;
+    let ok = unsafe {
+        ReadProcessMemory(
+            process,
+            address as _,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            std::ptr::from_mut(&mut read),
+        )
+    };
+    if ok == 0 || read == 0 {
+        return None;
+    }
+    buf.truncate(read);
+    Some(buf)
+}
+
+#[cfg(windows)]
+fn detect_patch_kind_best_effort(code: &[u8]) -> Option<&'static str> {
+    let b0 = *code.first().unwrap_or(&0);
+    if b0 == 0xC3 {
+        return Some("ret");
+    }
+    if b0 == 0xE9 || b0 == 0xEB {
+        return Some("jmp");
+    }
+    if code.len() >= 3 && code[0] == 0x33 && code[1] == 0xC0 && code[2] == 0xC3 {
+        return Some("xor_eax_eax_ret");
+    }
+    if code.len() >= 4 && code[0] == 0x48 && code[1] == 0x31 && code[2] == 0xC0 && code[3] == 0xC3 {
+        return Some("xor_rax_rax_ret");
+    }
+    if code.len() >= 6 && code[0] == 0xB8 && code[5] == 0xC3 {
+        return Some("mov_eax_imm_ret");
+    }
+    None
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn collect_etw_amsi_patch_findings_best_effort(
+    governor: &mut Governor,
+    process: isize,
+    pid: u32,
+    max_modules: usize,
+) -> Vec<ModuleIntegrityFinding> {
+    let mut out: Vec<ModuleIntegrityFinding> = Vec::new();
+    if !governor.try_consume_budget(1) {
+        return out;
+    }
+
+    let modules = collect_process_module_entries_best_effort(governor, pid, max_modules);
+    let mut ntdll: Option<ModuleEntry> = None;
+    let mut amsi: Option<ModuleEntry> = None;
+    for m in modules {
+        if m.name_lower == "ntdll.dll" {
+            ntdll = Some(m);
+        } else if m.name_lower == "amsi.dll" {
+            amsi = Some(m);
+        }
+    }
+
+    let targets: Vec<(ModuleEntry, &'static str)> = [
+        ntdll.map(|m| (m, "EtwEventWrite")),
+        amsi.map(|m| (m, "AmsiScanBuffer")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for (m, func) in targets {
+        if !governor.try_consume_budget(1) {
+            break;
+        }
+        let rva = resolve_export_rva_from_disk_best_effort(m.path.as_str(), func);
+        let Some(rva) = rva else {
+            continue;
+        };
+        let addr = m.base_address.saturating_add(u64::from(rva));
+        let Some(code) = read_remote_bytes_best_effort(governor, process, addr, 16) else {
+            continue;
+        };
+        let Some(kind) = detect_patch_kind_best_effort(code.as_slice()) else {
+            continue;
+        };
+        out.push(ModuleIntegrityFinding {
+            module_path: format!("{}!{func}", m.name_lower),
+            base_address: addr,
+            module_size: m.size,
+            finding: format!("patch_suspected:{kind}"),
+            confidence: 90,
+            mem_time_date_stamp: 0,
+            disk_time_date_stamp: 0,
+        });
+    }
+
+    out
 }
 
 #[allow(clippy::missing_errors_doc)]

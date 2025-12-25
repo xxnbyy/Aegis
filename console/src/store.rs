@@ -9,8 +9,9 @@ use aes_kw::Kek;
 use common::crypto;
 use common::error::{AegisError, ErrorCode};
 use common::protocol::{
-    ArtifactBuilder, Command, MAX_ARTIFACT_CHUNK_SIZE, Message as ProtocolMessage, MessageHeader,
-    MessagePayload, PayloadEnvelope, ProcessInfo, payload_envelope,
+    ArtifactBuilder, Command, EbpfEvent, MAX_ARTIFACT_CHUNK_SIZE, Message as ProtocolMessage,
+    MessageHeader, MessagePayload, PayloadEnvelope, ProcessGhostingEvidence, ProcessInfo,
+    WindowsMemoryForensicsEvidence, payload_envelope,
 };
 use prost::Message;
 use regex::{Captures, Regex};
@@ -39,6 +40,14 @@ const MAX_LEVEL01_NODES: usize = 20_000;
 const DEFAULT_LEVEL2_LIMIT: usize = 2000;
 
 type ArtifactParts<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
+struct CollectedPayloads {
+    processes: Vec<ProcessInfo>,
+    files: Vec<common::protocol::FileInfo>,
+    ebpf_events: Vec<EbpfEvent>,
+    ghosting: Vec<ProcessGhostingEvidence>,
+    memfor: Vec<WindowsMemoryForensicsEvidence>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PersistenceConfig {
@@ -1394,11 +1403,14 @@ fn build_graph_from_stream(
     let host_uuid = Uuid::from_bytes(header.host_uuid);
     let host_uuid_str = host_uuid.to_string();
 
-    let (processes, files) = collect_payloads(items.as_slice());
+    let collected = collect_payloads(items.as_slice());
     build_graph_from_payloads(
         host_uuid_str.as_str(),
-        processes.as_slice(),
-        files.as_slice(),
+        collected.processes.as_slice(),
+        collected.files.as_slice(),
+        collected.ebpf_events.as_slice(),
+        collected.ghosting.as_slice(),
+        collected.memfor.as_slice(),
     )
 }
 
@@ -1466,27 +1478,44 @@ fn validate_system_info(items: &[PayloadEnvelope]) -> Result<(), AegisError> {
     Ok(())
 }
 
-fn collect_payloads(
-    items: &[PayloadEnvelope],
-) -> (Vec<ProcessInfo>, Vec<common::protocol::FileInfo>) {
+fn collect_payloads(items: &[PayloadEnvelope]) -> CollectedPayloads {
     let mut processes: Vec<ProcessInfo> = Vec::new();
     let mut files: Vec<common::protocol::FileInfo> = Vec::new();
+    let mut ebpf_events: Vec<EbpfEvent> = Vec::new();
+    let mut ghosting: Vec<ProcessGhostingEvidence> = Vec::new();
+    let mut memfor: Vec<WindowsMemoryForensicsEvidence> = Vec::new();
 
     for env in items {
         match env.payload.as_ref() {
             Some(payload_envelope::Payload::ProcessInfo(p)) => processes.push(p.clone()),
             Some(payload_envelope::Payload::FileInfo(f)) => files.push(f.clone()),
+            Some(payload_envelope::Payload::EbpfEventBatch(b)) => {
+                ebpf_events.extend_from_slice(b.events.as_slice());
+            }
+            Some(payload_envelope::Payload::ProcessGhostingEvidence(e)) => ghosting.push(e.clone()),
+            Some(payload_envelope::Payload::WindowsMemoryForensicsEvidence(e)) => {
+                memfor.push(e.clone());
+            }
             _ => {}
         }
     }
 
-    (processes, files)
+    CollectedPayloads {
+        processes,
+        files,
+        ebpf_events,
+        ghosting,
+        memfor,
+    }
 }
 
 fn build_graph_from_payloads(
     host_uuid: &str,
     processes: &[ProcessInfo],
     files: &[common::protocol::FileInfo],
+    ebpf_events: &[EbpfEvent],
+    ghosting: &[ProcessGhostingEvidence],
+    memfor: &[WindowsMemoryForensicsEvidence],
 ) -> Result<Graph, AegisError> {
     let mut graph = Graph::default();
 
@@ -1559,7 +1588,237 @@ fn build_graph_from_payloads(
         graph.nodes.insert(node.id.clone(), node);
     }
 
+    apply_ghosting_evidence_to_graph(&mut graph, ghosting);
+    apply_windows_memory_forensics_to_graph(&mut graph, memfor);
+
+    for ev in ebpf_events {
+        if ev.pid == 0 || ev.exec_id == 0 {
+            continue;
+        }
+        let Some(proc_id) = find_process_node_id_by_pid_exec_id(&graph, ev.pid, ev.exec_id) else {
+            continue;
+        };
+
+        let Some(socket_key) = ebpf_socket_key(ev) else {
+            continue;
+        };
+        let socket_id = socket_node_id(host_uuid, socket_key.as_str());
+        if !graph.nodes.contains_key(socket_id.as_str()) {
+            let socket = socket_node(socket_id.clone(), socket_key.as_str(), ev);
+            graph.nodes.insert(socket_id.clone(), socket);
+        }
+        graph.edges.push(GraphEdge {
+            id: edge_id(proc_id.as_str(), socket_id.as_str(), EdgeType::HasIp),
+            src: proc_id,
+            dst: socket_id,
+            r#type: EdgeType::HasIp,
+            confidence: 0.8,
+        });
+    }
+
     Ok(graph)
+}
+
+fn apply_ghosting_evidence_to_graph(graph: &mut Graph, evidence: &[ProcessGhostingEvidence]) {
+    for ev in evidence {
+        let Some(proc_id) = find_latest_process_node_id_by_pid(graph, ev.pid) else {
+            continue;
+        };
+        let Some(node) = graph.nodes.get_mut(proc_id.as_str()) else {
+            continue;
+        };
+        push_tag(node, "GhostingEvidence");
+        if ev.delete_pending {
+            push_tag(node, "DeletePending");
+        }
+        if ev.suspected {
+            push_tag(node, "Suspected");
+        }
+        if !ev.exe_path.trim().is_empty() {
+            node.attrs
+                .insert("ghosting_exe_path".to_string(), ev.exe_path.clone());
+        }
+        node.attrs.insert(
+            "ghosting_delete_pending".to_string(),
+            ev.delete_pending.to_string(),
+        );
+        node.attrs
+            .insert("ghosting_suspected".to_string(), ev.suspected.to_string());
+        if let Some(mem) = ev.mem.as_ref() {
+            node.attrs.insert(
+                "ghosting_mem_stamp".to_string(),
+                mem.time_date_stamp.to_string(),
+            );
+            node.attrs.insert(
+                "ghosting_mem_size".to_string(),
+                mem.size_of_image.to_string(),
+            );
+        }
+        if let Some(disk) = ev.disk.as_ref() {
+            node.attrs.insert(
+                "ghosting_disk_stamp".to_string(),
+                disk.time_date_stamp.to_string(),
+            );
+            node.attrs.insert(
+                "ghosting_disk_size".to_string(),
+                disk.size_of_image.to_string(),
+            );
+        }
+        node.risk_score = std::cmp::max(node.risk_score, 90);
+    }
+}
+
+fn apply_windows_memory_forensics_to_graph(
+    graph: &mut Graph,
+    evidence: &[WindowsMemoryForensicsEvidence],
+) {
+    for ev in evidence {
+        let Some(proc_id) = find_process_node_id_by_pid_exec_id(graph, ev.pid, ev.exec_id) else {
+            continue;
+        };
+        let Some(node) = graph.nodes.get_mut(proc_id.as_str()) else {
+            continue;
+        };
+        push_tag(node, "MemForensics");
+        node.attrs.insert(
+            "memfor_private_exec_regions".to_string(),
+            ev.private_exec_region_count.to_string(),
+        );
+        if !ev.module_findings.is_empty() {
+            push_tag(node, "ModuleTamper");
+        }
+        node.attrs.insert(
+            "memfor_module_findings_count".to_string(),
+            ev.module_findings.len().to_string(),
+        );
+        node.attrs.insert(
+            "memfor_private_exec_region_samples_count".to_string(),
+            ev.private_exec_region_samples.len().to_string(),
+        );
+        let mut score: i32 = i32::try_from(node.risk_score).unwrap_or(100);
+        if ev.private_exec_region_count >= 1 {
+            score = score.saturating_add(25);
+            push_tag(node, "PrivateExecRegions");
+        }
+        if ev.private_exec_region_count >= 5 {
+            score = score.saturating_add(15);
+        }
+        if ev.private_exec_region_count >= 10 {
+            score = score.saturating_add(20);
+        }
+        for (i, f) in ev.module_findings.iter().take(5).enumerate() {
+            let key = format!("memfor_module_finding_{i}");
+            node.attrs.insert(
+                key,
+                format!(
+                    "{}|{}|confidence={}",
+                    f.module_path, f.finding, f.confidence
+                ),
+            );
+            score = score.saturating_add(i32::try_from(f.confidence.min(100) / 10).unwrap_or(0));
+        }
+        for (i, s) in ev.private_exec_region_samples.iter().take(3).enumerate() {
+            let key = format!("memfor_private_exec_sample_{i}");
+            node.attrs.insert(
+                key,
+                format!(
+                    "base=0x{:x}|size={}|protect=0x{:x}|sample_len={}",
+                    s.base_address,
+                    s.region_size,
+                    s.protect,
+                    s.sample.len()
+                ),
+            );
+            score = score.saturating_add(3);
+        }
+        let score = score.clamp(0, 100);
+        node.risk_score = u32::try_from(score).unwrap_or(node.risk_score);
+    }
+}
+
+fn find_process_node_id_by_pid_exec_id(graph: &Graph, pid: u32, exec_id: u64) -> Option<String> {
+    let list = graph.pid_index.get(&pid)?;
+    list.iter()
+        .find(|x| x.exec_id == exec_id)
+        .map(|x| x.node_id.clone())
+}
+
+fn find_latest_process_node_id_by_pid(graph: &Graph, pid: u32) -> Option<String> {
+    let list = graph.pid_index.get(&pid)?;
+    list.iter()
+        .max_by_key(|x| x.start_time_ms)
+        .map(|x| x.node_id.clone())
+}
+
+fn push_tag(node: &mut GraphNode, tag: &str) {
+    if !node.tags.iter().any(|t| t == tag) {
+        node.tags.push(tag.to_string());
+    }
+}
+
+fn socket_node_id(host_uuid: &str, key: &str) -> String {
+    sha256_hex(format!("{host_uuid}:socket:{key}").as_bytes())
+}
+
+fn socket_node(id: String, key: &str, ev: &EbpfEvent) -> GraphNode {
+    let mut attrs = std::collections::BTreeMap::new();
+    attrs.insert("key".to_string(), key.to_string());
+    attrs.insert("kind".to_string(), ev.kind.clone());
+    if !ev.comm.trim().is_empty() {
+        attrs.insert("comm".to_string(), ev.comm.clone());
+    }
+    if !ev.detail.trim().is_empty() {
+        attrs.insert(
+            "detail".to_string(),
+            token_limit_head_tail(ev.detail.as_str(), 400),
+        );
+    }
+    GraphNode {
+        id,
+        label: key.to_string(),
+        r#type: NodeType::Socket,
+        risk_score: 0,
+        is_inferred: true,
+        tags: vec!["ebpf".to_string()],
+        attrs,
+    }
+}
+
+fn ebpf_socket_key(ev: &EbpfEvent) -> Option<String> {
+    let d = ev.detail.trim();
+    if d.is_empty() {
+        return None;
+    }
+    parse_kv_socket_key(d)
+        .or_else(|| parse_hostport_token(d))
+        .or_else(|| Some(format!("pid={}:{}", ev.pid, sha256_hex(d.as_bytes()))))
+}
+
+fn parse_kv_socket_key(detail: &str) -> Option<String> {
+    for k in ["dst=", "remote=", "peer=", "connect="] {
+        if let Some(pos) = detail.find(k) {
+            let rest = detail.get(pos + k.len()..)?;
+            let token = rest
+                .split(|c: char| c.is_whitespace() || c == ';' || c == ',' || c == ')')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_hostport_token(detail: &str) -> Option<String> {
+    for token in detail.split_whitespace() {
+        let t = token.trim_matches(|c: char| c == ',' || c == ';' || c == '(' || c == ')');
+        if t.contains(':') && (t.contains('.') || t.contains(']')) {
+            return Some(t.to_string());
+        }
+    }
+    None
 }
 
 fn find_process_node_id(
