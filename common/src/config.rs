@@ -18,6 +18,8 @@ pub struct AegisConfig {
     pub governor: GovernorConfig,
     pub security: SecurityConfig,
     pub networking: NetworkingConfig,
+    pub forensics: ForensicsConfig,
+    pub artifact: ArtifactConfig,
 }
 
 impl AegisConfig {
@@ -27,6 +29,31 @@ impl AegisConfig {
         self.governor.validate()?;
         self.security.validate()?;
         self.networking.validate()?;
+        self.forensics.validate()?;
+        self.artifact.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsMemoryScanDepth {
+    #[serde(alias = "quick")]
+    #[default]
+    Fast,
+    Full,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ForensicsConfig {
+    pub windows_memory_scan_depth: WindowsMemoryScanDepth,
+}
+
+impl ForensicsConfig {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn validate(&self) -> Result<(), AegisError> {
+        let _ = self;
         Ok(())
     }
 }
@@ -48,6 +75,8 @@ impl CryptoConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct GovernorConfig {
+    #[serde(alias = "mode")]
+    pub profile: GovernorProfile,
     pub pid: PidConfig,
     pub token_bucket: TokenBucketConfig,
     pub max_single_core_usage: u32,
@@ -56,9 +85,19 @@ pub struct GovernorConfig {
     pub io_limit_mb: u32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernorProfile {
+    #[default]
+    Custom,
+    Office,
+    War,
+}
+
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
+            profile: GovernorProfile::default(),
             pid: PidConfig::default(),
             token_bucket: TokenBucketConfig::default(),
             max_single_core_usage: 5,
@@ -81,18 +120,43 @@ impl GovernorConfig {
         Ok(())
     }
 
+    #[must_use]
+    pub fn effective_profile_applied(&self) -> Self {
+        let mut cfg = self.clone();
+        match self.profile {
+            GovernorProfile::Custom => cfg,
+            GovernorProfile::Office => {
+                cfg.pid = PidConfig::default();
+                cfg.token_bucket = TokenBucketConfig::default();
+                cfg.max_single_core_usage = 5;
+                cfg.net_packet_limit_per_sec = 5000;
+                cfg.io_limit_mb = 10;
+                cfg
+            }
+            GovernorProfile::War => {
+                cfg.pid = PidConfig::default();
+                cfg.token_bucket = TokenBucketConfig::default();
+                cfg.max_single_core_usage = 80;
+                cfg.net_packet_limit_per_sec = 50_000;
+                cfg.io_limit_mb = 0;
+                cfg
+            }
+        }
+    }
+
     pub fn effective_token_bucket(&self) -> TokenBucketConfig {
-        if self.net_packet_limit_per_sec == 0 {
-            return self.token_bucket.clone();
+        let cfg = self.effective_profile_applied();
+        if cfg.net_packet_limit_per_sec == 0 {
+            return cfg.token_bucket;
         }
 
-        if self.token_bucket != TokenBucketConfig::default() {
-            return self.token_bucket.clone();
+        if cfg.token_bucket != TokenBucketConfig::default() {
+            return cfg.token_bucket;
         }
 
         TokenBucketConfig {
-            capacity: self.net_packet_limit_per_sec,
-            refill_per_sec: self.net_packet_limit_per_sec,
+            capacity: cfg.net_packet_limit_per_sec,
+            refill_per_sec: cfg.net_packet_limit_per_sec,
         }
     }
 
@@ -173,9 +237,15 @@ impl TokenBucketConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub enable_native_plugins: bool,
+    pub native_plugin_isolation: String,
+    pub native_plugin_timeout_ms: u64,
+    pub native_plugin_sig_mode: String,
     pub wasm_plugin_paths: Vec<String>,
     pub wasm_permissions_allow: Vec<String>,
     pub native_plugin_paths: Vec<String>,
+    pub ebpf_object_path: Option<String>,
+    pub ebpf_bpftool_path: Option<String>,
+    pub ebpf_pin_dir: Option<String>,
     pub timestomp_threshold_ms: u64,
     pub scan_whitelist: Vec<String>,
     pub yara_rule_paths: Vec<String>,
@@ -185,9 +255,15 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             enable_native_plugins: false,
+            native_plugin_isolation: "in_process".to_string(),
+            native_plugin_timeout_ms: 1500,
+            native_plugin_sig_mode: "hybrid".to_string(),
             wasm_plugin_paths: Vec::new(),
             wasm_permissions_allow: Vec::new(),
             native_plugin_paths: Vec::new(),
+            ebpf_object_path: None,
+            ebpf_bpftool_path: None,
+            ebpf_pin_dir: None,
             timestomp_threshold_ms: 1000,
             scan_whitelist: Vec::new(),
             yara_rule_paths: Vec::new(),
@@ -215,6 +291,66 @@ impl SecurityConfig {
         if self.native_plugin_paths.iter().any(|p| p.trim().is_empty()) {
             return Err(AegisError::ConfigError {
                 message: "security.native_plugin_paths 不能包含空路径".to_string(),
+            });
+        }
+        if self.native_plugin_isolation.trim().is_empty() {
+            return Err(AegisError::ConfigError {
+                message: "security.native_plugin_isolation 不能为空".to_string(),
+            });
+        }
+        if !matches!(
+            self.native_plugin_isolation.trim(),
+            "in_process" | "subprocess"
+        ) {
+            return Err(AegisError::ConfigError {
+                message: "security.native_plugin_isolation 仅允许 in_process/subprocess"
+                    .to_string(),
+            });
+        }
+        if self.native_plugin_timeout_ms == 0 {
+            return Err(AegisError::ConfigError {
+                message: "security.native_plugin_timeout_ms 不能为 0".to_string(),
+            });
+        }
+        if self.native_plugin_sig_mode.trim().is_empty() {
+            return Err(AegisError::ConfigError {
+                message: "security.native_plugin_sig_mode 不能为空".to_string(),
+            });
+        }
+        if !matches!(
+            self.native_plugin_sig_mode.trim(),
+            "ed25519" | "rsa_pkcs1v15" | "hybrid"
+        ) {
+            return Err(AegisError::ConfigError {
+                message: "security.native_plugin_sig_mode 仅允许 ed25519/rsa_pkcs1v15/hybrid"
+                    .to_string(),
+            });
+        }
+        if self
+            .ebpf_object_path
+            .as_ref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(AegisError::ConfigError {
+                message: "security.ebpf_object_path 不能是空字符串".to_string(),
+            });
+        }
+        if self
+            .ebpf_bpftool_path
+            .as_ref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(AegisError::ConfigError {
+                message: "security.ebpf_bpftool_path 不能是空字符串".to_string(),
+            });
+        }
+        if self
+            .ebpf_pin_dir
+            .as_ref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(AegisError::ConfigError {
+                message: "security.ebpf_pin_dir 不能是空字符串".to_string(),
             });
         }
         if self.yara_rule_paths.iter().any(|p| p.trim().is_empty()) {
@@ -248,6 +384,34 @@ impl NetworkingConfig {
         if self.heartbeat_interval_sec == 0 {
             return Err(AegisError::ConfigError {
                 message: "heartbeat_interval_sec 不能为 0".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ArtifactConfig {
+    pub max_files: u32,
+    pub max_total_mb: u64,
+}
+
+impl Default for ArtifactConfig {
+    fn default() -> Self {
+        Self {
+            max_files: 4096,
+            max_total_mb: 2048,
+        }
+    }
+}
+
+impl ArtifactConfig {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn validate(&self) -> Result<(), AegisError> {
+        if self.max_files == 0 {
+            return Err(AegisError::ConfigError {
+                message: "artifact.max_files 不能为 0".to_string(),
             });
         }
         Ok(())

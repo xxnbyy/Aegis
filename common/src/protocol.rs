@@ -12,7 +12,10 @@ pub mod proto {
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct PayloadEnvelope {
-    #[prost(oneof = "payload_envelope::Payload", tags = "1, 2, 3, 4, 5")]
+    #[prost(
+        oneof = "payload_envelope::Payload",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    )]
     pub payload: Option<payload_envelope::Payload>,
 }
 
@@ -29,6 +32,18 @@ pub mod payload_envelope {
         NetworkInterfaceUpdate(super::NetworkInterfaceUpdate),
         #[prost(message, tag = "5")]
         AgentTelemetry(super::AgentTelemetry),
+        #[prost(message, tag = "6")]
+        ProcessGhostingEvidence(super::ProcessGhostingEvidence),
+        #[prost(message, tag = "7")]
+        WindowsMemoryForensicsEvidence(super::WindowsMemoryForensicsEvidence),
+        #[prost(message, tag = "8")]
+        EbpfEventBatch(super::EbpfEventBatch),
+        #[prost(message, tag = "9")]
+        SmartReflexEvidence(super::SmartReflexEvidence),
+        #[prost(message, tag = "10")]
+        EvidenceChunk(super::EvidenceChunk),
+        #[prost(message, tag = "11")]
+        LinuxKernelForensicsEvidence(super::LinuxKernelForensicsEvidence),
     }
 }
 
@@ -156,6 +171,78 @@ impl<R: Read> Iterator for Chunker<R> {
         };
         self.sequence_id = self.sequence_id.saturating_add(1);
         Some(Ok(message))
+    }
+}
+
+pub struct EvidenceChunker<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    max_chunk_size: usize,
+    evidence_id: u64,
+    kind: String,
+    content_type: String,
+    sequence_id: u32,
+}
+
+impl<'a> EvidenceChunker<'a> {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn new(
+        bytes: &'a [u8],
+        max_chunk_size: usize,
+        evidence_id: u64,
+        kind: impl Into<String>,
+        content_type: impl Into<String>,
+    ) -> Result<Self, AegisError> {
+        if max_chunk_size == 0 || max_chunk_size > MAX_ARTIFACT_CHUNK_SIZE {
+            return Err(AegisError::ConfigError {
+                message: format!(
+                    "max_chunk_size 必须在 1..={MAX_ARTIFACT_CHUNK_SIZE} 之间，当前: {max_chunk_size}"
+                ),
+            });
+        }
+        Ok(Self {
+            bytes,
+            offset: 0,
+            max_chunk_size,
+            evidence_id,
+            kind: kind.into(),
+            content_type: content_type.into(),
+            sequence_id: 0,
+        })
+    }
+}
+
+impl Iterator for EvidenceChunker<'_> {
+    type Item = PayloadEnvelope;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.bytes.len() {
+            return None;
+        }
+
+        let end = self
+            .offset
+            .saturating_add(self.max_chunk_size)
+            .min(self.bytes.len());
+        let chunk_bytes = self
+            .bytes
+            .get(self.offset..end)
+            .unwrap_or_default()
+            .to_vec();
+        let is_last = end >= self.bytes.len();
+
+        let env = PayloadEnvelope::evidence_chunk(EvidenceChunk {
+            evidence_id: self.evidence_id,
+            sequence_id: self.sequence_id,
+            is_last,
+            kind: self.kind.clone(),
+            content_type: self.content_type.clone(),
+            bytes: chunk_bytes,
+        });
+
+        self.offset = end;
+        self.sequence_id = self.sequence_id.saturating_add(1);
+        Some(env)
     }
 }
 
@@ -308,6 +395,42 @@ impl PayloadEnvelope {
             payload: Some(payload_envelope::Payload::AgentTelemetry(v)),
         }
     }
+
+    pub fn process_ghosting_evidence(v: ProcessGhostingEvidence) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::ProcessGhostingEvidence(v)),
+        }
+    }
+
+    pub fn windows_memory_forensics_evidence(v: WindowsMemoryForensicsEvidence) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::WindowsMemoryForensicsEvidence(v)),
+        }
+    }
+
+    pub fn ebpf_event_batch(v: EbpfEventBatch) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::EbpfEventBatch(v)),
+        }
+    }
+
+    pub fn smart_reflex_evidence(v: SmartReflexEvidence) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::SmartReflexEvidence(v)),
+        }
+    }
+
+    pub fn evidence_chunk(v: EvidenceChunk) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::EvidenceChunk(v)),
+        }
+    }
+
+    pub fn linux_kernel_forensics_evidence(v: LinuxKernelForensicsEvidence) -> Self {
+        Self {
+            payload: Some(payload_envelope::Payload::LinuxKernelForensicsEvidence(v)),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
@@ -376,6 +499,198 @@ pub struct AgentTelemetry {
     pub memory_usage_mb: u32,
     #[prost(uint64, tag = "4")]
     pub dropped_events_count: u64,
+    #[prost(uint64, tag = "5")]
+    pub dropped_governor: u64,
+    #[prost(uint64, tag = "6")]
+    pub dropped_loop: u64,
+    #[prost(uint64, tag = "7")]
+    pub dropped_ringbuf: u64,
+    #[prost(uint32, tag = "8")]
+    pub dropped_rate_percent: u32,
+    #[prost(bool, tag = "9")]
+    pub overloaded: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct PeFingerprint {
+    #[prost(uint32, tag = "1")]
+    pub time_date_stamp: u32,
+    #[prost(uint32, tag = "2")]
+    pub size_of_image: u32,
+    #[prost(uint32, tag = "3")]
+    pub number_of_sections: u32,
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub section_names: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct ProcessGhostingEvidence {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(string, tag = "2")]
+    pub exe_path: String,
+    #[prost(bool, tag = "3")]
+    pub delete_pending: bool,
+    #[prost(bool, tag = "4")]
+    pub suspected: bool,
+    #[prost(message, optional, tag = "5")]
+    pub mem: Option<PeFingerprint>,
+    #[prost(message, optional, tag = "6")]
+    pub disk: Option<PeFingerprint>,
+    #[prost(bytes = "vec", tag = "7")]
+    pub mem_header: Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub disk_header: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct ModuleIntegrityFinding {
+    #[prost(string, tag = "1")]
+    pub module_path: String,
+    #[prost(uint64, tag = "2")]
+    pub base_address: u64,
+    #[prost(uint32, tag = "3")]
+    pub module_size: u32,
+    #[prost(string, tag = "4")]
+    pub finding: String,
+    #[prost(uint32, tag = "5")]
+    pub confidence: u32,
+    #[prost(uint32, tag = "6")]
+    pub mem_time_date_stamp: u32,
+    #[prost(uint32, tag = "7")]
+    pub disk_time_date_stamp: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct WindowsPrivateExecRegionSample {
+    #[prost(uint64, tag = "1")]
+    pub base_address: u64,
+    #[prost(uint64, tag = "2")]
+    pub region_size: u64,
+    #[prost(uint32, tag = "3")]
+    pub protect: u32,
+    #[prost(uint32, tag = "4")]
+    pub state: u32,
+    #[prost(uint32, tag = "5")]
+    pub ty: u32,
+    #[prost(bytes = "vec", tag = "6")]
+    pub sample: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct WindowsCallStackSample {
+    #[prost(uint32, tag = "1")]
+    pub tid: u32,
+    #[prost(uint64, tag = "2")]
+    pub rip: u64,
+    #[prost(uint64, tag = "3")]
+    pub rsp: u64,
+    #[prost(uint64, repeated, tag = "4")]
+    pub return_addresses: Vec<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct WindowsMemoryForensicsEvidence {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(uint64, tag = "2")]
+    pub exec_id: u64,
+    #[prost(int64, tag = "3")]
+    pub collected_at: i64,
+    #[prost(uint32, tag = "4")]
+    pub private_exec_region_count: u32,
+    #[prost(message, repeated, tag = "5")]
+    pub module_findings: Vec<ModuleIntegrityFinding>,
+    #[prost(message, repeated, tag = "6")]
+    pub private_exec_region_samples: Vec<WindowsPrivateExecRegionSample>,
+    #[prost(message, repeated, tag = "7")]
+    pub call_stack_samples: Vec<WindowsCallStackSample>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct EbpfEvent {
+    #[prost(uint64, tag = "1")]
+    pub timestamp_ns: u64,
+    #[prost(uint32, tag = "2")]
+    pub pid: u32,
+    #[prost(uint32, tag = "3")]
+    pub tgid: u32,
+    #[prost(uint64, tag = "4")]
+    pub exec_id: u64,
+    #[prost(string, tag = "5")]
+    pub kind: String,
+    #[prost(string, tag = "6")]
+    pub comm: String,
+    #[prost(string, tag = "7")]
+    pub detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct EbpfEventBatch {
+    #[prost(int64, tag = "1")]
+    pub collected_at: i64,
+    #[prost(uint64, tag = "2")]
+    pub dropped_total: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub events: Vec<EbpfEvent>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct SmartReflexEvidence {
+    #[prost(int64, tag = "1")]
+    pub matched_at: i64,
+    #[prost(uint32, tag = "2")]
+    pub score: u32,
+    #[prost(string, tag = "3")]
+    pub kind: String,
+    #[prost(string, tag = "4")]
+    pub indicator: String,
+    #[prost(uint32, tag = "5")]
+    pub pid: u32,
+    #[prost(uint64, tag = "6")]
+    pub exec_id: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct EvidenceChunk {
+    #[prost(uint64, tag = "1")]
+    pub evidence_id: u64,
+    #[prost(uint32, tag = "2")]
+    pub sequence_id: u32,
+    #[prost(bool, tag = "3")]
+    pub is_last: bool,
+    #[prost(string, tag = "4")]
+    pub kind: String,
+    #[prost(string, tag = "5")]
+    pub content_type: String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct LinuxVdsoHash {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(uint64, tag = "2")]
+    pub exec_id: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, prost::Message)]
+pub struct LinuxKernelForensicsEvidence {
+    #[prost(int64, tag = "1")]
+    pub collected_at: i64,
+    #[prost(string, tag = "2")]
+    pub core_pattern: String,
+    #[prost(bool, tag = "3")]
+    pub core_pattern_suspicious: bool,
+    #[prost(string, repeated, tag = "4")]
+    pub hidden_kernel_modules: Vec<String>,
+    #[prost(string, repeated, tag = "5")]
+    pub ftrace_enabled_functions: Vec<String>,
+    #[prost(message, repeated, tag = "6")]
+    pub vdso_hashes: Vec<LinuxVdsoHash>,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -550,6 +865,45 @@ mod tests {
 
         let bad_big = Chunker::new(std::io::empty(), MAX_ARTIFACT_CHUNK_SIZE + 1, 1).err();
         assert!(matches!(bad_big, Some(AegisError::ConfigError { .. })));
+    }
+
+    #[test]
+    fn evidence_chunker_roundtrip() -> Result<(), AegisError> {
+        let bytes: Vec<u8> = (0..5_000_000u32)
+            .map(|i| u8::try_from(i % 251).unwrap_or_default())
+            .collect();
+        let evidence_id = 123u64;
+        let mut chunker = EvidenceChunker::new(
+            bytes.as_slice(),
+            777_777,
+            evidence_id,
+            "test",
+            "application/octet-stream",
+        )?;
+
+        let mut rebuilt: Vec<u8> = Vec::new();
+        let mut saw_last = false;
+        let mut expected_seq = 0u32;
+
+        for env in chunker.by_ref() {
+            let Some(payload_envelope::Payload::EvidenceChunk(c)) = env.payload else {
+                return Err(AegisError::ProtocolError {
+                    message: "payload 不匹配".to_string(),
+                    code: None,
+                });
+            };
+            assert_eq!(c.evidence_id, evidence_id);
+            assert_eq!(c.sequence_id, expected_seq);
+            expected_seq = expected_seq.saturating_add(1);
+            rebuilt.extend_from_slice(c.bytes.as_slice());
+            if c.is_last {
+                saw_last = true;
+            }
+        }
+
+        assert!(saw_last);
+        assert_eq!(rebuilt, bytes);
+        Ok(())
     }
 
     #[test]

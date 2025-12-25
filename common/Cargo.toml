@@ -28,6 +28,17 @@ sysinfo = "0.30"
 winreg = "0.52"
 winapi-util = "0.1"
 wmi = "0.18"
+windows-sys = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_Kernel",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -19,9 +19,17 @@ base64 = "0.22"
 libloading = "0.8"
 wasmtime = { version = "=38.0.4", features = ["cranelift"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+ed25519-dalek = { version = "2", features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 wmi = "0.18"
+windows-sys = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

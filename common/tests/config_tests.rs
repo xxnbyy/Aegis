@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use common::config::{AegisConfig, ConfigManager};
+use common::config::{AegisConfig, ConfigManager, WindowsMemoryScanDepth};
 
 #[test]
 fn deserialize_yaml_sets_fields() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,7 +73,47 @@ fn defaults_are_secure() {
     assert_eq!(cfg.governor.max_single_core_usage, 5);
     assert_eq!(cfg.governor.net_packet_limit_per_sec, 5000);
     assert_eq!(cfg.governor.io_limit_mb, 10);
+    assert_eq!(
+        cfg.forensics.windows_memory_scan_depth,
+        WindowsMemoryScanDepth::Fast
+    );
     assert_eq!(cfg.networking.heartbeat_interval_sec, 60);
+}
+
+#[test]
+fn governor_profile_office_overrides_limits() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg: AegisConfig = serde_yaml::from_str(
+        r"
+governor:
+  profile: office
+  max_single_core_usage: 12
+  net_packet_limit_per_sec: 6000
+  io_limit_mb: 20
+",
+    )?;
+    let applied = cfg.governor.effective_profile_applied();
+    assert_eq!(applied.max_single_core_usage, 5);
+    assert_eq!(applied.net_packet_limit_per_sec, 5000);
+    assert_eq!(applied.io_limit_mb, 10);
+    Ok(())
+}
+
+#[test]
+fn governor_profile_war_overrides_limits() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg: AegisConfig = serde_yaml::from_str(
+        r"
+governor:
+  mode: war
+  max_single_core_usage: 12
+  net_packet_limit_per_sec: 6000
+  io_limit_mb: 20
+",
+    )?;
+    let applied = cfg.governor.effective_profile_applied();
+    assert_eq!(applied.max_single_core_usage, 80);
+    assert_eq!(applied.net_packet_limit_per_sec, 50_000);
+    assert_eq!(applied.io_limit_mb, 0);
+    Ok(())
 }
 
 #[test]
