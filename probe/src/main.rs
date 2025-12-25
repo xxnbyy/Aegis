@@ -3,7 +3,6 @@
 #[cfg(windows)]
 use std::collections::BTreeMap;
 use std::fs::File;
-#[cfg(windows)]
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,9 +16,11 @@ use common::config::{ArtifactConfig, ConfigManager, load_yaml_file};
 use common::crypto;
 use common::detection::{RuleManager, RuleSet};
 use common::governor::{Governor, IoLimiter};
+#[cfg(windows)]
+use common::protocol::EvidenceChunker;
 use common::protocol::{
-    AgentTelemetry, EvidenceChunker, FileInfo, NetworkInterfaceUpdate, PayloadEnvelope,
-    ProcessInfo, SmartReflexEvidence, SystemInfo, payload_envelope,
+    AgentTelemetry, FileInfo, NetworkInterfaceUpdate, PayloadEnvelope, ProcessInfo,
+    SmartReflexEvidence, SystemInfo, payload_envelope,
 };
 #[cfg(target_os = "linux")]
 use common::protocol::{EbpfEvent, EbpfEventBatch, LinuxKernelForensicsEvidence, LinuxVdsoHash};
@@ -412,22 +413,24 @@ fn apply_native_plugin_worker_hardening(cmd: &mut std::process::Command) {
             cmd.env("AEGIS_SELF_ED25519_PUBKEY_PATH", v);
         }
         #[allow(unsafe_code)]
-        cmd.pre_exec(|| {
-            unsafe {
-                let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                let core = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                let _ = libc::setrlimit(libc::RLIMIT_CORE, &core);
-                let nofile = libc::rlimit {
-                    rlim_cur: 128,
-                    rlim_max: 128,
-                };
-                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
-            }
-            Ok(())
-        });
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe {
+                    let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                    let core = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    let _ = libc::setrlimit(libc::RLIMIT_CORE, &core);
+                    let nofile = libc::rlimit {
+                        rlim_cur: 128,
+                        rlim_max: 128,
+                    };
+                    let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
+                }
+                Ok(())
+            });
+        }
     }
 }
 
@@ -2093,9 +2096,12 @@ fn maybe_emit_process_snapshot(
     let total = processes.len();
     let mut sent: usize = 0;
     for p in processes {
-        let pid = p.pid;
-        let exec_id = p.exec_id;
         let is_ghost = p.is_ghost;
+        #[cfg(windows)]
+        let pid = p.pid;
+        #[cfg(windows)]
+        let exec_id = p.exec_id;
+        #[cfg(windows)]
         let exe_path = p.exe_path.clone();
 
         if !governor.try_consume_budget(1) {
