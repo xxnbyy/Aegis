@@ -470,10 +470,12 @@ fn try_compile_aegis_ebpf_object_best_effort(
         return None;
     }
 
-    let _ = std::fs::OpenOptions::new()
-        .write(true)
-        .open(object_path.as_path())
-        .and_then(|mut f| f.flush());
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(object_path.as_path())
+            .and_then(|mut f| f.flush()),
+    );
 
     Some(object_path.to_string_lossy().to_string())
 }
@@ -540,10 +542,7 @@ pub fn open_aegis_ringbuf_best_effort(
         if !consume_budget_best_effort(governor, 1) {
             return Ok(None);
         }
-        let info = match bpf_obj_get_info_by_fd_map(std::os::fd::AsRawFd::as_raw_fd(&owned)) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let info = bpf_obj_get_info_by_fd_map(std::os::fd::AsRawFd::as_raw_fd(&owned))?;
 
         let page_size = page_size()?;
         let data_size = usize::try_from(info.max_entries).unwrap_or(0);
@@ -681,6 +680,7 @@ pub fn lookup_aegis_exec_id_best_effort(
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 impl RingbufReader {
+    #[allow(clippy::missing_errors_doc)]
     pub fn drain_events_best_effort(
         &mut self,
         governor: &mut Governor,
@@ -710,7 +710,8 @@ impl RingbufReader {
                 break;
             }
 
-            let off = (consumer as usize) & (self.data_size.saturating_sub(1));
+            let mask_u64 = u64::try_from(self.data_size.saturating_sub(1)).unwrap_or(u64::MAX);
+            let off = usize::try_from(consumer & mask_u64).unwrap_or(0);
             let available_to_end = self.data_size.saturating_sub(off);
             if available_to_end < 8 {
                 consumer = consumer.saturating_add(available_to_end as u64);
@@ -727,8 +728,7 @@ impl RingbufReader {
             let payload_len = (len_flags & 0x3fff_ffffu32) as usize;
             let total_len = 8usize
                 .checked_add(payload_len)
-                .map(|v| (v + 7) & !7usize)
-                .unwrap_or(0);
+                .map_or(0, |v| (v + 7) & !7usize);
             if total_len == 0 || total_len > self.data_size {
                 consumer = consumer.saturating_add(8);
                 continue;
@@ -1075,10 +1075,8 @@ pub fn bruteforce_proc_pids_governed(governor: &mut Governor, max_pids: usize) -
         if out.len() >= max_pids {
             break;
         }
-        if pid == 1 || pid % 256 == 0 {
-            if !consume_budget_best_effort(governor, 1) {
-                break;
-            }
+        if (pid == 1 || pid % 256 == 0) && !consume_budget_best_effort(governor, 1) {
+            break;
         }
         let path = std::path::PathBuf::from("/proc").join(pid.to_string());
         let Ok(meta) = std::fs::metadata(path.as_path()) else {
@@ -1396,10 +1394,8 @@ pub fn collect_host_pids_via_fork_setns_governed(
         if reps.len() >= max_namespaces {
             break;
         }
-        if pid == 1 || pid % 128 == 0 {
-            if !consume_budget_best_effort(governor, 1) {
-                break;
-            }
+        if (pid == 1 || pid % 128 == 0) && !consume_budget_best_effort(governor, 1) {
+            break;
         }
         let Some(inode) = ns_inode_for_pid(pid, "mnt") else {
             continue;
@@ -1685,6 +1681,7 @@ pub fn collect_process_infos(_limit: usize, _exec_id_counter: &AtomicU64) -> Vec
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::implicit_hasher)]
 pub fn collect_process_infos_with_exec_id_overrides(
     limit: usize,
     exec_id_counter: &AtomicU64,
@@ -2021,16 +2018,16 @@ pub fn read_ftrace_enabled_functions_best_effort(
     governor: &mut Governor,
     max_lines: usize,
 ) -> Vec<String> {
+    const CANDIDATES: [&str; 2] = [
+        "/sys/kernel/debug/tracing/enabled_functions",
+        "/sys/kernel/tracing/enabled_functions",
+    ];
     if max_lines == 0 {
         return Vec::new();
     }
     if !consume_budget_best_effort(governor, 1) {
         return Vec::new();
     }
-    const CANDIDATES: [&str; 2] = [
-        "/sys/kernel/debug/tracing/enabled_functions",
-        "/sys/kernel/tracing/enabled_functions",
-    ];
     let mut content: Option<String> = None;
     for path in CANDIDATES {
         if let Ok(s) = std::fs::read_to_string(path) {
@@ -2066,6 +2063,7 @@ pub fn read_ftrace_enabled_functions_best_effort(
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub fn read_fs_flags_best_effort(governor: &mut Governor, path: &std::path::Path) -> Option<u32> {
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
     if !consume_budget_best_effort(governor, 1) {
         return None;
     }
@@ -2074,7 +2072,6 @@ pub fn read_fs_flags_best_effort(governor: &mut Governor, path: &std::path::Path
     }
     let file = std::fs::File::open(path).ok()?;
     let mut flags: libc::c_long = 0;
-    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
     let ret = unsafe {
         libc::ioctl(
             std::os::fd::AsRawFd::as_raw_fd(&file),
@@ -2120,8 +2117,7 @@ pub fn read_vdso_sha256_best_effort(governor: &mut Governor, pid: u32) -> Option
     }
     let file = std::fs::File::open(mem_path.as_path()).ok()?;
     let mut buf = [0u8; 4096];
-    use std::os::unix::fs::FileExt;
-    let n = file.read_at(&mut buf, start).ok()?;
+    let n = std::os::unix::fs::FileExt::read_at(&file, &mut buf, start).ok()?;
     if n == 0 {
         return None;
     }
