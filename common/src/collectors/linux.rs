@@ -2063,7 +2063,7 @@ pub fn read_ftrace_enabled_functions_best_effort(
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub fn read_fs_flags_best_effort(governor: &mut Governor, path: &std::path::Path) -> Option<u32> {
-    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601u32 as libc::Ioctl;
     if !consume_budget_best_effort(governor, 1) {
         return None;
     }
