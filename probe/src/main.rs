@@ -317,7 +317,10 @@ impl SubprocessNativePlugin {
             .spawn()
             .map_err(|e| format!("启动 native 插件子进程失败: {e}"))?;
 
+        #[cfg(windows)]
         let _job_guard = apply_native_plugin_worker_sandbox_best_effort(&child)?;
+        #[cfg(not(windows))]
+        apply_native_plugin_worker_sandbox_best_effort(&child);
 
         let mut stdin = child
             .stdin
@@ -415,19 +418,17 @@ fn apply_native_plugin_worker_hardening(cmd: &mut std::process::Command) {
         #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(|| {
-                unsafe {
-                    let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                    let core = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    let _ = libc::setrlimit(libc::RLIMIT_CORE, &core);
-                    let nofile = libc::rlimit {
-                        rlim_cur: 128,
-                        rlim_max: 128,
-                    };
-                    let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
-                }
+                let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_CORE, &raw const core);
+                let nofile = libc::rlimit {
+                    rlim_cur: 128,
+                    rlim_max: 128,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const nofile);
                 Ok(())
             });
         }
@@ -504,11 +505,7 @@ fn apply_native_plugin_worker_sandbox_best_effort(
 }
 
 #[cfg(not(windows))]
-fn apply_native_plugin_worker_sandbox_best_effort(
-    _child: &std::process::Child,
-) -> Result<(), String> {
-    Ok(())
-}
+fn apply_native_plugin_worker_sandbox_best_effort(_child: &std::process::Child) {}
 
 fn resolve_config_relative_path(base_dir: &Path, raw: &str) -> PathBuf {
     let p = PathBuf::from(raw);
