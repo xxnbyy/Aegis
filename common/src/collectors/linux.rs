@@ -60,7 +60,7 @@ pub fn read_ringbuf_dropped_events_best_effort(
 
         let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
 
-        let mut key: u32 = 0;
+        let key: u32 = 0;
         let mut value: u64 = 0;
         let mut attr = BpfAttrMapElem {
             map_fd: std::os::fd::AsRawFd::as_raw_fd(&owned).cast_unsigned(),
@@ -1461,6 +1461,7 @@ fn collect_process_info_for_pid_with_ctx(
         .ok()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
+    let has_floating_code = is_fileless_exe_target(exe_path.as_str());
     let uid = read_proc_uid(status_path.as_path()).unwrap_or(0);
 
     let (exec_id, exec_id_quality) = if start_ticks != 0 {
@@ -1491,7 +1492,7 @@ fn collect_process_info_for_pid_with_ctx(
         start_time,
         is_ghost: false,
         is_mismatched: false,
-        has_floating_code: is_fileless_exe_target(exe_path.as_str()),
+        has_floating_code,
         exec_id,
         exec_id_quality,
     }
@@ -2065,6 +2066,7 @@ pub fn read_ftrace_enabled_functions_best_effort(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub fn read_fs_flags_best_effort(governor: &mut Governor, path: &std::path::Path) -> Option<u32> {
     if !consume_budget_best_effort(governor, 1) {
         return None;
@@ -2120,18 +2122,11 @@ pub fn read_vdso_sha256_best_effort(governor: &mut Governor, pid: u32) -> Option
     }
     let file = std::fs::File::open(mem_path.as_path()).ok()?;
     let mut buf = [0u8; 4096];
-    let n = unsafe {
-        libc::pread(
-            std::os::fd::AsRawFd::as_raw_fd(&file),
-            std::ptr::from_mut(&mut buf).cast::<libc::c_void>(),
-            buf.len(),
-            i64::try_from(start).unwrap_or(i64::MAX),
-        )
-    };
-    if n <= 0 {
+    use std::os::unix::fs::FileExt;
+    let n = file.read_at(&mut buf, start).ok()?;
+    if n == 0 {
         return None;
     }
-    let n = usize::try_from(n).ok()?;
     Some(sha256_32(buf.get(0..n).unwrap_or_default()))
 }
 
