@@ -11,7 +11,7 @@ use rsa::pkcs8::EncodePublicKey;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::model::{
-    AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, Decryption, GetAiInsightInput,
+    AnalyzeEvidenceChunkInput, AnalyzeEvidenceMeta, BBox, Decryption, GetAiInsightInput,
     GetGraphViewportInput, GetTaskInput, ListTasksInput, OpenArtifactInput, OpenArtifactOptions,
     Page, Source, TaskStatus, ViewportLevel,
 };
@@ -283,7 +283,13 @@ fn analyze_evidence_rejects_chunks_after_finished_upload() -> Result<(), Box<dyn
     let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_after")?;
     let (_dir, mut c) = temp_console()?;
 
-    let _task_id = upload_bytes_as_evidence(&mut c, 3000, artifact_bytes.as_slice())?;
+    let task_id = upload_bytes_as_evidence(&mut c, 3000, artifact_bytes.as_slice())?;
+    let t0 = c.get_task(GetTaskInput {
+        task_id: task_id.clone(),
+    })?;
+    assert_eq!(t0.status, TaskStatus::Pending);
+    let case_path0 = t0.case_path.ok_or("missing case_path")?;
+    assert!(std::path::Path::new(case_path0.as_str()).exists());
 
     expect_err_code(
         c.analyze_evidence(AnalyzeEvidenceChunkInput {
@@ -295,6 +301,11 @@ fn analyze_evidence_rejects_chunks_after_finished_upload() -> Result<(), Box<dyn
         }),
         ErrorCode::Console731,
     )?;
+
+    let t1 = c.get_task(GetTaskInput { task_id })?;
+    assert_eq!(t1.status, TaskStatus::Pending);
+    let case_path1 = t1.case_path.ok_or("missing case_path")?;
+    assert!(std::path::Path::new(case_path1.as_str()).exists());
     Ok(())
 }
 
@@ -469,6 +480,21 @@ fn list_tasks_orders_by_created_at_desc() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn mark_task_done_with_error_sets_failed_status() -> Result<(), Box<dyn std::error::Error>> {
+    let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_ai_fail")?;
+    let (_dir, mut c) = temp_console()?;
+
+    let task_id = upload_bytes_as_evidence(&mut c, 5200, artifact_bytes.as_slice())?;
+    c.mark_task_running(task_id.as_str())?;
+    c.mark_task_done_with_error(task_id.as_str(), "ai failed")?;
+
+    let t = c.get_task(GetTaskInput { task_id })?;
+    assert_eq!(t.status, TaskStatus::Failed);
+    assert_eq!(t.error_message.as_deref(), Some("ai failed"));
+    Ok(())
+}
+
+#[test]
 fn open_artifact_with_passphrase_and_viewport_level0_connectivity()
 -> Result<(), Box<dyn std::error::Error>> {
     let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw1")?;
@@ -504,6 +530,43 @@ fn open_artifact_with_passphrase_and_viewport_level0_connectivity()
             .iter()
             .any(|e| matches!(e.r#type, crate::EdgeType::ParentOf))
     );
+    Ok(())
+}
+
+#[test]
+fn viewport_bbox_is_processed_and_emits_warning_when_missing_coords()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (artifact_bytes, _priv_pem, _host_uuid) = build_test_artifact_bytes("pw_bbox")?;
+    let dir = tempfile::tempdir()?;
+    let p = dir.path().join("t_bbox.aes");
+    std::fs::write(p.as_path(), artifact_bytes.as_slice())?;
+
+    let mut c = Console::new(ConsoleConfig::default());
+    let out = c.open_artifact(OpenArtifactInput {
+        source: Source::LocalPath {
+            path: p.display().to_string(),
+        },
+        decryption: Decryption::UserPassphrase {
+            passphrase: "pw_bbox".to_string(),
+        },
+        options: OpenArtifactOptions::default(),
+    })?;
+
+    let v = c.get_graph_viewport(GetGraphViewportInput {
+        case_id: out.case_id,
+        level: ViewportLevel::L0,
+        viewport_bbox: Some(BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1.0,
+            y2: 1.0,
+        }),
+        risk_score_threshold: Some(0),
+        center_node_id: None,
+        page: None,
+    })?;
+    let warnings = v.warnings.unwrap_or_default();
+    assert!(warnings.iter().any(|w| w.contains("viewport_bbox")));
     Ok(())
 }
 
