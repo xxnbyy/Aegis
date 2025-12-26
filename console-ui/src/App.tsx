@@ -29,13 +29,33 @@ function envSecurityMode(): "secure" | "unsandboxed" {
   return v?.trim().toLowerCase() === "unsandboxed" ? "unsandboxed" : "secure";
 }
 
+function splitCommaOrNewline(v: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  for (let i = 0; i < v.length; i += 1) {
+    const ch = v[i];
+    if (ch === "," || ch === "\n" || ch === "\r") {
+      const t = cur.trim();
+      if (t.length > 0) out.push(t);
+      cur = "";
+      while (i + 1 < v.length) {
+        const n = v[i + 1];
+        if (n !== "," && n !== "\n" && n !== "\r") break;
+        i += 1;
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  const t = cur.trim();
+  if (t.length > 0) out.push(t);
+  return out;
+}
+
 function envNativePlugins(): string[] {
   const v = (import.meta as any).env?.VITE_AEGIS_NATIVE_PLUGINS as string | undefined;
   if (!v) return [];
-  return v
-    .split(/[\r\n,]+/g)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+  return splitCommaOrNewline(v);
 }
 
 export default function App() {

@@ -10,11 +10,29 @@ import type {
   WsEnvelope
 } from "./types";
 
+function trimTrailingSlashes(s: string): string {
+  let out = s;
+  while (out.endsWith("/")) {
+    out = out.slice(0, -1);
+  }
+  return out;
+}
+
+function toWsUrl(s: string): string {
+  if (s.startsWith("https:")) {
+    return `wss:${s.slice("https:".length)}`;
+  }
+  if (s.startsWith("http:")) {
+    return `ws:${s.slice("http:".length)}`;
+  }
+  return s;
+}
+
 export class AegisClient {
   private readonly baseUrl: string;
 
   constructor(baseUrl: string) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes(baseUrl);
   }
 
   async healthz(): Promise<string> {
@@ -46,7 +64,7 @@ export class AegisClient {
   }
 
   connectWs(onMessage: (msg: WsEnvelope) => void, onError?: (e: Event) => void): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+    const wsUrl = toWsUrl(this.baseUrl);
     const ws = new WebSocket(`${wsUrl}/api/v1/ws`);
     ws.onmessage = (ev) => {
       try {
@@ -80,4 +98,3 @@ export class AegisClient {
     return (await r.json()) as T;
   }
 }
-
