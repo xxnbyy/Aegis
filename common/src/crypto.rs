@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(not(windows))]
 use std::{
     fs,
@@ -372,6 +372,79 @@ pub fn verify_hmac_sig_trailer_v1(
                 code: None,
             })?,
     );
+    Ok(match mac.verify_slice(tag.as_slice()) {
+        Ok(()) => HmacSigVerification::Valid,
+        Err(_) => HmacSigVerification::Invalid,
+    })
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn verify_hmac_sig_trailer_v1_reader<R: Read + Seek>(
+    reader: &mut R,
+    session_key: &[u8; 32],
+) -> Result<HmacSigVerification, AegisError> {
+    let len = reader.seek(SeekFrom::End(0)).map_err(AegisError::IoError)?;
+    if len < u64::try_from(HMAC_SIG_TRAILER_LEN).unwrap_or_default() {
+        return Ok(HmacSigVerification::Missing);
+    }
+
+    let trailer_start = len.saturating_sub(u64::try_from(HMAC_SIG_TRAILER_LEN).unwrap_or_default());
+    reader
+        .seek(SeekFrom::Start(trailer_start))
+        .map_err(AegisError::IoError)?;
+    let mut trailer = [0u8; HMAC_SIG_TRAILER_LEN];
+    reader
+        .read_exact(trailer.as_mut_slice())
+        .map_err(AegisError::IoError)?;
+
+    if trailer.get(0..4) != Some(HMAC_SIG_MAGIC.as_slice()) {
+        return Ok(HmacSigVerification::Missing);
+    }
+    let version = trailer.get(4).copied().unwrap_or_default();
+    let alg = trailer.get(5).copied().unwrap_or_default();
+    if version != HMAC_SIG_VERSION_V1 || alg != HMAC_SIG_ALG_HMAC_SHA256 {
+        return Ok(HmacSigVerification::Missing);
+    }
+    if trailer.get(6..8) != Some([0u8; 2].as_slice()) {
+        return Ok(HmacSigVerification::Missing);
+    }
+    let tag: [u8; 32] = trailer
+        .get(8..40)
+        .ok_or(AegisError::ProtocolError {
+            message: "HMAC trailer tag 越界".to_string(),
+            code: None,
+        })?
+        .try_into()
+        .map_err(|_| AegisError::ProtocolError {
+            message: "HMAC trailer tag 长度错误".to_string(),
+            code: None,
+        })?;
+
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(session_key).map_err(|_| AegisError::CryptoError {
+            message: "初始化 HMAC 失败".to_string(),
+            code: None,
+        })?;
+    mac.update(HMAC_SIG_LABEL_V1);
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(AegisError::IoError)?;
+    let mut remaining = trailer_start;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let take = std::cmp::min(remaining, u64::try_from(buf.len()).unwrap_or(0));
+        let take_usize = usize::try_from(take).unwrap_or(0);
+        if take_usize == 0 {
+            break;
+        }
+        reader
+            .read_exact(&mut buf[..take_usize])
+            .map_err(AegisError::IoError)?;
+        mac.update(&buf[..take_usize]);
+        remaining = remaining.saturating_sub(take);
+    }
+
     Ok(match mac.verify_slice(tag.as_slice()) {
         Ok(()) => HmacSigVerification::Valid,
         Err(_) => HmacSigVerification::Invalid,
